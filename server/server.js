@@ -402,6 +402,14 @@ app.post('/api/v1/tx/:action', async (req, res, next) => {
     if (!rateLimit(`tx:${req.ip}`, 60, 60_000)) return res.status(429).json({ error: 'Rate limit exceeded' });
     const builder = TX_BUILDERS[req.params.action];
     if (!builder) return res.status(404).json({ error: `Unknown action. Valid actions: ${Object.keys(TX_BUILDERS).join(', ')}` });
+    // Building requires the wallet library; reading does not. If it cannot load,
+    // say so plainly and point at the encoding, rather than failing opaquely.
+    if (!escrow.canBuildTransactions()) {
+      return res.status(503).json({
+        error: 'Transaction building is unavailable on this server. Build it yourself from the instruction encoding in /llms.txt — the result is identical and needs no trust in this API.',
+        documentation: '/llms.txt',
+      });
+    }
     const { feePayer, built, extra } = await builder(req.body || {});
     const { blockhash, lastValidBlockHeight } = (await rpc('getLatestBlockhash', [{ commitment: 'confirmed' }])).value;
     const transaction = new Transaction({ feePayer: built.instruction.keys[0].pubkey, recentBlockhash: blockhash }).add(built.instruction);

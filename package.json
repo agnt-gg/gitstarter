@@ -19,5 +19,9 @@
   },
   "devDependencies": {
     "esbuild": "0.25.8"
+  },
+  "comment:overrides": "rpc-websockets pulls an ESM-only uuid@14, which Node 18 cannot require() from CJS. Production runs Node 18, so @solana/web3.js was unloadable there while working locally on Node 22. Pinning uuid to its last CJS release fixes the tree for both.",
+  "overrides": {
+    "uuid": "^9.0.1"
   }
 }

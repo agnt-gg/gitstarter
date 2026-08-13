@@ -9,7 +9,27 @@
 // Everything in this file is derived from program/src/lib.rs. Changing one
 // without the other is a bug.
 
-const { PublicKey, SystemProgram, TransactionInstruction } = require('@solana/web3.js');
+const bs58Module = require('bs58');
+const bs58 = bs58Module.default || bs58Module;
+
+// @solana/web3.js is loaded only when a transaction is actually being built.
+//
+// Reading commissions needs nothing but base58 and buffer offsets, and the read
+// path is what agents depend on most. Requiring a large wallet library at module
+// load would tie discovery to that library's dependency tree - which has already
+// bitten us once: a nested ESM-only `uuid` makes web3.js unloadable under
+// Node 18, and it would have taken /llms.txt and the whole read API down with
+// it. Now that failure can only affect transaction construction, which callers
+// can do themselves from the encoding documented in llms.txt.
+let web3;
+function w3() {
+  if (!web3) web3 = require('@solana/web3.js');
+  return web3;
+}
+/// Whether this process can build transactions locally.
+function canBuildTransactions() {
+  try { w3(); return true; } catch { return false; }
+}
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
 const BPS_DENOMINATOR = 10_000;
@@ -81,18 +101,21 @@ function i64(value) { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(value)
 function u16(value) { const b = Buffer.alloc(2); b.writeUInt16LE(value); return b; }
 function u32(value) { const b = Buffer.alloc(4); b.writeUInt32LE(value); return b; }
 
-const key = value => (value instanceof PublicKey ? value : new PublicKey(value));
+const key = value => {
+  const { PublicKey } = w3();
+  return value instanceof PublicKey ? value : new PublicKey(value);
+};
 
 function commissionPda(programId, creator, seed) {
-  return PublicKey.findProgramAddressSync(
+  return w3().PublicKey.findProgramAddressSync(
     [SEED_COMMISSION, key(creator).toBuffer(), u64(seed)], key(programId))[0];
 }
 function vaultPda(programId, commission) {
-  return PublicKey.findProgramAddressSync(
+  return w3().PublicKey.findProgramAddressSync(
     [SEED_VAULT, key(commission).toBuffer()], key(programId))[0];
 }
 function pledgePda(programId, commission, backer) {
-  return PublicKey.findProgramAddressSync(
+  return w3().PublicKey.findProgramAddressSync(
     [SEED_PLEDGE, key(commission).toBuffer(), key(backer).toBuffer()], key(programId))[0];
 }
 
@@ -101,7 +124,7 @@ function decodeCommission(data) {
   const b = Buffer.from(data);
   if (b.length !== COMMISSION_ACCOUNT_BYTES) throw new Error('Not a commission account');
   let o = 1;
-  const pk = () => { const v = new PublicKey(b.subarray(o, o + 32)).toBase58(); o += 32; return v; };
+  const pk = () => { const v = bs58.encode(b.subarray(o, o + 32)); o += 32; return v; };
   const num = () => { const v = Number(b.readBigUInt64LE(o)); o += 8; return v; };
   const creator = pk();
   o += 32; // reserved, retained for layout compatibility
@@ -132,6 +155,8 @@ function decodeCommission(data) {
 const escrowRemaining = c => c.pledged - c.released - c.refunded;
 
 const meta = (pubkey, isSigner, isWritable) => ({ pubkey: key(pubkey), isSigner, isWritable });
+const systemProgram = () => w3().SystemProgram.programId;
+const ix = args => new (w3().TransactionInstruction)(args);
 
 /// Instruction builders. `ctx` carries { programId, configPda, treasury }.
 const build = {
@@ -140,14 +165,14 @@ const build = {
     const vault = vaultPda(ctx.programId, commission);
     return {
       commission, vault,
-      instruction: new TransactionInstruction({
+      instruction: ix({
         programId: key(ctx.programId),
         keys: [
           meta(creator, true, true),
           meta(ctx.configPda, false, false),
           meta(commission, false, true),
           meta(vault, false, true),
-          meta(SystemProgram.programId, false, false),
+          meta(systemProgram(), false, false),
         ],
         data: Buffer.concat([
           Buffer.from([IX.createCommission]), u64(seed), u64(goalLamports),
@@ -162,7 +187,7 @@ const build = {
     const pledge = pledgePda(ctx.programId, commission, backer);
     return {
       commission: key(commission), vault, pledge,
-      instruction: new TransactionInstruction({
+      instruction: ix({
         programId: key(ctx.programId),
         keys: [
           meta(backer, true, true),
@@ -170,7 +195,7 @@ const build = {
           meta(commission, false, true),
           meta(pledge, false, true),
           meta(vault, false, true),
-          meta(SystemProgram.programId, false, false),
+          meta(systemProgram(), false, false),
         ],
         data: Buffer.concat([Buffer.from([IX.pledge]), u64(amountLamports)]),
       }),
@@ -180,7 +205,7 @@ const build = {
   selectAgent(ctx, { creator, commission, agent }) {
     return {
       commission: key(commission),
-      instruction: new TransactionInstruction({
+      instruction: ix({
         programId: key(ctx.programId),
         keys: [meta(creator, true, false), meta(commission, false, true), meta(agent, false, false)],
         data: Buffer.from([IX.selectAgent]),
@@ -191,7 +216,7 @@ const build = {
   revokeAgent(ctx, { creator, commission }) {
     return {
       commission: key(commission),
-      instruction: new TransactionInstruction({
+      instruction: ix({
         programId: key(ctx.programId),
         keys: [meta(creator, true, false), meta(commission, false, true)],
         data: Buffer.from([IX.revokeAgent]),
@@ -202,7 +227,7 @@ const build = {
   acceptAgent(ctx, { agent, commission }) {
     return {
       commission: key(commission),
-      instruction: new TransactionInstruction({
+      instruction: ix({
         programId: key(ctx.programId),
         keys: [meta(agent, true, false), meta(commission, false, true)],
         data: Buffer.from([IX.acceptAgent]),
@@ -214,7 +239,7 @@ const build = {
     const vault = vaultPda(ctx.programId, commission);
     return {
       commission: key(commission), vault,
-      instruction: new TransactionInstruction({
+      instruction: ix({
         programId: key(ctx.programId),
         keys: [
           meta(creator, true, false),
@@ -233,7 +258,7 @@ const build = {
     const pledge = pledgePda(ctx.programId, commission, backer);
     return {
       commission: key(commission), vault, pledge,
-      instruction: new TransactionInstruction({
+      instruction: ix({
         programId: key(ctx.programId),
         keys: [
           meta(backer, true, true),
@@ -249,7 +274,7 @@ const build = {
   cancel(ctx, { signer, commission }) {
     return {
       commission: key(commission),
-      instruction: new TransactionInstruction({
+      instruction: ix({
         programId: key(ctx.programId),
         keys: [meta(signer, true, false), meta(commission, false, true)],
         data: Buffer.from([IX.cancel]),
@@ -295,5 +320,5 @@ module.exports = {
   MAX_COMMISSION_DURATION_SECONDS, COMMISSION_ACCOUNT_BYTES, VAULT_RENT_LAMPORTS,
   IX, STATUS, ERRORS, ERROR_HELP,
   commissionPda, vaultPda, pledgePda, decodeCommission, escrowRemaining,
-  build, availableActions, explainError,
+  build, availableActions, explainError, canBuildTransactions,
 };
