@@ -10,3 +10,10 @@ _*.png
 _patch_*.py
 _probe_*.sh
 *-deploy.tgz
+
+# Keypairs never belong in the repository, not even devnet throwaways. A public
+# repo whose entire pitch is "verify this yourself" cannot also be a place where
+# secret keys are casually committed.
+*_WALLET.json
+*keypair*.json
+deployer.json
