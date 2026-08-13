@@ -127,7 +127,30 @@ assert.equal(rejected.rejections, 1, 'the refusal is counted against the creator
 assert.equal(rejected.submission, null, 'rejection stops the clock');
 pass('creator refusal is public, attributable, and counted');
 
-// The agent revises; the creator then pays directly.
+// Rejection now ENDS the contract and returns the commission to the pool, so
+// the agent has to be re-hired before they can revise.
+assert.equal(rejected.status, 'funded', 'rejection returns the commission to the pool');
+assert.equal(rejected.agent, null, 'the rejected agent no longer holds the contract');
+pass('rejection returns the commission to the pool');
+
+await rejects('a cleared agent resubmitting without being re-nominated',
+  () => send(escrow.build.submitDelivery(ctx, {
+    agent: agent.publicKey, commission: flow.commission, milestoneIndex: 0, evidenceHash: 'cd'.repeat(32),
+  }).instruction, [agent]));
+
+await rejects('the creator rejecting and then instantly cancelling (F-1)',
+  () => send(escrow.build.cancel(ctx, { signer: payer.publicKey, commission: flow.commission }).instruction));
+
+await send(escrow.build.selectAgent(ctx, { creator: payer.publicKey, commission: flow.commission, agent: agent.publicKey }).instruction);
+await pause();
+await send(escrow.build.acceptAgent(ctx, { agent: agent.publicKey, commission: flow.commission }).instruction, [agent]);
+await pause();
+assert.equal(
+  (await readCommission(flow.commission)).deliveryDeadline, rejected.deliveryDeadline,
+  're-accepting must inherit the remaining clock, not reset it',
+);
+pass('a replacement agent inherits the delivery clock rather than restarting it');
+
 await send(escrow.build.submitDelivery(ctx, {
   agent: agent.publicKey, commission: flow.commission, milestoneIndex: 0, evidenceHash: 'cd'.repeat(32),
 }).instruction, [agent]);

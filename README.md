@@ -79,6 +79,7 @@ expires to whichever outcome is fair at that point.
 | Funding | Creation | 14 days | up to 30 days | Refund — nobody worked |
 | Delivery | Acceptance | 3 days | 1 hour to 30 days | Refund — the agent failed |
 | Review | Submission | 48 hours | 1 hour to 14 days | **Release** — the agent delivered |
+| Claim grace | Review ending | 24 hours | fixed | Escrow reopens if still unclaimed |
 
 That last row is the important one. A creator who is handed work and says
 nothing no longer keeps it for free: once the review window lapses, **anyone**
@@ -90,7 +91,11 @@ their working time.
 
 A delivery awaiting judgement freezes cancellation and refunds from every
 direction, including the agent's own. Work that has been handed over cannot be
-cancelled out from under it.
+cancelled out from under it. That freeze outlasts the review window by a 24-hour
+grace period: a delivery submitted late can mature *after* the delivery
+deadline, and without the grace the agent would be racing the first backer to
+hit refund for work they had actually delivered. The grace is bounded, so an
+agent who submits and vanishes cannot hold the escrow shut indefinitely.
 
 A nomination that is never accepted lapses after 3 days, after which anyone can
 clear it so the commission can be offered to someone else. Until then the claim
@@ -113,13 +118,31 @@ themselves as the paid agent; the program rejects it.
 |---|---|
 | Pledge | 0% |
 | **Milestone release** | **1%**, floored |
-| Refund | 0% |
-| Create / nominate / accept / revoke / cancel | 0% |
+| **Refund, when a delivery was ever submitted** | **1%**, floored |
+| Refund, when no delivery was ever submitted | 0% |
+| Create / nominate / accept / revoke / cancel / reject | 0% |
 
 Solana network fees (~5000 lamports per signature) always apply and go to
 validators, not to GitStarter. The protocol fee is a compile-time constant, not
 a config value: changing it requires shipping a visibly new program, not
 flipping an admin switch over money that is already escrowed.
+
+**The fee is for the connection, not the outcome.** GitStarter can control
+whether two parties are matched and whether real work is carried between them.
+It cannot control whether the creator likes that work. So the fee attaches the
+moment a delivery is submitted, and applies however the money then leaves
+escrow — release or refund.
+
+That also removes a perverse incentive. When only releases were charged, a
+creator paid 1% to approve work and 0% to refuse it, which quietly made refusal
+the cheaper option — the exact behaviour the review clock exists to discourage.
+Both now cost the same, so the decision is made on merit.
+
+The fee follows each lamport out of escrow and is therefore charged **once** on
+any given lamport, no matter how many submit/reject cycles occurred. A
+commission that never received a delivery pays nothing at all: no connection was
+made. Whether a given commission will charge it is exposed as `refundFeeApplies`
+on every API response.
 
 ## Rules the program enforces
 
@@ -130,6 +153,10 @@ Violating any of these gets the transaction rejected, not silently accepted:
 - Funding deadline in the future and at most **30 days** out.
 - Delivery window between 1 hour and 30 days; review window between 1 hour and 14 days.
 - Only the creator may nominate or reject a delivery.
+- Rejecting returns the commission to the pool: the agent is cleared and the
+  creator may hire anyone, including the same agent again.
+- The delivery clock does **not** restart when a replacement agent accepts, so
+  cycling agents cannot be used to stretch the deadline.
 - The creator may release at any time; anyone may release a delivery whose review window has lapsed.
 - Only the contracted agent may submit a delivery, and only before their delivery deadline.
 - Only the nominated wallet may accept.
@@ -363,7 +390,7 @@ integers are little-endian.
 | 2 | Pledge | `amount` u64 | backer(s,w), config, commission(w), pledge(w), vault(w), system |
 | 3 | SelectAgent | — | creator(s), commission(w), agent |
 | 4 | ReleaseMilestone | `index` u8 | signer(s), commission(w), vault(w), agent(w), treasury(w) |
-| 5 | Refund | — | backer(s,w), commission(w), pledge(w), vault(w) |
+| 5 | Refund | — | backer(s,w), commission(w), pledge(w), vault(w), treasury(w) |
 | 6 | Cancel | — | signer(s), commission(w) |
 | 7 | SetPaused | `paused` bool | admin(s), config(w) |
 | 8 | AcceptAgent | — | agent(s), commission(w) |
@@ -389,14 +416,18 @@ integers are little-endian.
   clock. `evidence_hash` is an opaque 32-byte commitment; the chain never stores
   the content itself.
 - **RejectDelivery** — the creator refuses a delivery. Public, attributable, and
-  it stops the clock. The agent may revise and resubmit.
+  it stops the clock. It also **ends the contract**: the agent is cleared and the
+  commission returns to the pool, so the creator can hire someone else rather
+  than being stuck with an agent whose work they have already refused. The same
+  agent can be re-nominated. The delivery clock keeps running throughout.
 - **ReleaseMilestone** — pays 99% to the agent and 1% to the treasury, atomically
   and irreversibly. Each milestone is one bit in a bitmap, so it cannot be
   replayed. The final milestone sweeps everything remaining, so integer dust
   cannot strand. Releasing the last one moves to `shipped`, which is terminal.
-- **Refund** — pro-rata over everything never released, no fee. The last
-  refunder takes the accumulated dust so the vault closes to exactly its rent
-  reserve. Once per pledge.
+- **Refund** — pro-rata over everything never released. Charges the 1%
+  connection fee if a delivery was ever submitted, and nothing if none was. The
+  last refunder takes the accumulated dust so the vault closes to exactly its
+  rent reserve. Once per pledge.
 - **Cancel** — creator any time before an agent accepts; the **agent** any time
   (walking away early, which frees the escrow for refunds immediately);
   **anyone** once the deadline has passed.
@@ -612,6 +643,19 @@ Read these before committing real money.
   protected by the delivery and review clocks.
 - **A creator can pay a wallet they control.** Direct self-dealing is blocked on
   chain; routing around it socially is not, exactly as on any crowdfunding site.
+- **One garbage delivery makes the whole pot taxable.** The 1% attaches as soon
+  as *any* delivery is submitted, and the chain cannot judge quality. A
+  nominated agent who submits junk for the cost of one transaction (~5,000
+  lamports) permanently flips that commission from fee-free to 1%-taxed. They
+  gain nothing by it — the fee goes to the treasury, not to them — so it is
+  vandalism rather than theft, and it requires the creator to have nominated
+  them. But it is a real griefing lever, and the damage scales with the pot
+  while the cost does not. Check an agent's record before nominating.
+- **A backer's SOL can be held for up to 75 days in the worst case**, if every
+  window is set to its maximum and a delivery lands immediately before the
+  delivery deadline: 30 days funding + 30 days delivery + 14 days review + 1 day
+  claim grace. Typical settings are days. The clocks are visible on every
+  commission before you pledge.
 - **Account rent is not reclaimable** in this version: ~0.0035 SOL per
   commission and ~0.0014 SOL per backer stays on chain permanently. On very
   small commissions that is a real percentage.

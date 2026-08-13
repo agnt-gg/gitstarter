@@ -3,8 +3,13 @@
 //! ## The mechanism
 //!
 //! Backers pledge native SOL into a per-commission PDA vault. SOL does NOT go
-//! to the agent until milestones are accepted. A fixed 1.00% fee is taken once,
-//! when successful work is released; refunds return all unreleased SOL free.
+//! to the agent until milestones are accepted.
+//!
+//! A fixed 1.00% fee is charged for the CONNECTION, not the outcome: it applies
+//! once an agent has actually submitted a delivery, and then to every lamport
+//! leaving escrow, whether by release or by refund. A commission that never
+//! received a delivery refunds in full and costs nothing. This is what stops a
+//! creator saving money by refusing work rather than approving it.
 //!
 //! ## Design rules this file follows
 //!
@@ -100,8 +105,13 @@ pub const MAX_MILESTONES: usize = 8;
 // That last inversion is the whole point. Silence used to be free for a creator
 // sitting on delivered work; now silence pays.
 
-/// Ceiling on the funding phase. Also bounds the worst-case lock: a commission
-/// can hold SOL for at most MAX_FUNDING_DURATION + MAX_DELIVERY_WINDOW.
+/// Ceiling on the funding phase.
+///
+/// The worst-case time a backer's SOL can be held is the sum of every clock:
+/// MAX_FUNDING_DURATION + MAX_DELIVERY_WINDOW + MAX_REVIEW_WINDOW +
+/// CLAIM_GRACE_WINDOW = 75 days, reached only by choosing every window at its
+/// maximum and submitting a delivery immediately before the delivery deadline.
+/// Typical settings are days, not months.
 pub const MAX_FUNDING_DURATION: i64 = 30 * 86_400;
 
 /// Delivery clock, measured from the moment the agent accepts. Agents building
@@ -122,6 +132,16 @@ pub const DEFAULT_REVIEW_WINDOW: i64 = 2 * 86_400;
 /// funded commission. Until it lapses the claim is exclusive, which is what
 /// stops several agents from speculatively building the same thing.
 pub const NOMINATION_WINDOW: i64 = 3 * 86_400;
+
+/// How long a matured, unclaimed delivery stays protected from refunds.
+///
+/// A submission made late in the delivery phase can mature *after* the delivery
+/// deadline, at which point both "anyone may release to the agent" and "backers
+/// may refund" are true at once, and whoever transacts first wins. An agent who
+/// genuinely delivered should not lose a race to a fast backer, so their claim
+/// holds for this long. It is deliberately bounded: an unclaimed milestone must
+/// eventually release the escrow, or a silent agent could lock it forever.
+pub const CLAIM_GRACE_WINDOW: i64 = 86_400;
 
 pub const SEED_CONFIG: &[u8] = b"config";
 pub const SEED_COMMISSION: &[u8] = b"commission";
@@ -227,7 +247,12 @@ pub struct Commission {
     pub total_pledged: u64,
     /// Gross lamports released against milestones (agent payout + fee).
     pub released: u64,
-    /// Lamports refunded to backers, with no protocol fee.
+    /// Lamports debited from escrow by refunds, GROSS of the connection fee.
+    ///
+    /// When `submissions > 0` the backer receives 99% of this and the treasury
+    /// takes 1%, so an off-chain consumer must not read this as "what backers
+    /// received". It is the amount that left the vault, which is what the
+    /// conservation invariant is stated over.
     pub refunded: u64,
     /// Number of distinct pledge accounts and number already fully refunded.
     /// The last refunder receives integer-division dust, so no lamport can remain
@@ -327,6 +352,16 @@ impl Commission {
         self.has_pending_submission() && now >= self.submitted_at.saturating_add(self.review_window)
     }
 
+    /// True while a matured claim is still protected from being refunded away.
+    pub fn claim_protected(&self, now: i64) -> bool {
+        self.has_pending_submission()
+            && now
+                < self
+                    .submitted_at
+                    .saturating_add(self.review_window)
+                    .saturating_add(CLAIM_GRACE_WINDOW)
+    }
+
     /// Clears the pending submission. Called on release and on rejection.
     pub fn clear_submission(&mut self) {
         self.submitted_at = 0;
@@ -420,7 +455,10 @@ pub enum Instruction {
     ReleaseMilestone { index: u8 },
 
     /// 5. Backer withdraws their pro-rata share of whatever was never released.
-    /// Accounts: [backer(s,w)] [commission(w)] [pledge(w)] [vault(w)]
+    ///
+    /// Charges the 1% connection fee if any delivery was ever submitted, and
+    /// nothing at all if none was.
+    /// Accounts: [backer(s,w)] [commission(w)] [pledge(w)] [vault(w)] [treasury(w)]
     Refund,
 
     /// 6. Terminate. Creator any time before Delivered, or anyone once the
@@ -980,19 +1018,28 @@ fn accept_agent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     // Accepting an expired commission would move already-refundable money into
     // Building, where the creator could still release it. Backers who consider
     // that commission dead must not have to race a late acceptance.
-    if Clock::get()?.unix_timestamp >= c.deadline {
+    let now = Clock::get()?.unix_timestamp;
+    if now >= c.deadline {
+        return Err(EscrowError::DeadlinePassed.into());
+    }
+    // A commission that has been through a rejection already has a running
+    // delivery clock. Re-accepting must not restart it, or cycling agents would
+    // become a way to extend the deadline indefinitely at backers' expense.
+    if c.delivery_deadline > 0 && now >= c.delivery_deadline {
         return Err(EscrowError::DeadlinePassed.into());
     }
     c.agent = *agent.key;
     c.has_agent = true;
     c.has_pending_agent = false;
     c.status = Status::Building;
-    // The delivery clock starts now, not at creation. An agent who accepts late
-    // in a funding window gets the same time to work as one who accepts early.
-    c.delivery_deadline = Clock::get()?
-        .unix_timestamp
-        .checked_add(c.delivery_window)
-        .ok_or(EscrowError::MathOverflow)?;
+    // The delivery clock starts at the FIRST acceptance, not at creation. An
+    // agent who accepts late in a funding window gets the same time to work as
+    // one who accepted early — but a replacement agent inherits what is left.
+    if c.delivery_deadline == 0 {
+        c.delivery_deadline = now
+            .checked_add(c.delivery_window)
+            .ok_or(EscrowError::MathOverflow)?;
+    }
     save(commission_ai, &c)?;
     msg!("agent accepted, delivery due {}", c.delivery_deadline);
     Ok(())
@@ -1093,8 +1140,18 @@ fn reject_delivery(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResu
     }
     c.clear_submission();
     c.rejections = c.rejections.saturating_add(1);
+    // Rejection ends the contract and returns the commission to the pool, so the
+    // creator can nominate anyone — including the same agent again. Keeping a
+    // rejected agent bound to work the creator has already refused helps nobody,
+    // and it leaves funded work parked with a counterparty who cannot satisfy it.
+    //
+    // The delivery clock deliberately survives. Whoever accepts next inherits the
+    // remaining time, so cycling agents cannot be used to stretch the deadline.
+    c.agent = Pubkey::default();
+    c.has_agent = false;
+    c.status = Status::Funded;
     save(commission_ai, &c)?;
-    msg!("delivery rejected");
+    msg!("delivery rejected, commission returned to the pool");
     Ok(())
 }
 
@@ -1123,6 +1180,14 @@ fn release_milestone(program_id: &Pubkey, accounts: &[AccountInfo], index: u8) -
     let matured = c.review_expired(now) && c.submitted_index == index;
     if !is_creator && !matured {
         return Err(EscrowError::ReviewWindowOpen.into());
+    }
+    // Past the delivery deadline the escrow is refundable, so an unrestricted
+    // creator release would race the backers who are withdrawing — and because a
+    // schedule-completing release takes everything remaining, the slower half of
+    // the cap table would absorb the whole loss. After the deadline only a claim
+    // the agent actually earned may still be paid.
+    if c.delivery_deadline > 0 && now >= c.delivery_deadline && !matured {
+        return Err(EscrowError::DeadlinePassed.into());
     }
     if *agent.key != c.agent {
         return Err(EscrowError::BadOwner.into());
@@ -1203,6 +1268,7 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let commission_ai = next_account_info(ai)?;
     let pledge_ai = next_account_info(ai)?;
     let vault_ai = next_account_info(ai)?;
+    let treasury = next_account_info(ai)?;
     assert_signer(backer)?;
     let mut c = load_commission(commission_ai, program_id)?;
     // A commission that met its goal and then expired without an agent holds
@@ -1212,7 +1278,13 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // An agent who accepted and then delivered nothing leaves the escrow in
     // exactly the state an unfunded one is in, so it refunds on the same terms
     // once their delivery clock runs out.
-    let delivery_expired = c.status == Status::Building && now >= c.delivery_deadline;
+    //
+    // The clock governs the commission once started, whichever side let it lapse
+    // and whether or not an agent currently holds the contract. Scoping this to
+    // Building would strand a commission that was rejected back into the pool and
+    // then never re-accepted: nobody could accept it (its delivery clock is up)
+    // and nobody could refund it (its funding deadline had not arrived).
+    let delivery_expired = c.delivery_deadline > 0 && now >= c.delivery_deadline;
     let refundable = c.status == Status::Cancelled
         || (matches!(c.status, Status::Funding | Status::Funded) && now >= c.deadline)
         || delivery_expired;
@@ -1221,9 +1293,16 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
     // Work that has been delivered and not yet judged is not abandoned work.
     // Refunding around a live claim would hand the creator back the exact
-    // free-work outcome the review clock exists to prevent.
-    if c.has_pending_submission() && !c.review_expired(now) {
+    // free-work outcome the review clock exists to prevent. The protection
+    // outlasts the review window by a grace period so that an agent whose claim
+    // matures after the delivery deadline does not lose a race to a fast backer.
+    if c.claim_protected(now) {
         return Err(EscrowError::SubmissionPending.into());
+    }
+    // The treasury is snapshotted per commission, so a later config change
+    // cannot redirect fees on SOL that is already escrowed.
+    if *treasury.key != c.treasury {
+        return Err(EscrowError::BadTreasury.into());
     }
     assert_pda(
         &[SEED_VAULT, commission_ai.key.as_ref()],
@@ -1262,16 +1341,44 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         .ok_or(EscrowError::MathOverflow)?
         == c.pledger_count;
     let entitled = mul_div(never_released, p.amount, c.total_pledged)?;
+    let remaining = c.escrow_remaining()?;
+    // Clamp rather than reject.
+    //
+    // `entitled` is a share of `total_pledged - released`, a base that shrinks
+    // when a milestone is released but not when other backers refund. So a
+    // release landing BETWEEN two refunds can leave a later backer entitled to
+    // more than the vault still holds. Rejecting that outright froze
+    // `refunded_pledger_count`, which meant `is_last` could never become true,
+    // the dust sweep never fired, and the remainder was stranded permanently
+    // with every remaining backer locked out. Clamping always records a
+    // settlement and always advances the counter, so the sweep still closes the
+    // vault exactly.
     let amount = if is_last {
-        c.escrow_remaining()?
+        remaining
     } else {
         entitled
             .checked_sub(p.refunded)
             .ok_or(EscrowError::MathOverflow)?
+            .min(remaining)
     };
-    if amount > c.escrow_remaining()? {
-        return Err(EscrowError::NothingToRefund.into());
-    }
+    // The protocol charges for the connection, not for the outcome.
+    //
+    // Once an agent has actually delivered something, the platform has done the
+    // job it can control: it matched two parties and carried real work between
+    // them. Whether the creator accepts that work is a judgement no protocol can
+    // make. Charging only on release meant a creator paid 1% to approve and 0% to
+    // refuse, which quietly priced refusal as the cheaper option — the exact
+    // behaviour the review clock exists to discourage. Now both cost the same and
+    // the decision is made on merit.
+    //
+    // The fee is per lamport leaving escrow, so it is charged exactly once on any
+    // given lamport regardless of how many rejection cycles occurred. A commission
+    // that never saw a submission pays nothing: no connection was made.
+    let (fee, net) = if c.submissions > 0 {
+        split_fee(amount)?
+    } else {
+        (0, amount)
+    };
     // A dust-sized pledge can be entitled to exactly zero after flooring. That is
     // still a settled claim, and it must be recorded: refusing it would stop
     // `refunded_pledger_count` from ever reaching `pledger_count`, so the final
@@ -1298,10 +1405,16 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             .ok_or(EscrowError::InsufficientVault)?;
         **backer.try_borrow_mut_lamports()? = backer
             .lamports()
-            .checked_add(amount)
+            .checked_add(net)
             .ok_or(EscrowError::MathOverflow)?;
+        if fee > 0 {
+            **treasury.try_borrow_mut_lamports()? = treasury
+                .lamports()
+                .checked_add(fee)
+                .ok_or(EscrowError::MathOverflow)?;
+        }
     }
-    msg!("refunded {} lamports, fee=0", amount);
+    msg!("refunded {} lamports to backer, fee {}", net, fee);
     Ok(())
 }
 
@@ -1321,7 +1434,16 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // Before an agent accepts, the creator may cancel. After selection, neither
     // side can be rugged mid-build: cancellation opens only at the precommitted
     // deadline, by anyone.
-    let creator_may_cancel = is_creator && matches!(c.status, Status::Funding | Status::Funded);
+    // The creator may back out at will only while nobody has ever committed to
+    // the work: `delivery_deadline == 0` is exactly "no agent has accepted yet".
+    //
+    // Without that condition, rejection would launder a live delivery claim into
+    // an instant unilateral exit: reject (which clears the submission) and cancel
+    // in the same slot, and the escrow is gone before the agent can be re-hired
+    // or resubmit. The delivery clock is supposed to keep running across a
+    // rejection; this is what makes that promise real rather than decorative.
+    let creator_may_cancel =
+        is_creator && matches!(c.status, Status::Funding | Status::Funded) && c.delivery_deadline == 0;
     // The contracted agent may always walk away. Surrendering their own claim
     // cannot harm backers — it only releases the remaining escrow for refund
     // immediately instead of making everyone wait out the deadline.
@@ -1331,6 +1453,10 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // is whether they still have time left to deliver.
     let expiry = if c.status == Status::Building {
         c.delivery_deadline
+    } else if c.delivery_deadline > 0 {
+        // Back in the pool after a rejection: whichever clock runs out first ends
+        // it, because past either one the commission can no longer progress.
+        c.deadline.min(c.delivery_deadline)
     } else {
         c.deadline
     };
@@ -1340,10 +1466,10 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // A delivery awaiting judgement blocks cancellation from every direction,
     // including the agent's own. Otherwise a creator could watch work land and
     // then cancel out from under it, which is precisely the theft this change
-    // exists to stop. The escape hatch is not privileged: once the review window
-    // lapses, anyone may release the milestone, and cancelling becomes possible
-    // again afterwards.
-    if c.has_pending_submission() && !c.review_expired(now) {
+    // exists to stop. The escape hatch is not privileged: once the claim has
+    // matured and its grace period has passed, anyone may release the milestone,
+    // and cancelling becomes possible again afterwards.
+    if c.claim_protected(now) {
         return Err(EscrowError::SubmissionPending.into());
     }
     c.status = Status::Cancelled;
@@ -1570,11 +1696,20 @@ mod tests {
         assert!(DEFAULT_REVIEW_WINDOW <= MAX_REVIEW_WINDOW);
         assert_eq!(MIN_DELIVERY_WINDOW, 3_600, "one hour must be expressible");
         assert_eq!(MIN_REVIEW_WINDOW, 3_600);
-        // The worst case a backer's SOL can be locked is both phases back to back.
+        // The real worst case for a backer is both phases back to back PLUS a
+        // delivery submitted one second before the delivery deadline, whose
+        // review window and claim grace then have to run out. Stating only the
+        // first two would understate the lock a backer is actually agreeing to.
+        let worst_case_lock =
+            MAX_FUNDING_DURATION + MAX_DELIVERY_WINDOW + MAX_REVIEW_WINDOW + CLAIM_GRACE_WINDOW;
         assert_eq!(
-            MAX_FUNDING_DURATION + MAX_DELIVERY_WINDOW,
-            60 * 86_400,
-            "total lock must stay far below the old 180-day ceiling"
+            worst_case_lock,
+            75 * 86_400,
+            "the disclosed worst-case lock must match what the clocks actually permit"
+        );
+        assert!(
+            worst_case_lock < 180 * 86_400,
+            "and must stay far below the old single-deadline ceiling"
         );
     }
 }

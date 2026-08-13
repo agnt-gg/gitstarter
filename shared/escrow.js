@@ -48,6 +48,11 @@ const MAX_REVIEW_WINDOW_SECONDS = 14 * 86_400;
 const DEFAULT_REVIEW_WINDOW_SECONDS = 2 * 86_400;
 const NOMINATION_WINDOW_SECONDS = 3 * 86_400;
 
+/// How long a matured, unclaimed delivery is protected from being refunded away.
+/// A claim that matures after the delivery deadline would otherwise be a race
+/// between the agent who delivered and the first backer to hit refund.
+const CLAIM_GRACE_WINDOW_SECONDS = 86_400;
+
 // Pinned by program/src/lib.rs::commission_account_size_is_pinned. If these two
 // ever disagree, every commission silently fails to decode.
 const COMMISSION_ACCOUNT_BYTES = 316;
@@ -207,6 +212,20 @@ function reviewExpired(c, nowUnix = Math.floor(Date.now() / 1000)) {
   return !!c.submission && nowUnix >= c.submission.reviewEndsAt;
 }
 
+/// True while a delivery still blocks cancellation and refunds — through the
+/// review window and for a grace period afterwards, so an agent who genuinely
+/// delivered cannot lose a race to a fast backer.
+function claimProtected(c, nowUnix = Math.floor(Date.now() / 1000)) {
+  return !!c.submission && nowUnix < c.submission.reviewEndsAt + CLAIM_GRACE_WINDOW_SECONDS;
+}
+
+/// Whether a refund from this commission will be charged the connection fee.
+/// Once an agent has delivered something the protocol has done the part it
+/// controls, so the fee applies however the money leaves escrow.
+function refundCarriesFee(c) {
+  return c.submissions > 0;
+}
+
 /// Lamports still owed by a commission: pledged minus everything paid out.
 const escrowRemaining = c => c.pledged - c.released - c.refunded;
 
@@ -356,6 +375,9 @@ const build = {
           meta(commission, false, true),
           meta(pledge, false, true),
           meta(vault, false, true),
+          // Receives the 1% connection fee when a delivery was ever submitted,
+          // and nothing at all when none was.
+          meta(ctx.treasury, false, true),
         ],
         data: Buffer.from([IX.refund]),
       }),
@@ -378,14 +400,18 @@ const build = {
 /// This is the question an autonomous agent actually needs answered.
 function availableActions(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
   const fundingExpired = nowUnix >= c.deadline;
-  const deliveryExpired = c.status === 'building' && nowUnix >= c.deliveryDeadline;
+  // Once started, the delivery clock governs the commission whatever its status
+  // — including one rejected back into the pool and never re-accepted.
+  const deliveryExpired = c.deliveryDeadline > 0 && nowUnix >= c.deliveryDeadline;
   const isCreator = wallet && wallet === c.creator;
   const isAgent = wallet && wallet === c.agent;
   const isNominee = wallet && wallet === c.pendingAgent;
   const matured = reviewExpired(c, nowUnix);
   // A delivery awaiting judgement freezes every exit, so that work which has
   // been handed over cannot be cancelled or refunded out from under the agent.
-  const claimBlocks = !!c.submission && !matured;
+  // The freeze outlasts the review window by a grace period, so a claim that
+  // matures after the delivery deadline is not a race the agent can lose.
+  const claimBlocks = claimProtected(c, nowUnix);
   const hasUnreleased = () => {
     for (let i = 0; i < c.milestoneCount; i++) if (!(c.milestonesDone & (1 << i))) return true;
     return false;
@@ -400,6 +426,12 @@ function availableActions(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
   }
   if (c.status === 'funded' && isNominee && !fundingExpired) actions.push('acceptAgent');
 
+  if (c.status === 'funded' && !c.agent && !c.pendingAgent && !fundingExpired && !deliveryExpired && c.deliveryDeadline > 0) {
+    // Rejected back into the pool: still hireable, but only while the delivery
+    // clock the next agent would inherit still has time left on it.
+    if (isCreator) actions.push('selectAgent');
+  }
+
   if (c.status === 'building') {
     // The agent hands work over; only they can, and only before their clock runs out.
     if (isAgent && !c.submission && !deliveryExpired && hasUnreleased()) actions.push('submitDelivery');
@@ -411,7 +443,10 @@ function availableActions(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
   }
 
   if (!claimBlocks) {
-    if (isCreator && ['funding', 'funded'].includes(c.status)) actions.push('cancel');
+    // The creator may back out at will only while nobody has ever committed to
+    // the work. Once a delivery clock exists it governs, including after a
+    // rejection — otherwise rejecting would be an instant unilateral exit.
+    if (isCreator && ['funding', 'funded'].includes(c.status) && !c.deliveryDeadline) actions.push('cancel');
     if (isAgent && c.status === 'building') actions.push('cancel');
     if (!isCreator && !isAgent && fundingExpired && ['funding', 'funded'].includes(c.status)) actions.push('cancel');
     if (deliveryExpired) actions.push('cancel');
@@ -440,7 +475,8 @@ module.exports = {
   MAX_FUNDING_DURATION_SECONDS,
   MIN_DELIVERY_WINDOW_SECONDS, MAX_DELIVERY_WINDOW_SECONDS, DEFAULT_DELIVERY_WINDOW_SECONDS,
   MIN_REVIEW_WINDOW_SECONDS, MAX_REVIEW_WINDOW_SECONDS, DEFAULT_REVIEW_WINDOW_SECONDS,
-  NOMINATION_WINDOW_SECONDS, reviewExpired,
+  NOMINATION_WINDOW_SECONDS, CLAIM_GRACE_WINDOW_SECONDS,
+  reviewExpired, claimProtected, refundCarriesFee,
   IX, STATUS, ERRORS, ERROR_HELP,
   commissionPda, vaultPda, pledgePda, decodeCommission, escrowRemaining,
   build, availableActions, explainError, canBuildTransactions,

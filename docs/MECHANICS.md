@@ -46,6 +46,12 @@ Two consequences worth being explicit about:
   an outsider, not even the agent. Work that has been handed over cannot be
   cancelled out from under it. This is not a deadlock: the review window always
   matures, and anyone may then release it.
+- **The freeze outlasts the review window by 24 hours.** A delivery submitted
+  close to the delivery deadline can mature *after* it, at which point both
+  "anyone may release to the agent" and "backers may refund" would be true at
+  once — a race the agent could lose for work they had actually delivered. The
+  grace period settles that in the agent's favour. It is bounded, so an agent
+  who submits and then vanishes cannot hold the escrow shut indefinitely.
 
 ## Submissions — how an agent takes a job
 
@@ -85,10 +91,20 @@ only enforces who is allowed to move money once a judgement is made — and how
 long the creator has to make one.
 
 A creator can **RejectDelivery** while the review window is still theirs. That
-is a real refusal: it stops the clock and the agent must revise and resubmit.
-But it is now an on-chain act attributable to their address and counted in
-`rejections`, rather than silence that costs them nothing. Once the window
-lapses, rejection is refused — a matured claim cannot be retroactively cancelled.
+is a real refusal: it stops the clock, and it **ends the contract** — the agent
+is cleared and the commission returns to the pool, so the creator can hire
+someone else instead of being stuck with an agent whose work they have already
+refused. The same agent can be re-nominated.
+
+The delivery clock deliberately keeps running across a rejection. Whoever
+accepts next inherits whatever time is left, so cycling through agents cannot be
+used to stretch the deadline at backers' expense. Once that clock runs out the
+escrow is refundable, whether or not anyone currently holds the contract.
+
+Rejection is an on-chain act attributable to the creator's address and counted
+in `rejections`, rather than silence that costs them nothing. Once the review
+window lapses, rejection is refused — a matured claim cannot be retroactively
+cancelled.
 
 This is why the description field matters more than it looks. **It is the review
 contract.** Write it so a stranger can tell, without asking you, whether the work
@@ -200,14 +216,47 @@ and because nobody but the agent may cancel mid-build, the escrow would have bee
 unreachable forever — a ransom primitive. The cap turns the worst case into a
 bounded wait.
 
+## What the fee is for
+
+**The protocol charges for the connection, not the outcome.**
+
+GitStarter controls two things: whether two parties are matched, and whether
+real work is carried between them under rules both can rely on. It does not
+control whether the creator judges that work to be good. So the fee attaches at
+the moment a delivery is submitted, and then applies however the money leaves
+escrow — release or refund.
+
+This corrected a genuine misalignment. When only releases were charged, a
+creator paid 1% to approve work and nothing to refuse it. That is a small
+number, but it pointed the wrong way: refusal was the cheaper option, which is
+precisely the behaviour the review clock exists to discourage. Approving and
+refusing now cost the same, so the decision is made on the work.
+
+Two properties keep it honest:
+
+- **Charged once per lamport.** The fee follows each lamport out of escrow, and
+  each lamport leaves once. Five submit/reject cycles cost the same as one. A
+  commission half released and half refunded pays 1% overall, not 2%.
+- **Nothing without a delivery.** A commission that expires with no submission
+  refunds in full. No connection was made, so there is nothing to charge for.
+
+Worth stating plainly: the fee comes out of escrow, which is backer money. Where
+the creator is also the backer — typical for small bounties — they are paying for
+their own choice of agent, which is fair. Where third parties funded it, they
+are paying 1% for a match the creator made and work they did not receive. That
+is the honest cost of making refusal and approval cost the same, and it is why
+the reputation record matters: `autoReleases` and `rejections` are what let
+backers judge a creator before funding them.
+
 ## Fees, in full
 
 | Action | Protocol fee |
 |---|---|
 | Pledge | 0% |
-| Milestone release | **1%**, floored |
-| Refund | 0% |
-| Create / nominate / accept / cancel | 0% |
+| **Milestone release** | **1%**, floored |
+| **Refund, when a delivery was ever submitted** | **1%**, floored |
+| Refund, when no delivery was ever submitted | 0% |
+| Create / nominate / accept / revoke / cancel / reject | 0% |
 
 Network transaction fees (roughly 0.000005 SOL) always apply and go to Solana
 validators, not to GitStarter.
@@ -236,6 +285,26 @@ in the local harness.
 
 That is not the same as a professional firm signing off. Size early commissions
 accordingly.
+
+## Known tradeoffs of the connection fee
+
+Two consequences worth stating plainly, both surfaced by adversarial review
+rather than discovered in production.
+
+**A single garbage delivery makes the pot taxable.** The fee attaches the moment
+any delivery is submitted, and no on-chain rule can judge whether that delivery
+was serious. An agent the creator nominated can therefore submit junk for the
+cost of one transaction and permanently move that commission from fee-free to
+1%-taxed. They capture none of it, so there is no profit motive — it is
+vandalism, and it needs a nomination first. The counterweight is reputation: an
+agent with submissions and no completions is visible at
+`/api/v1/reputation/:wallet`, and creators should read it before nominating.
+
+**The worst-case hold is 75 days, not 60.** Funding (≤30d) plus delivery (≤30d)
+plus, if a delivery lands just before the delivery deadline, its review window
+(≤14d) and the claim grace (1d). That combination requires every window to be
+set to its maximum; ordinary commissions run in days. Every clock is visible on
+the commission before anyone pledges.
 
 ## Costs that are not fees
 

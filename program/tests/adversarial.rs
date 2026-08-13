@@ -337,13 +337,14 @@ fn revoke_ix(creator: Pubkey, commission: Pubkey) -> Instruction {
     )
 }
 
-fn refund_ix(backer: Pubkey, commission: Pubkey, vault: Pubkey) -> Instruction {
+fn refund_ix(backer: Pubkey, commission: Pubkey, vault: Pubkey, treasury: Pubkey) -> Instruction {
     ix(
         vec![
             AccountMeta::new(backer, true),
             AccountMeta::new(commission, false),
             AccountMeta::new(pledge_pda(commission, backer), false),
             AccountMeta::new(vault, false),
+            AccountMeta::new(treasury, false),
         ],
         EscrowInstruction::Refund,
     )
@@ -478,7 +479,7 @@ async fn pledges_are_refused_once_the_deadline_has_passed() {
     let before = balance(&mut w.ctx, w.backer_a.pubkey()).await;
     send(
         &mut w.ctx,
-        &[refund_ix(w.backer_a.pubkey(), commission, vault)],
+        &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())],
         &[&w.backer_a],
     )
     .await
@@ -578,7 +579,7 @@ async fn contracted_agent_can_walk_away_and_free_the_escrow() {
 
     send(
         &mut w.ctx,
-        &[refund_ix(w.backer_a.pubkey(), commission, vault)],
+        &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())],
         &[&w.backer_a],
     )
     .await
@@ -923,7 +924,7 @@ async fn refunds_cannot_be_replayed_or_stolen() {
     // Someone with no pledge of their own gets nothing.
     assert!(send(
         &mut w.ctx,
-        &[refund_ix(w.backer_b.pubkey(), commission, vault)],
+        &[refund_ix(w.backer_b.pubkey(), commission, vault, w.treasury.pubkey())],
         &[&w.backer_b]
     )
     .await
@@ -931,7 +932,7 @@ async fn refunds_cannot_be_replayed_or_stolen() {
 
     send(
         &mut w.ctx,
-        &[refund_ix(w.backer_a.pubkey(), commission, vault)],
+        &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())],
         &[&w.backer_a],
     )
     .await
@@ -939,7 +940,7 @@ async fn refunds_cannot_be_replayed_or_stolen() {
     assert!(
         send(
             &mut w.ctx,
-            &[refund_ix(w.backer_a.pubkey(), commission, vault)],
+            &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())],
             &[&w.backer_a]
         )
         .await
@@ -1083,7 +1084,7 @@ async fn an_expired_commission_cannot_be_accepted_and_stays_refundable() {
     );
     send(
         &mut w.ctx,
-        &[refund_ix(w.backer_a.pubkey(), commission, vault)],
+        &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())],
         &[&w.backer_a],
     )
     .await
@@ -1323,7 +1324,7 @@ async fn dust_sized_backers_cannot_freeze_the_refund_sweep() {
     ] {
         send(
             &mut w.ctx,
-            &[refund_ix(kp.pubkey(), commission, vault)],
+            &[refund_ix(kp.pubkey(), commission, vault, w.treasury.pubkey())],
             &[kp],
         )
         .await
@@ -1579,7 +1580,7 @@ async fn a_pending_delivery_cannot_be_cancelled_or_refunded_away() {
     assert!(
         send(
             &mut w.ctx,
-            &[refund_ix(w.backer_a.pubkey(), commission, vault)],
+            &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())],
             &[&w.backer_a]
         )
         .await
@@ -1711,6 +1712,46 @@ async fn rejection_is_recorded_and_cannot_be_used_to_stop_a_matured_claim() {
     assert_eq!(c.rejections, 1, "the refusal is attributable and counted");
     assert!(!c.has_pending_submission(), "rejection stops the clock");
     assert_eq!(c.submissions, 1);
+    // Rejection ends the contract and returns the work to the pool, so the
+    // creator is free to hire someone else rather than being stuck with an agent
+    // whose work they have already refused.
+    assert_eq!(c.status, Status::Funded, "rejection re-opens the commission");
+    assert!(!c.has_agent, "the rejected agent no longer holds the contract");
+    let delivery_deadline_after_rejection = c.delivery_deadline;
+
+    // A cleared agent cannot keep submitting against work they no longer hold.
+    assert!(
+        send(
+            &mut w.ctx,
+            &[submit_ix(w.agent.pubkey(), commission, 0)],
+            &[&w.agent]
+        )
+        .await
+        .is_err(),
+        "a rejected agent must re-accept before they can submit again"
+    );
+
+    // The creator gives the same agent another go. They may, but the delivery
+    // clock does not restart, so cycling agents cannot stretch the deadline.
+    send(
+        &mut w.ctx,
+        &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())],
+        &[&w.creator],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut w.ctx,
+        &[accept_ix(w.agent.pubkey(), commission)],
+        &[&w.agent],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        commission_state(&mut w.ctx, commission).await.delivery_deadline,
+        delivery_deadline_after_rejection,
+        "re-accepting must inherit the remaining time, not reset the clock"
+    );
 
     // The agent revises and resubmits; the creator lets this one lapse.
     send(
@@ -1851,7 +1892,7 @@ async fn delivery_clock_starts_at_acceptance_and_expires_to_refund() {
     // No cancel needed: an expired delivery phase refunds on its own terms.
     send(
         &mut w.ctx,
-        &[refund_ix(w.backer_a.pubkey(), commission, vault)],
+        &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())],
         &[&w.backer_a],
     )
     .await
@@ -2059,4 +2100,504 @@ async fn funding_deadline_ceiling_is_thirty_days() {
     )
     .await
     .unwrap();
+}
+
+// ── the connection fee ──────────────────────────────────────────────────────
+//
+// The protocol charges for connecting two parties and carrying real work
+// between them, not for guaranteeing an outcome it cannot control. Charging
+// only on release meant refusing work was cheaper than approving it, which
+// priced refusal as the rational default. These tests pin the corrected model.
+
+/// A commission nobody ever delivered against costs nothing. No connection was
+/// made, so there is nothing to charge for.
+#[tokio::test]
+async fn a_commission_with_no_submission_refunds_without_any_fee() {
+    let mut w = world().await;
+    let seed = 30;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![10_000], dl, 7_200, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+    send(&mut w.ctx, &[cancel_ix(w.creator.pubkey(), commission)], &[&w.creator]).await.unwrap();
+
+    let backer_before = balance(&mut w.ctx, w.backer_a.pubkey()).await;
+    let treasury_before = balance(&mut w.ctx, w.treasury.pubkey()).await;
+    send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await.unwrap();
+
+    assert_eq!(
+        balance(&mut w.ctx, w.backer_a.pubkey()).await - backer_before,
+        1_000_000,
+        "a backer must get every lamport back when no work was ever delivered"
+    );
+    assert_eq!(
+        balance(&mut w.ctx, w.treasury.pubkey()).await - treasury_before,
+        0,
+        "the protocol must not charge for a connection it never made"
+    );
+    assert_eq!(balance(&mut w.ctx, vault).await, 890_880);
+}
+
+/// Once work has been delivered the protocol has done its job, so the fee is
+/// charged whichever way the money leaves — and the creator can no longer save
+/// money by refusing rather than approving.
+#[tokio::test]
+async fn refusing_delivered_work_costs_the_creator_exactly_what_approving_costs() {
+    let mut w = world().await;
+    let seed = 31;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![10_000], dl, 7_200, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[reject_ix(w.creator.pubkey(), commission)], &[&w.creator]).await.unwrap();
+
+    // Nobody re-accepts and the delivery clock runs out.
+    let deadline = commission_state(&mut w.ctx, commission).await.delivery_deadline;
+    warp_past(&mut w.ctx, deadline).await;
+
+    let backer_before = balance(&mut w.ctx, w.backer_a.pubkey()).await;
+    let treasury_before = balance(&mut w.ctx, w.treasury.pubkey()).await;
+    send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await
+        .expect("an expired commission must refund even after being rejected back into the pool");
+
+    let fee = balance(&mut w.ctx, w.treasury.pubkey()).await - treasury_before;
+    let returned = balance(&mut w.ctx, w.backer_a.pubkey()).await - backer_before;
+    assert_eq!(fee, 10_000, "1% is charged because work was actually delivered");
+    assert_eq!(returned, 990_000, "the backer receives the rest");
+    assert_eq!(fee + returned, 1_000_000, "conservation: every lamport is accounted for");
+    assert_eq!(balance(&mut w.ctx, vault).await, 890_880, "the vault closes exactly");
+}
+
+/// Rejection cycles must not multiply the fee. An agent who resubmits ten times
+/// would otherwise be able to burn ten percent of backer money for the price of
+/// a few transaction fees.
+#[tokio::test]
+async fn repeated_rejections_cannot_multiply_the_fee() {
+    let mut w = world().await;
+    let seed = 32;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![10_000], dl, 86_400, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+
+    // Five full submit/reject cycles.
+    for _ in 0..5 {
+        send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+        send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+        send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+        send(&mut w.ctx, &[reject_ix(w.creator.pubkey(), commission)], &[&w.creator]).await.unwrap();
+    }
+    let c = commission_state(&mut w.ctx, commission).await;
+    assert_eq!(c.rejections, 5);
+    assert_eq!(c.submissions, 5);
+
+    let deadline = c.delivery_deadline;
+    warp_past(&mut w.ctx, deadline).await;
+    let treasury_before = balance(&mut w.ctx, w.treasury.pubkey()).await;
+    send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await.unwrap();
+
+    assert_eq!(
+        balance(&mut w.ctx, w.treasury.pubkey()).await - treasury_before,
+        10_000,
+        "five rejections must still cost exactly one percent, not five"
+    );
+    assert_eq!(balance(&mut w.ctx, vault).await, 890_880);
+}
+
+/// Half released and half refunded must still total exactly one percent: the fee
+/// follows the lamport out of escrow, and each lamport leaves once.
+#[tokio::test]
+async fn a_partly_released_commission_is_charged_exactly_one_percent_overall() {
+    let mut w = world().await;
+    let seed = 33;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![5_000, 5_000], dl, 7_200, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+
+    let treasury_before = balance(&mut w.ctx, w.treasury.pubkey()).await;
+    // Milestone one is accepted and paid.
+    send(
+        &mut w.ctx,
+        &[release_ix(w.creator.pubkey(), commission, vault, w.agent.pubkey(), w.treasury.pubkey(), 0)],
+        &[&w.creator],
+    ).await.unwrap();
+    // The rest is abandoned and refunds.
+    let deadline = commission_state(&mut w.ctx, commission).await.delivery_deadline;
+    warp_past(&mut w.ctx, deadline).await;
+    send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await.unwrap();
+
+    assert_eq!(
+        balance(&mut w.ctx, w.treasury.pubkey()).await - treasury_before,
+        10_000,
+        "half paid and half refunded is still one percent of the pot, once"
+    );
+    let c = commission_state(&mut w.ctx, commission).await;
+    assert_eq!(c.released + c.refunded, c.total_pledged, "conservation");
+    assert_eq!(balance(&mut w.ctx, vault).await, 890_880);
+}
+
+/// A claim that matures after the delivery deadline opens both "anyone may
+/// release to the agent" and "backers may refund" at once. Without protection
+/// the agent loses a race to a fast backer for work they actually delivered.
+#[tokio::test]
+async fn a_matured_claim_survives_a_refund_race_but_does_not_lock_escrow() {
+    let mut w = world().await;
+    let seed = 34;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    // Review window outlasts the delivery window on purpose.
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![10_000], dl, 3_600, 7_200,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+
+    let c = commission_state(&mut w.ctx, commission).await;
+    let review_ends = c.submitted_at + c.review_window;
+    assert!(review_ends > c.delivery_deadline, "the race window must actually exist here");
+
+    // Past both the delivery deadline and the review window: the claim has
+    // matured and the escrow looks refundable at the same moment.
+    warp_past(&mut w.ctx, review_ends).await;
+    assert!(
+        send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await.is_err(),
+        "a backer must not be able to outrace an agent to work that was delivered"
+    );
+
+    let agent_before = balance(&mut w.ctx, w.agent.pubkey()).await;
+    send(
+        &mut w.ctx,
+        &[release_ix(w.backer_b.pubkey(), commission, vault, w.agent.pubkey(), w.treasury.pubkey(), 0)],
+        &[&w.backer_b],
+    ).await.expect("the matured claim is still payable by anyone");
+    assert_eq!(balance(&mut w.ctx, w.agent.pubkey()).await - agent_before, 990_000);
+}
+
+/// The grace period must be bounded. An agent who submits and then vanishes
+/// cannot be allowed to hold the escrow shut forever.
+#[tokio::test]
+async fn an_unclaimed_matured_delivery_eventually_releases_the_escrow() {
+    let mut w = world().await;
+    let seed = 35;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![10_000], dl, 3_600, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+
+    let c = commission_state(&mut w.ctx, commission).await;
+    // One second short of the grace expiring, the claim still holds.
+    let grace_ends = c.submitted_at + c.review_window + 86_400;
+    warp_past(&mut w.ctx, grace_ends - 120).await;
+    assert!(
+        send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await.is_err(),
+        "the claim is protected for the whole grace period"
+    );
+
+    // After it, the escrow must come back rather than staying locked.
+    warp_past(&mut w.ctx, grace_ends).await;
+    let treasury_before = balance(&mut w.ctx, w.treasury.pubkey()).await;
+    send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await
+        .expect("an abandoned claim must not lock backer money forever");
+    assert_eq!(
+        balance(&mut w.ctx, w.treasury.pubkey()).await - treasury_before,
+        10_000,
+        "work was delivered, so the connection fee still applies"
+    );
+    assert_eq!(balance(&mut w.ctx, vault).await, 890_880);
+}
+
+/// A commission rejected back into the pool and never re-accepted must not sit
+/// idle: unacceptable because its delivery clock is up, unrefundable because its
+/// funding deadline has not arrived.
+#[tokio::test]
+async fn a_rejected_commission_nobody_re_accepts_does_not_sit_idle() {
+    let mut w = world().await;
+    let seed = 36;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    // Funding window far longer than the delivery window.
+    let dl = soon(&mut w.ctx, 20 * 86_400).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![10_000], dl, 3_600, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[reject_ix(w.creator.pubkey(), commission)], &[&w.creator]).await.unwrap();
+
+    let deadline = commission_state(&mut w.ctx, commission).await.delivery_deadline;
+    warp_past(&mut w.ctx, deadline).await;
+
+    // Re-accepting is refused: the clock it would inherit has already run out.
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    assert!(
+        send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.is_err(),
+        "an agent must not inherit a delivery clock that has already expired"
+    );
+
+    // So the money must be refundable, long before the funding deadline.
+    send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await
+        .expect("escrow must not idle until the funding deadline once delivery has lapsed");
+    assert_eq!(balance(&mut w.ctx, vault).await, 890_880);
+}
+
+/// Refund now moves lamports to a treasury account supplied by the caller. That
+/// is a new substitution surface: if it were unchecked, any backer could name
+/// themselves and collect the fee, or point it at an account whose balance the
+/// program would then corrupt.
+#[tokio::test]
+async fn the_refund_fee_cannot_be_redirected_to_an_attacker() {
+    let mut w = world().await;
+    let seed = 37;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![10_000], dl, 3_600, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[reject_ix(w.creator.pubkey(), commission)], &[&w.creator]).await.unwrap();
+    let deadline = commission_state(&mut w.ctx, commission).await.delivery_deadline;
+    warp_past(&mut w.ctx, deadline + 86_400).await;
+
+    // A backer naming themselves as the treasury.
+    assert!(
+        send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.backer_a.pubkey())], &[&w.backer_a]).await.is_err(),
+        "a backer must not be able to collect the fee by naming themselves treasury"
+    );
+    // An arbitrary third party.
+    let thief = Keypair::new();
+    assert!(
+        send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, thief.pubkey())], &[&w.backer_a]).await.is_err(),
+        "the fee must not be redirectable to an arbitrary account"
+    );
+    // The vault itself, which the program is also mutating in the same handler.
+    assert!(
+        send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, vault)], &[&w.backer_a]).await.is_err(),
+        "aliasing the vault as the treasury must be refused, not merely survive"
+    );
+    // The commission account, whose data the program writes in the same handler.
+    assert!(
+        send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, commission)], &[&w.backer_a]).await.is_err(),
+        "aliasing the commission as the treasury must be refused"
+    );
+
+    // Only the treasury recorded at creation is accepted, and conservation holds.
+    let treasury_before = balance(&mut w.ctx, w.treasury.pubkey()).await;
+    let backer_before = balance(&mut w.ctx, w.backer_a.pubkey()).await;
+    send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await.unwrap();
+    let fee = balance(&mut w.ctx, w.treasury.pubkey()).await - treasury_before;
+    let returned = balance(&mut w.ctx, w.backer_a.pubkey()).await - backer_before;
+    assert_eq!(fee, 10_000);
+    assert_eq!(fee + returned, 1_000_000, "no lamport is created or destroyed");
+    assert_eq!(balance(&mut w.ctx, vault).await, 890_880);
+}
+
+/// F-1, found by adversarial review of the rejection change.
+///
+/// Returning a rejected commission to the pool accidentally handed the creator
+/// back their at-will cancellation right. Reject (which clears the submission)
+/// and cancel in the same slot, and the escrow is gone before the agent can be
+/// re-hired or resubmit — defeating the delivery clock the rejection was
+/// specifically designed to keep running.
+#[tokio::test]
+async fn rejection_cannot_be_laundered_into_an_instant_creator_cancellation() {
+    let mut w = world().await;
+    let seed = 38;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![10_000], dl, 86_400, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 1_000_000)], &[&w.backer_a]).await.unwrap();
+
+    // Before anyone commits, the creator may still back out freely.
+    // (Verified on a separate commission so this one can continue.)
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[reject_ix(w.creator.pubkey(), commission)], &[&w.creator]).await.unwrap();
+    assert_eq!(commission_state(&mut w.ctx, commission).await.status, Status::Funded);
+
+    // THE ATTACK: cancel immediately after rejecting, in the same phase.
+    assert!(
+        send(&mut w.ctx, &[cancel_ix(w.creator.pubkey(), commission)], &[&w.creator]).await.is_err(),
+        "a creator must not be able to reject and then instantly cancel; the delivery clock keeps running"
+    );
+    assert!(
+        send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await.is_err(),
+        "nor reach the escrow through a refund while that clock is still live"
+    );
+
+    // The agent can therefore still be re-hired and deliver, which is the whole
+    // point of the clock surviving a rejection.
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+    let agent_before = balance(&mut w.ctx, w.agent.pubkey()).await;
+    send(
+        &mut w.ctx,
+        &[release_ix(w.creator.pubkey(), commission, vault, w.agent.pubkey(), w.treasury.pubkey(), 0)],
+        &[&w.creator],
+    ).await.unwrap();
+    assert_eq!(balance(&mut w.ctx, w.agent.pubkey()).await - agent_before, 990_000);
+
+    // And the escrow is still bounded: once the clock runs out it comes back.
+    let (c2, v2) = addresses(w.creator.pubkey(), 39);
+    let dl2 = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_with_windows(w.creator.pubkey(), w.config, c2, v2, 39, 1_000_000, vec![10_000], dl2, 3_600, 3_600)],
+        &[&w.creator],
+    ).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, c2, v2, 1_000_000)], &[&w.backer_a]).await.unwrap();
+    // A commission nobody ever accepted is still cancellable at will.
+    send(&mut w.ctx, &[cancel_ix(w.creator.pubkey(), c2)], &[&w.creator]).await
+        .expect("the pre-agent creator cancel right must be preserved");
+}
+
+/// CRITICAL, found by adversarial review.
+///
+/// `entitled` is a share of `total_pledged - released`, a base that shrinks on a
+/// release but not on other refunds. A release landing BETWEEN two refunds could
+/// therefore leave a later backer entitled to more than the vault still held,
+/// and the handler rejected outright instead of clamping. That froze
+/// `refunded_pledger_count`, so `is_last` never became true, the dust sweep never
+/// fired, and the remainder was stranded permanently with the remaining backers
+/// locked out of their own money.
+///
+/// The interleave is reachable with no malice at all: once a matured claim has
+/// outlived its grace period, "anyone may release it" and "backers may refund"
+/// are BOTH live, so ordinary transaction ordering is enough.
+#[tokio::test]
+async fn a_release_between_refunds_cannot_strand_the_remaining_backers() {
+    let mut w = world().await;
+    let seed = 40;
+    let (commission, vault) = addresses(w.creator.pubkey(), seed);
+    let dl = soon(&mut w.ctx, A_WEEK).await;
+    // Three backers and a two-milestone schedule: the shape the single-backer
+    // fee tests could never have exposed.
+    send(
+        &mut w.ctx,
+        &[create_with_windows(
+            w.creator.pubkey(), w.config, commission, vault, seed,
+            1_000_000, vec![5_000, 5_000], dl, 3_600, 3_600,
+        )],
+        &[&w.creator],
+    ).await.unwrap();
+
+    let backer_c = Keypair::new();
+    send(
+        &mut w.ctx,
+        &[system_instruction::transfer(&w.treasury.pubkey(), &backer_c.pubkey(), 50_000_000)],
+        &[&w.treasury],
+    ).await.unwrap();
+
+    send(&mut w.ctx, &[pledge_ix(w.backer_a.pubkey(), w.config, commission, vault, 400_000)], &[&w.backer_a]).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(w.backer_b.pubkey(), w.config, commission, vault, 300_000)], &[&w.backer_b]).await.unwrap();
+    send(&mut w.ctx, &[pledge_ix(backer_c.pubkey(), w.config, commission, vault, 300_000)], &[&backer_c]).await.unwrap();
+
+    send(&mut w.ctx, &[nominate_ix(w.creator.pubkey(), commission, w.agent.pubkey())], &[&w.creator]).await.unwrap();
+    send(&mut w.ctx, &[accept_ix(w.agent.pubkey(), commission)], &[&w.agent]).await.unwrap();
+    send(&mut w.ctx, &[submit_ix(w.agent.pubkey(), commission, 0)], &[&w.agent]).await.unwrap();
+
+    // Walk past the delivery deadline AND past the claim grace, so refunds and
+    // the matured release are simultaneously live. This is the by-design
+    // overlap, not an exotic edge.
+    let c0 = commission_state(&mut w.ctx, commission).await;
+    warp_past(&mut w.ctx, c0.submitted_at + c0.review_window + 86_400).await;
+
+    // 1. One backer exits first.
+    send(&mut w.ctx, &[refund_ix(w.backer_a.pubkey(), commission, vault, w.treasury.pubkey())], &[&w.backer_a]).await.unwrap();
+
+    // 2. A stranger completes the agent's matured claim, shrinking the base the
+    //    remaining backers were entitled against.
+    send(
+        &mut w.ctx,
+        &[release_ix(w.backer_b.pubkey(), commission, vault, w.agent.pubkey(), w.treasury.pubkey(), 0)],
+        &[&w.backer_b],
+    ).await.expect("a matured claim stays payable by anyone");
+
+    // 3. THE BUG: every remaining backer must still be able to settle.
+    for (kp, label) in [(&w.backer_b, "backer_b"), (&backer_c, "backer_c")] {
+        send(&mut w.ctx, &[refund_ix(kp.pubkey(), commission, vault, w.treasury.pubkey())], &[kp]).await
+            .unwrap_or_else(|e| panic!("{label} was locked out of their own money: {e:?}"));
+    }
+
+    let c = commission_state(&mut w.ctx, commission).await;
+    assert_eq!(c.refunded_pledger_count, c.pledger_count, "every backer settled");
+    assert_eq!(c.released + c.refunded, c.total_pledged, "conservation");
+    assert_eq!(
+        balance(&mut w.ctx, vault).await, 890_880,
+        "not one lamport may be stranded"
+    );
 }

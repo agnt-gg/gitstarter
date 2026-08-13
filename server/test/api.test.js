@@ -16,7 +16,10 @@ test('health and public config expose no secrets', async () => {
   assert.equal(config.feeBasisPoints, 100);
   assert.equal(config.settlementAsset, 'SOL');
   assert.equal(config.lamportsPerSol, 1_000_000_000);
-  assert.equal(config.feePolicy, 'successful_releases_only');
+  assert.equal(config.feePolicy, 'charged_once_per_lamport_when_work_was_delivered');
+  // A fee that now also applies to refunds must be explained where callers look,
+  // not discovered when the money is short.
+  assert.match(config.feeExplainer, /never saw a delivery costs nothing/);
   assert.equal('tokenMint' in config, false);
   assert.equal(JSON.stringify(config).includes('keypair'), false);
 });

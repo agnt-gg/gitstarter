@@ -358,6 +358,7 @@ async fn sol_refund_returns_full_unreleased_pledge_with_zero_fee() {
                 AccountMeta::new(commission_key, false),
                 AccountMeta::new(pledge_key, false),
                 AccountMeta::new(vault, false),
+                AccountMeta::new(treasury.pubkey(), false),
             ],
             EscrowInstruction::Refund,
         )],

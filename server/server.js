@@ -98,7 +98,7 @@ app.get('/api/auth/session', (req, res) => {
   if (!row) return res.status(401).json({ error: 'No active wallet session' });
   res.json({ wallet: row.wallet, expiresAt: row.expires_at });
 });
-app.get('/api/config', (_req, res) => res.json({ cluster: CLUSTER, rpcUrl: PUBLIC_RPC_URL, programId: PROGRAM_ID, settlementAsset: 'SOL', treasuryWallet: TREASURY_WALLET, configPda: CONFIG_PDA, lamportsPerSol: 1_000_000_000, feeBasisPoints: 100, feePolicy: 'successful_releases_only' }));
+app.get('/api/config', (_req, res) => res.json({ cluster: CLUSTER, rpcUrl: PUBLIC_RPC_URL, programId: PROGRAM_ID, settlementAsset: 'SOL', treasuryWallet: TREASURY_WALLET, configPda: CONFIG_PDA, lamportsPerSol: 1_000_000_000, feeBasisPoints: 100, feePolicy: 'charged_once_per_lamport_when_work_was_delivered', feeExplainer: 'The protocol charges 1% for connecting the parties and carrying real work between them. It applies to a milestone release, and to a refund only if a delivery was ever submitted. A commission that never saw a delivery costs nothing.' }));
 function challengeMessage(wallet, nonce, expiresAt) {
   // Domain-bound so a signature collected on another site cannot be replayed
   // here, and stored verbatim so verification compares the whole message rather
@@ -289,6 +289,9 @@ function presentCommission(address, chain, meta, wallet) {
         // Once this is true the agent has earned the milestone and anyone may
         // complete the payment.
         releasableByAnyone: escrow.reviewExpired(chain),
+        // Until this lapses the claim also blocks cancellation and refunds, so
+        // the agent cannot lose a race for work they already delivered.
+        blocksExitUntil: new Date((chain.submission.reviewEndsAt + escrow.CLAIM_GRACE_WINDOW_SECONDS) * 1000).toISOString(),
       }
       : null,
     conduct: {
@@ -296,6 +299,12 @@ function presentCommission(address, chain, meta, wallet) {
       rejections: chain.rejections,
       autoReleases: chain.autoReleases,
     },
+    // The protocol charges 1% for connecting the parties and carrying real work
+    // between them. Once a delivery has been made that fee applies however the
+    // money leaves escrow, so refusing work is no longer cheaper than accepting
+    // it. A commission that never saw a delivery refunds in full.
+    refundFeeApplies: escrow.refundCarriesFee(chain),
+    refundFeeBasisPoints: escrow.refundCarriesFee(chain) ? escrow.FEE_BASIS_POINTS : 0,
     title: meta?.title ?? null,
     description: meta?.description ?? null,
     repositoryUrl: meta?.repository_url ?? null,
