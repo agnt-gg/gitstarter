@@ -290,6 +290,7 @@ Returned as `custom program error: 0x<hex>`.
 
 | Dec | Name | Meaning |
 |---|---|---|
+| 1 | AlreadyInitialized | That account already exists |
 | 2 | Unauthorized | Wrong wallet for this action |
 | 7 | BadStatus | Wrong lifecycle state |
 | 11 | MilestoneAlreadyReleased | Already paid |
