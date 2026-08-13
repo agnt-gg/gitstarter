@@ -363,15 +363,6 @@ textarea{min-height:100px;resize:vertical;font-family:var(--sans)}
 .tasks li.done .pct{color:var(--success-fg)}
 .tasks li.now span.txt{font-weight:600}
 
-/* flash */
-.flash{
-  border:1px solid var(--accent-muted);background:var(--accent-subtle);color:var(--fg);
-  border-radius:var(--radius);padding:12px 16px;font-size:14px;display:flex;gap:8px;align-items:flex-start;
-}
-.flash.warn{background:var(--attention-subtle);border-color:var(--attention-muted)}
-.flash.ok{background:var(--success-subtle);border-color:var(--success-muted)}
-.flash b{font-weight:600}
-
 /* bids */
 .bid{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border-muted)}
 .bid:last-child{border-bottom:0}
@@ -512,7 +503,6 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 <!-- ══ body ══ -->
 <div class="layout">
   <div>
-    <div id="banner"></div>
     <div class="Box" id="listBox"></div>
     <p class="hint" style="text-align:center;margin-top:16px">
       Escrow releases on verified milestones. Unspent tokens are refunded pro-rata.
@@ -564,7 +554,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 <div class="overlay" id="overlay"><div class="dlg" id="dlg"></div></div>
 <div class="toast" id="toast"></div>
 
-<script src="/app.js?v=20260813-audited" defer></script>
+<script src="/app.js?v=20260813-clean-header" defer></script>
 
 </body>
 </html>
