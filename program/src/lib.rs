@@ -56,8 +56,17 @@ pub const BPS_DENOMINATOR: u64 = 10_000;
 /// Only this wallet can initialize the singleton. This closes the deployment
 /// front-running window: without a fixed initializer, the first observer to
 /// call InitConfig becomes admin and chooses the fee treasury.
+///
+/// The mainnet authority is compiled in behind the `mainnet` feature so that a
+/// production binary can never be built with the disposable devnet key by
+/// accident. Switching it is a visible, reviewable, recompiled event.
+#[cfg(not(feature = "mainnet"))]
 pub const INITIALIZER: Pubkey =
     solana_program::pubkey!("4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY");
+
+#[cfg(feature = "mainnet")]
+pub const INITIALIZER: Pubkey =
+    solana_program::pubkey!("AactHbz74TBh1nGkEMeHaAdpwUGQHqnBrKabZefLikYj");
 
 pub const MAX_MILESTONES: usize = 8;
 
@@ -101,6 +110,8 @@ pub enum EscrowError {
     InsufficientVault = 20,
     BadTreasury = 21,
     DeadlineInPast = 22,
+    DeadlinePassed = 23,
+    SelfDealing = 24,
 }
 
 impl From<EscrowError> for ProgramError {
@@ -362,17 +373,43 @@ fn create_pda_account<'a>(
     seeds_with_bump: &[&[u8]],
 ) -> ProgramResult {
     let rent = Rent::get()?;
-    let lamports = rent.minimum_balance(space);
-    let ix = system_instruction::create_account(
-        payer.key,
-        new_account.key,
-        lamports,
-        space as u64,
-        program_id,
-    );
+    let required = rent.minimum_balance(space);
+    let current = new_account.lamports();
+
+    if current == 0 {
+        let ix = system_instruction::create_account(
+            payer.key,
+            new_account.key,
+            required,
+            space as u64,
+            program_id,
+        );
+        return invoke_signed(
+            &ix,
+            &[payer.clone(), new_account.clone(), system_program.clone()],
+            &[seeds_with_bump],
+        );
+    }
+
+    // Every PDA address here is deterministic and therefore precomputable by a
+    // stranger, who can grief the owner by sending 1 lamport to it first: the
+    // system program refuses `create_account` on any funded account. Topping up
+    // then allocating and assigning reaches an identical end state, so a
+    // deliberate grief costs the attacker a lamport and changes nothing.
+    if current < required {
+        solana_program::program::invoke(
+            &system_instruction::transfer(payer.key, new_account.key, required - current),
+            &[payer.clone(), new_account.clone(), system_program.clone()],
+        )?;
+    }
     invoke_signed(
-        &ix,
-        &[payer.clone(), new_account.clone(), system_program.clone()],
+        &system_instruction::allocate(new_account.key, space as u64),
+        &[new_account.clone(), system_program.clone()],
+        &[seeds_with_bump],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(new_account.key, program_id),
+        &[new_account.clone(), system_program.clone()],
         &[seeds_with_bump],
     )
 }
@@ -513,7 +550,10 @@ fn create_commission(
         program_id,
         vault_ai,
     )?;
-    if !vault_ai.data_is_empty() || vault_ai.lamports() != 0 {
+    // Only emptiness proves "not yet initialized". A lamport balance does not:
+    // anyone can send lamports to a precomputable address, and create_pda_account
+    // now absorbs that case rather than letting it block the creator.
+    if !vault_ai.data_is_empty() {
         return Err(EscrowError::AlreadyInitialized.into());
     }
     create_pda_account(
@@ -589,6 +629,9 @@ fn pledge(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Program
     assert_pda(&[SEED_CONFIG], program_id, config_ai)?;
     let cfg = {
         let d = config_ai.try_borrow_data()?;
+        if d.is_empty() || d[0] != TAG_CONFIG {
+            return Err(EscrowError::BadAccountTag.into());
+        }
         Config::try_from_slice(&d).map_err(|_| ProgramError::InvalidAccountData)?
     };
     if cfg.paused {
@@ -597,6 +640,13 @@ fn pledge(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Program
     let mut c = load_commission(commission_ai, program_id)?;
     if c.status != Status::Funding {
         return Err(EscrowError::BadStatus.into());
+    }
+    // A commission at or past its deadline is already refundable. Accepting new
+    // money into it would let pledges and refunds interleave in the same state,
+    // which is what previously allowed a commission to enter Building with a
+    // non-zero refunded balance and strand a milestone that could never be paid.
+    if Clock::get()?.unix_timestamp >= c.deadline {
+        return Err(EscrowError::DeadlinePassed.into());
     }
     assert_pda(
         &[SEED_VAULT, commission_ai.key.as_ref()],
@@ -688,6 +738,15 @@ fn select_agent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     }
     if c.status != Status::Funded {
         return Err(EscrowError::GoalNotMet.into());
+    }
+    // The creator alone decides when milestones release. If the creator could
+    // also be the payee, a commission funded by third parties would be a
+    // one-signature path to draining every backer. A determined creator can
+    // still route through a second wallet, which is why backers are told plainly
+    // that they are trusting the named creator's judgement — but the naive,
+    // one-click version of that theft is closed here.
+    if *agent.key == c.creator {
+        return Err(EscrowError::SelfDealing.into());
     }
     c.pending_agent = *agent.key;
     c.has_pending_agent = true;
@@ -822,6 +881,9 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         program_id,
         pledge_ai,
     )?;
+    if vault_ai.owner != program_id {
+        return Err(EscrowError::BadOwner.into());
+    }
     assert_owned_by_program(pledge_ai, program_id)?;
     let mut p = {
         let d = pledge_ai.try_borrow_data()?;
@@ -897,7 +959,12 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // side can be rugged mid-build: cancellation opens only at the precommitted
     // deadline, by anyone.
     let creator_may_cancel = is_creator && matches!(c.status, Status::Funding | Status::Funded);
-    if !creator_may_cancel && now < c.deadline {
+    // The contracted agent may always walk away. Surrendering their own claim
+    // cannot harm backers — it only releases the remaining escrow for refund
+    // immediately instead of making everyone wait out the deadline.
+    let agent_may_walk_away =
+        c.has_agent && c.agent == *signer.key && c.status == Status::Building;
+    if !creator_may_cancel && !agent_may_walk_away && now < c.deadline {
         return Err(EscrowError::DeadlineNotPassed.into());
     }
     c.status = Status::Cancelled;
