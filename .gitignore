@@ -1,0 +1,11 @@
+node_modules/
+data/
+.env
+*.keypair.json
+*.sqlite*
+program/target/
+.DS_Store
+_*.png
+_patch_*.py
+_probe_*.sh
+*-deploy.tgz

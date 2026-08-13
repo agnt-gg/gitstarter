@@ -1,0 +1,22 @@
+{
+  "name": "gitstarter",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test server/test/*.test.js",
+    "build:client": "esbuild client/app.js --bundle --format=iife --global-name=GitStarterApp --outfile=public/app.js --minify"
+  },
+  "dependencies": {
+    "@solana/spl-token": "0.4.13",
+    "@solana/web3.js": "1.98.4",
+    "better-sqlite3": "11.10.0",
+    "bs58": "6.0.0",
+    "express": "5.1.0",
+    "tweetnacl": "1.0.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.8"
+  }
+}

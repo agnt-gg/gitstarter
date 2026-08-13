@@ -1,0 +1,36 @@
+[package]
+name = "gitstarter-escrow"
+version = "0.1.0"
+edition = "2021"
+description = "Milestone escrow for crowdfunded agent commissions, with a fixed 1% protocol fee."
+license = "MIT"
+repository = "https://github.com/agnt-gg/gitstarter"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "gitstarter_escrow"
+
+# Deliberately minimal. The only dependencies are the Solana runtime bindings
+# and borsh. In particular we do NOT depend on spl-token: the two things we
+# need from it (a TransferChecked instruction and the token-account layout)
+# are hand-encoded in `spl` below. That removes an entire class of
+# dependency-version breakage and makes every byte we send auditable here.
+[dependencies]
+solana-program = "1.18"
+borsh = "0.10.4"
+borsh-derive = "0.10.4"
+
+[dev-dependencies]
+solana-program-test = "1.18"
+solana-sdk = "1.18"
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+no-entrypoint = []
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
