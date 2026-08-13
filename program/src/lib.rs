@@ -70,6 +70,17 @@ pub const INITIALIZER: Pubkey =
 
 pub const MAX_MILESTONES: usize = 8;
 
+/// Hard ceiling on how far out a deadline may be set.
+///
+/// Without it, `deadline` only had a lower bound, so a commission could be
+/// created with a deadline centuries away. Once such a commission reached
+/// Building, every exit was closed: the creator cannot cancel mid-build, the
+/// deadline never arrives, and refunds require Cancelled or Funding. The escrow
+/// became permanently unreachable, and a creator/agent pair could hold it for
+/// ransom. Bounding the deadline converts that permanent lock into a worst-case
+/// wait, without weakening the mid-build protection an agent relies on.
+pub const MAX_COMMISSION_DURATION: i64 = 180 * 86_400;
+
 pub const SEED_CONFIG: &[u8] = b"config";
 pub const SEED_COMMISSION: &[u8] = b"commission";
 pub const SEED_VAULT: &[u8] = b"vault";
@@ -112,6 +123,9 @@ pub enum EscrowError {
     DeadlineInPast = 22,
     DeadlinePassed = 23,
     SelfDealing = 24,
+    DeadlineTooFar = 25,
+    GoalTooSmall = 26,
+    NoPendingAgent = 27,
 }
 
 impl From<EscrowError> for ProgramError {
@@ -312,6 +326,11 @@ pub enum Instruction {
     /// 8. Nominated agent independently accepts the funded contract.
     /// Accounts: [agent(s)] [commission(w)]
     AcceptAgent,
+
+    /// 9. Creator withdraws a nomination the nominee never accepted, so one
+    ///    unresponsive counterparty cannot strand a successfully funded raise.
+    /// Accounts: [creator(s)] [commission(w)]
+    RevokeAgent,
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -437,6 +456,7 @@ pub fn process_instruction(
         Instruction::Cancel => cancel(program_id, accounts),
         Instruction::SetPaused { paused } => set_paused(program_id, accounts, paused),
         Instruction::AcceptAgent => accept_agent(program_id, accounts),
+        Instruction::RevokeAgent => revoke_agent(program_id, accounts),
     }
 }
 
@@ -453,6 +473,13 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], treasury: Pubkey) 
     }
     if *system_program.key != solana_program::system_program::ID {
         return Err(EscrowError::BadOwner.into());
+    }
+    // The treasury is snapshotted into every commission created under this
+    // config. A treasury that cannot receive lamports would make every release
+    // fail permanently, so it is validated once, here, rather than discovered
+    // later by a creator whose commission can never pay out.
+    if treasury == Pubkey::default() || treasury == solana_program::system_program::ID {
+        return Err(EscrowError::BadTreasury.into());
     }
     let bump = assert_pda(&[SEED_CONFIG], program_id, config_ai)?;
 
@@ -514,11 +541,17 @@ fn create_commission(
     if cfg.paused {
         return Err(EscrowError::Paused.into());
     }
-    if goal == 0 {
-        return Err(EscrowError::AmountZero.into());
+    // A goal below one basis-point unit lets an individual milestone slice floor
+    // to zero lamports, which reverts and wedges the schedule short of Delivered.
+    if goal < BPS_DENOMINATOR {
+        return Err(EscrowError::GoalTooSmall.into());
     }
-    if deadline <= Clock::get()?.unix_timestamp {
+    let now = Clock::get()?.unix_timestamp;
+    if deadline <= now {
         return Err(EscrowError::DeadlineInPast.into());
+    }
+    if deadline > now.saturating_add(MAX_COMMISSION_DURATION) {
+        return Err(EscrowError::DeadlineTooFar.into());
     }
     if milestone_bps.is_empty() || milestone_bps.len() > MAX_MILESTONES {
         return Err(EscrowError::BadMilestones.into());
@@ -550,10 +583,13 @@ fn create_commission(
         program_id,
         vault_ai,
     )?;
-    // Only emptiness proves "not yet initialized". A lamport balance does not:
-    // anyone can send lamports to a precomputable address, and create_pda_account
-    // now absorbs that case rather than letting it block the creator.
-    if !vault_ai.data_is_empty() {
+    // The vault holds zero bytes for its whole life, so `data_is_empty()` is
+    // always true here and cannot serve as the reinit guard. Ownership is the
+    // property that actually changes: an initialised vault belongs to this
+    // program, an uninitialised address still belongs to the system program.
+    // A lamport balance proves nothing either way, since anyone may send to a
+    // precomputable address, and create_pda_account absorbs that case.
+    if vault_ai.owner != &solana_program::system_program::ID {
         return Err(EscrowError::AlreadyInitialized.into());
     }
     create_pda_account(
@@ -688,6 +724,9 @@ fn pledge(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Program
     } else {
         assert_owned_by_program(pledge_ai, program_id)?;
         let d = pledge_ai.try_borrow_data()?;
+        if d.is_empty() || d[0] != TAG_PLEDGE {
+            return Err(EscrowError::BadAccountTag.into());
+        }
         let existing = Pledge::try_from_slice(&d).map_err(|_| ProgramError::InvalidAccountData)?;
         if existing.commission != *commission_ai.key || existing.backer != *backer.key {
             return Err(EscrowError::BadPda.into());
@@ -767,12 +806,39 @@ fn accept_agent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     if c.pending_agent != *agent.key {
         return Err(EscrowError::Unauthorized.into());
     }
+    // Accepting an expired commission would move already-refundable money into
+    // Building, where the creator could still release it. Backers who consider
+    // that commission dead must not have to race a late acceptance.
+    if Clock::get()?.unix_timestamp >= c.deadline {
+        return Err(EscrowError::DeadlinePassed.into());
+    }
     c.agent = *agent.key;
     c.has_agent = true;
     c.has_pending_agent = false;
     c.status = Status::Building;
     save(commission_ai, &c)?;
     msg!("agent accepted");
+    Ok(())
+}
+
+fn revoke_agent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let ai = &mut accounts.iter();
+    let creator = next_account_info(ai)?;
+    let commission_ai = next_account_info(ai)?;
+    assert_signer(creator)?;
+    let mut c = load_commission(commission_ai, program_id)?;
+    if c.creator != *creator.key {
+        return Err(EscrowError::Unauthorized.into());
+    }
+    // Only an unaccepted nomination may be withdrawn. Once an agent has signed,
+    // their contract is theirs and only they can end it early.
+    if c.has_agent || !c.has_pending_agent {
+        return Err(EscrowError::NoPendingAgent.into());
+    }
+    c.pending_agent = Pubkey::default();
+    c.has_pending_agent = false;
+    save(commission_ai, &c)?;
+    msg!("nomination withdrawn");
     Ok(())
 }
 
@@ -866,8 +932,12 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let vault_ai = next_account_info(ai)?;
     assert_signer(backer)?;
     let mut c = load_commission(commission_ai, program_id)?;
+    // A commission that met its goal and then expired without an agent holds
+    // backer money exactly as a Funding one does. Requiring a third party to pay
+    // for a Cancel first served no purpose.
     let refundable = c.status == Status::Cancelled
-        || (c.status == Status::Funding && Clock::get()?.unix_timestamp >= c.deadline);
+        || (matches!(c.status, Status::Funding | Status::Funded)
+            && Clock::get()?.unix_timestamp >= c.deadline);
     if !refundable {
         return Err(EscrowError::BadStatus.into());
     }
@@ -887,6 +957,9 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     assert_owned_by_program(pledge_ai, program_id)?;
     let mut p = {
         let d = pledge_ai.try_borrow_data()?;
+        if d.is_empty() || d[0] != TAG_PLEDGE {
+            return Err(EscrowError::BadAccountTag.into());
+        }
         Pledge::try_from_slice(&d).map_err(|_| ProgramError::InvalidAccountData)?
     };
     if p.backer != *backer.key || p.commission != *commission_ai.key {
@@ -912,9 +985,13 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             .checked_sub(p.refunded)
             .ok_or(EscrowError::MathOverflow)?
     };
-    if amount == 0 || amount > c.escrow_remaining()? {
+    if amount > c.escrow_remaining()? {
         return Err(EscrowError::NothingToRefund.into());
     }
+    // A dust-sized pledge can be entitled to exactly zero after flooring. That is
+    // still a settled claim, and it must be recorded: refusing it would stop
+    // `refunded_pledger_count` from ever reaching `pledger_count`, so the final
+    // refunder's sweep would never fire and the remainder would strand forever.
     p.refunded = p
         .refunded
         .checked_add(amount)
@@ -930,14 +1007,16 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         .ok_or(EscrowError::MathOverflow)?;
     save(pledge_ai, &p)?;
     save(commission_ai, &c)?;
-    **vault_ai.try_borrow_mut_lamports()? = vault_ai
-        .lamports()
-        .checked_sub(amount)
-        .ok_or(EscrowError::InsufficientVault)?;
-    **backer.try_borrow_mut_lamports()? = backer
-        .lamports()
-        .checked_add(amount)
-        .ok_or(EscrowError::MathOverflow)?;
+    if amount > 0 {
+        **vault_ai.try_borrow_mut_lamports()? = vault_ai
+            .lamports()
+            .checked_sub(amount)
+            .ok_or(EscrowError::InsufficientVault)?;
+        **backer.try_borrow_mut_lamports()? = backer
+            .lamports()
+            .checked_add(amount)
+            .ok_or(EscrowError::MathOverflow)?;
+    }
     msg!("refunded {} lamports, fee=0", amount);
     Ok(())
 }
@@ -962,8 +1041,7 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // The contracted agent may always walk away. Surrendering their own claim
     // cannot harm backers — it only releases the remaining escrow for refund
     // immediately instead of making everyone wait out the deadline.
-    let agent_may_walk_away =
-        c.has_agent && c.agent == *signer.key && c.status == Status::Building;
+    let agent_may_walk_away = c.has_agent && c.agent == *signer.key && c.status == Status::Building;
     if !creator_may_cancel && !agent_may_walk_away && now < c.deadline {
         return Err(EscrowError::DeadlineNotPassed.into());
     }
@@ -1065,6 +1143,25 @@ mod tests {
         assert!(
             c.escrow_remaining().is_err(),
             "must not underflow into a huge number"
+        );
+    }
+
+    /// The production authority is selected by a feature flag, and an optimising
+    /// build inlines it rather than storing it as a searchable literal. This is
+    /// the only reliable way to prove which key a given artifact will trust.
+    #[test]
+    fn initializer_matches_the_target_network() {
+        #[cfg(feature = "mainnet")]
+        assert_eq!(
+            INITIALIZER.to_string(),
+            "AactHbz74TBh1nGkEMeHaAdpwUGQHqnBrKabZefLikYj",
+            "a mainnet build must trust only the production authority"
+        );
+        #[cfg(not(feature = "mainnet"))]
+        assert_eq!(
+            INITIALIZER.to_string(),
+            "4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY",
+            "a default build must trust only the disposable devnet authority"
         );
     }
 

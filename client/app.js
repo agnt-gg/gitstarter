@@ -15,6 +15,28 @@ const WALLETS = [
   {id:'brave',name:'Brave Wallet',logo:'/wallets/brave.png',url:'https://brave.com/wallet/',provider:()=>window.braveSolana},
   {id:'trust',name:'Trust Wallet',logo:'/wallets/trust.svg',url:'https://trustwallet.com/download',provider:()=>window.trustwallet?.solana}
 ];
+// Everything a transaction is built from is pinned here, in code the user
+// downloads, rather than taken from an API response. Without this, whoever can
+// answer /api/config — a compromised server, a hostile proxy, a stolen TLS
+// session — could hand back their own program id and have the wallet sign a
+// transfer of the user's whole balance into it. The server may describe
+// commissions; it may not choose what you sign.
+const PINNED = {
+  programId:'6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy',
+  configPda:'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29',
+  treasuryWallet:'4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY',
+  cluster:'devnet',
+  rpcHosts:['api.devnet.solana.com']
+};
+function verifyConfig(config){
+  for(const field of ['programId','configPda','treasuryWallet','cluster']){
+    if(config[field]!==PINNED[field])throw new Error(`Refusing to continue: the server reported a ${field} that does not match this build. Do not sign anything.`);
+  }
+  let host;
+  try{host=new URL(config.rpcUrl).host;}catch{throw new Error('Refusing to continue: the server reported an unusable RPC endpoint.');}
+  if(!PINNED.rpcHosts.includes(host))throw new Error('Refusing to continue: the server reported an untrusted RPC endpoint. Do not sign anything.');
+  return config;
+}
 const STATUS = ['funding','funded','building','shipped','refunded'];
 const STATUS_UI = {
   funding:{label:'Open',detail:'Open for pledges',cls:'blue',icon:'circle'}, funded:{label:'Funded',detail:'Funded — accepting agent',cls:'yellow',icon:'clock'}, building:{label:'In progress',detail:'In progress',cls:'purple',icon:'play'}, shipped:{label:'Delivered',detail:'Delivered',cls:'green',icon:'check'}, refunded:{label:'Closed',detail:'Closed — refundable',cls:'gray',icon:'x'}
@@ -83,7 +105,9 @@ async function connectWallet(walletId){
     const publicKey=result?.publicKey||provider.publicKey;
     if(!publicKey)throw new Error(`${wallet.name} did not return a wallet address`);
     const address=publicKey.toBase58();
-    if(state.sessionWallet&&state.sessionWallet!==address){state.session=null;state.sessionWallet=null;}
+    // Switching wallets must end the previous session on the server too, not
+    // just forget it in this tab.
+    if(state.sessionWallet&&state.sessionWallet!==address){try{await api('/api/auth/logout',{method:'POST'});}catch{}state.session=null;state.sessionWallet=null;}
     state.provider=provider;state.wallet=publicKey;state.walletName=wallet.name;state.authStatus=state.session?'authenticated':'connected';localStorage.setItem('gitstarter.wallet',wallet.id);
     closeDialog();render();
     if(state.session){await refresh();return;}
@@ -192,4 +216,4 @@ document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('overlay').classList.contains('on'))closeDialog();});
 $('q').addEventListener('input',render);
 document.addEventListener('change',event=>{if(event.target.id==='sortSelect'){state.sort=event.target.value;render();}});
-(async()=>{try{state.config=await api('/api/config');state.connection=new web3.Connection(state.config.rpcUrl,'confirmed');await refresh();await restoreSession();}catch(e){showError(e);}})();
+(async()=>{try{state.config=verifyConfig(await api('/api/config'));state.connection=new web3.Connection(state.config.rpcUrl,'confirmed');await refresh();await restoreSession();}catch(e){showError(e);}})();

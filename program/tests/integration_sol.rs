@@ -43,6 +43,16 @@ async fn send(
         ))
         .await
 }
+/// Deadlines are bounded, so tests take one relative to the validator clock
+/// rather than a fixed timestamp that drifts out of range.
+async fn soon(ctx: &mut ProgramTestContext, seconds: i64) -> i64 {
+    ctx.banks_client
+        .get_sysvar::<solana_program::clock::Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp
+        + seconds
+}
 async fn balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
     ctx.banks_client.get_balance(key).await.unwrap()
 }
@@ -123,6 +133,7 @@ fn create(
     seed: u64,
     goal: u64,
     bps: Vec<u16>,
+    deadline: i64,
 ) -> Instruction {
     ix(
         vec![
@@ -136,7 +147,7 @@ fn create(
             seed,
             goal,
             milestone_bps: bps,
-            deadline: i64::MAX / 2,
+            deadline,
         },
     )
 }
@@ -163,6 +174,7 @@ fn pledge(
 #[tokio::test]
 async fn sol_funding_release_charges_one_percent_only_on_success() {
     let (mut ctx, creator, backer, _b2, agent, treasury, config) = setup().await;
+    let deadline = soon(&mut ctx, 7 * 86_400).await;
     let seed = 7u64;
     let (commission_key, _) = Pubkey::find_program_address(
         &[
@@ -190,8 +202,9 @@ async fn sol_funding_release_charges_one_percent_only_on_success() {
             commission_key,
             vault,
             seed,
-            10_000,
+            1_000_000,
             vec![5_000, 5_000],
+            deadline,
         )],
         &[&creator],
     )
@@ -206,13 +219,13 @@ async fn sol_funding_release_charges_one_percent_only_on_success() {
             commission_key,
             pledge_key,
             vault,
-            10_000,
+            1_000_000,
         )],
         &[&backer],
     )
     .await
     .unwrap();
-    assert_eq!(balance(&mut ctx, vault).await - before, 10_000);
+    assert_eq!(balance(&mut ctx, vault).await - before, 1_000_000);
     assert_eq!(
         commission(&mut ctx, commission_key).await.status,
         Status::Funded
@@ -264,16 +277,17 @@ async fn sol_funding_release_charges_one_percent_only_on_success() {
     .unwrap();
     assert_eq!(
         balance(&mut ctx, agent.pubkey()).await - agent_before,
-        4_950
+        495_000
     );
     assert_eq!(
         balance(&mut ctx, treasury.pubkey()).await - treasury_before,
-        50
+        5_000
     );
 }
 #[tokio::test]
 async fn sol_refund_returns_full_unreleased_pledge_with_zero_fee() {
     let (mut ctx, creator, backer, _b2, _agent, treasury, config) = setup().await;
+    let deadline = soon(&mut ctx, 7 * 86_400).await;
     let seed = 8u64;
     let (commission_key, _) = Pubkey::find_program_address(
         &[
@@ -302,8 +316,9 @@ async fn sol_refund_returns_full_unreleased_pledge_with_zero_fee() {
                 commission_key,
                 vault,
                 seed,
-                20_000,
+                2_000_000,
                 vec![10_000],
+                deadline,
             ),
             pledge(
                 backer.pubkey(),
@@ -311,7 +326,7 @@ async fn sol_refund_returns_full_unreleased_pledge_with_zero_fee() {
                 commission_key,
                 pledge_key,
                 vault,
-                10_000,
+                1_000_000,
             ),
         ],
         &[&creator, &backer],
@@ -350,7 +365,7 @@ async fn sol_refund_returns_full_unreleased_pledge_with_zero_fee() {
     .unwrap();
     assert_eq!(
         balance(&mut ctx, backer.pubkey()).await - backer_before,
-        10_000
+        1_000_000
     );
     assert_eq!(balance(&mut ctx, treasury.pubkey()).await, treasury_before);
     let c = commission(&mut ctx, commission_key).await;

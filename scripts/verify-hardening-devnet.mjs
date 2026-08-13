@@ -71,6 +71,14 @@ const acceptIx = (agent, commission) => new TransactionInstruction({
   ],
   data: Buffer.from([8]),
 });
+const revokeIx = (creator, commission) => new TransactionInstruction({
+  programId: PROGRAM,
+  keys: [
+    { pubkey: creator, isSigner: true, isWritable: false },
+    { pubkey: commission, isSigner: false, isWritable: true },
+  ],
+  data: Buffer.from([9]),
+});
 const cancelIx = (signer, commission) => new TransactionInstruction({
   programId: PROGRAM,
   keys: [
@@ -111,8 +119,32 @@ await send([pledgeIx(backer.publicKey, commission, vault, 2_000_000)], [backer])
 await pause();
 
 console.log('Live devnet enforcement:');
+
+// A deadline far enough out is indistinguishable from never, which is what made
+// escrow permanently unreachable.
+await rejects('a deadline beyond the ceiling (permanent-lock primitive)', async () => {
+  const s = seed + 1;
+  const { commission: c2, vault: v2 } = addresses(creator.publicKey, s);
+  await send([createIx(creator.publicKey, c2, v2, s, 2_000_000, [10_000], Math.floor(Date.now() / 1000) + 400 * 86400)], [creator]);
+});
+await rejects('a goal small enough to floor a milestone slice to zero', async () => {
+  const s = seed + 2;
+  const { commission: c3, vault: v3 } = addresses(creator.publicKey, s);
+  await send([createIx(creator.publicKey, c3, v3, s, 500, [5_000, 5_000], far)], [creator]);
+});
+
 await rejects('creator naming themselves as the paid agent',
   () => send([nominateIx(creator.publicKey, commission, creator.publicKey)], [creator]));
+
+// An unaccepted nomination must be withdrawable, so one unresponsive nominee
+// cannot strand a funded raise.
+await send([nominateIx(creator.publicKey, commission, backer.publicKey)], [creator]);
+await pause();
+await send([revokeIx(creator.publicKey, commission)], [creator]);
+await pause();
+console.log('  PASS  unaccepted nomination withdrawn');
+await rejects('a withdrawn nominee accepting anyway',
+  () => send([acceptIx(backer.publicKey, commission)], [backer]));
 
 await send([nominateIx(creator.publicKey, commission, agent.publicKey)], [creator]);
 await pause();

@@ -24,9 +24,11 @@ Cancelled ◄─────────────┴────────�
 Two signatures, from two different wallets, in two separate transactions:
 
 1. The creator calls **SelectAgent**, naming the agent's wallet. That wallet
-   becomes *pending*.
+   becomes *pending*. If the nominee never responds, the creator can call
+   **RevokeAgent** and name someone else — one unresponsive counterparty cannot
+   strand a funded raise.
 2. The agent calls **AcceptAgent** with their own key. Only then does the
-   commission enter Building.
+   commission enter Building. An expired commission cannot be accepted.
 
 Nobody can be conscripted: a creator cannot bind an agent who has not signed.
 Nobody can gatecrash: a wallet that was not nominated cannot accept. The creator
@@ -110,7 +112,7 @@ The protections that exist are structural rather than judicial:
 | Creator cancels mid-build to avoid paying | Impossible before the deadline once an agent has accepted |
 | Creator pays themselves with backers' money | Creator cannot be the agent |
 | Agent takes the money and disappears | They only ever hold released milestones; the rest refunds at the deadline |
-| Agent sits on a contract doing nothing | The deadline is fixed at creation and cannot be extended |
+| Agent sits on a contract doing nothing | The deadline is fixed at creation, cannot be extended, and cannot exceed 180 days |
 | Creator refuses to release completed work | Agent keeps prior milestones, walks away, and the rest returns to backers |
 
 So the deadline **is** the dispute resolution: a precommitted, unstoppable clock
@@ -130,6 +132,12 @@ Two things follow, and they are the reason this is launching small:
 
 A 2-of-3 arbiter release path is the intended v2 answer. It is not in this
 version.
+
+**Deadlines are capped at 180 days.** That cap is a safety property, not a
+policy: without it a commission could be created with a deadline centuries out,
+and because nobody but the agent may cancel mid-build, the escrow would have been
+unreachable forever — a ransom primitive. The cap turns the worst case into a
+bounded wait.
 
 ## Fees, in full
 
@@ -155,6 +163,18 @@ admin switch over money that is already escrowed.
 vault, or block a release or a refund.
 
 A compromised admin key can stop growth. It cannot take anyone's money.
+
+## What has been reviewed
+
+The program was audited adversarially before launch: an independent security
+pass over every handler, an economic pass that re-derived the fee and refund
+arithmetic by hand, and a web-layer pass. Everything they found that could
+lose, lock, or misdirect money was fixed and is covered by a regression test,
+and each fix was then re-verified against the deployed program rather than only
+in the local harness.
+
+That is not the same as a professional firm signing off. Size early commissions
+accordingly.
 
 ## Costs that are not fees
 

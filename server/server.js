@@ -9,18 +9,50 @@ const { openDatabase } = require('./db');
 
 const PORT = Number(process.env.PORT || 3417);
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+// The server's own RPC endpoint may embed a provider API key. Browsers get a
+// keyless endpoint instead, so /api/config can never hand out billing credentials.
+const PUBLIC_RPC_URL = process.env.PUBLIC_SOLANA_RPC_URL
+  || (/api-key|\?/i.test(RPC_URL) ? 'https://api.devnet.solana.com' : RPC_URL);
 const CLUSTER = process.env.SOLANA_CLUSTER || 'devnet';
 const PROGRAM_ID = process.env.PROGRAM_ID || '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
 const TREASURY_WALLET = process.env.TREASURY_WALLET || '4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY';
 const CONFIG_PDA = process.env.CONFIG_PDA || 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29';
 const DB_PATH = path.resolve(process.env.DATABASE_PATH || path.join(__dirname, '..', 'data', 'gitstarter.sqlite'));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+// __Host- forbids a Domain attribute and requires Secure + Path=/, so a
+// compromised sibling subdomain cannot force a cookie onto this origin.
+const SESSION_COOKIE = '__Host-gitstarter_session';
+const SIGN_IN_DOMAIN = process.env.SIGN_IN_DOMAIN || 'gitstarter.agnt.gg';
 const db = openDatabase(DB_PATH);
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
 
 function hash(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
+
+// Small in-process limiter. Enough to stop an anonymous caller from overwriting
+// a victim's in-flight nonce in a loop, or growing the nonce table without bound.
+const rateBuckets = new Map();
+function rateLimit(key, limit, windowMs) {
+  const now = Date.now();
+  const hits = (rateBuckets.get(key) || []).filter(t => now - t < windowMs);
+  hits.push(now);
+  rateBuckets.set(key, hits);
+  if (rateBuckets.size > 5000) for (const [k, v] of rateBuckets) if (!v.some(t => now - t < windowMs)) rateBuckets.delete(k);
+  return hits.length <= limit;
+}
+function cleanWallet(value) {
+  const text = cleanText(value, 64);
+  // Alphabet validity is not enough: without a length check every distinct
+  // base58 string becomes a permanent row in the nonce table.
+  if (bs58.decode(text).length !== 32) throw Object.assign(new Error('Invalid wallet'), { status: 400 });
+  return text;
+}
+function purgeExpired() {
+  const now = Date.now();
+  db.prepare('DELETE FROM auth_nonces WHERE expires_at < ?').run(now);
+  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
+}
 function cleanText(value, max) {
   if (typeof value !== 'string') throw Object.assign(new Error('Expected text'), { status: 400 });
   const text = value.trim();
@@ -44,7 +76,7 @@ async function rpc(method, params) {
 function sessionToken(req) {
   const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (bearer) return bearer;
-  const match = (req.headers.cookie || '').match(/(?:^|;\s*)gitstarter_session=([^;]+)/);
+  const match = (req.headers.cookie || '').match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
   return match ? decodeURIComponent(match[1]) : '';
 }
 function activeSession(req) {
@@ -63,20 +95,45 @@ app.get('/api/auth/session', (req, res) => {
   if (!row) return res.status(401).json({ error: 'No active wallet session' });
   res.json({ wallet: row.wallet, expiresAt: row.expires_at });
 });
-app.get('/api/config', (_req, res) => res.json({ cluster: CLUSTER, rpcUrl: RPC_URL, programId: PROGRAM_ID, settlementAsset: 'SOL', treasuryWallet: TREASURY_WALLET, configPda: CONFIG_PDA, lamportsPerSol: 1_000_000_000, feeBasisPoints: 100, feePolicy: 'successful_releases_only' }));
+app.get('/api/config', (_req, res) => res.json({ cluster: CLUSTER, rpcUrl: PUBLIC_RPC_URL, programId: PROGRAM_ID, settlementAsset: 'SOL', treasuryWallet: TREASURY_WALLET, configPda: CONFIG_PDA, lamportsPerSol: 1_000_000_000, feeBasisPoints: 100, feePolicy: 'successful_releases_only' }));
+function challengeMessage(wallet, nonce, expiresAt) {
+  // Domain-bound so a signature collected on another site cannot be replayed
+  // here, and stored verbatim so verification compares the whole message rather
+  // than searching it for a substring.
+  return [
+    'Sign in to GitStarter',
+    `Domain: ${SIGN_IN_DOMAIN}`,
+    `Wallet: ${wallet}`,
+    `Nonce: ${nonce}`,
+    `Expires: ${new Date(expiresAt).toISOString()}`
+  ].join('\n');
+}
 app.post('/api/auth/challenge', (req, res) => {
   let wallet;
-  try { wallet = cleanText(req.body.wallet, 64); bs58.decode(wallet); } catch { return res.status(400).json({ error: 'Invalid wallet' }); }
+  try { wallet = cleanWallet(req.body.wallet); } catch { return res.status(400).json({ error: 'Invalid wallet' }); }
+  if (!rateLimit(`challenge:${req.ip}`, 20, 60_000) || !rateLimit(`challenge:w:${wallet}`, 5, 60_000)) {
+    return res.status(429).json({ error: 'Too many sign-in attempts. Wait a minute and try again.' });
+  }
+  purgeExpired();
   const nonce = crypto.randomBytes(24).toString('base64url');
   const expiresAt = Date.now() + 5 * 60_000;
+  const message = challengeMessage(wallet, nonce, expiresAt);
   db.prepare('INSERT INTO auth_nonces(wallet,nonce,expires_at,used_at) VALUES(?,?,?,NULL) ON CONFLICT(wallet) DO UPDATE SET nonce=excluded.nonce,expires_at=excluded.expires_at,used_at=NULL').run(wallet, nonce, expiresAt);
-  res.json({ message: `Sign in to GitStarter\nWallet: ${wallet}\nNonce: ${nonce}\nExpires: ${new Date(expiresAt).toISOString()}`, expiresAt });
+  res.json({ message, expiresAt });
 });
 app.post('/api/auth/verify', (req, res) => {
   try {
-    const wallet = cleanText(req.body.wallet, 64), message = cleanText(req.body.message, 512), signature = cleanText(req.body.signature, 128);
+    const wallet = cleanWallet(req.body.wallet), message = cleanText(req.body.message, 512), signature = cleanText(req.body.signature, 128);
+    if (!rateLimit(`verify:${req.ip}`, 30, 60_000)) return res.status(429).json({ error: 'Too many sign-in attempts. Wait a minute and try again.' });
     const row = db.prepare('SELECT nonce,expires_at,used_at FROM auth_nonces WHERE wallet=?').get(wallet);
-    if (!row || row.used_at || row.expires_at < Date.now() || !message.includes(`Nonce: ${row.nonce}`) || !message.includes(`Wallet: ${wallet}`)) return res.status(401).json({ error: 'Expired or invalid challenge' });
+    // Byte equality against the message this server issued. Substring matching
+    // let an attacker request a challenge for someone else's wallet, wrap the
+    // nonce in unrelated text on their own site, and turn the victim's signature
+    // into a session here.
+    if (!row || row.used_at || row.expires_at < Date.now()
+      || message !== challengeMessage(wallet, row.nonce, row.expires_at)) {
+      return res.status(401).json({ error: 'Expired or invalid challenge' });
+    }
     if (!nacl.sign.detached.verify(Buffer.from(message), bs58.decode(signature), bs58.decode(wallet))) return res.status(401).json({ error: 'Bad signature' });
     const token = crypto.randomBytes(32).toString('base64url'), now = Date.now();
     db.transaction(() => {
@@ -84,9 +141,17 @@ app.post('/api/auth/verify', (req, res) => {
       db.prepare('INSERT INTO sessions(token_hash,wallet,expires_at,created_at) VALUES(?,?,?,?)').run(hash(token), wallet, now + 30 * 24 * 60 * 60_000, now);
     })();
     const expiresAt = now + 30 * 24 * 60 * 60_000;
-    res.setHeader('Set-Cookie', `gitstarter_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`);
+    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`);
     res.json({ wallet, expiresAt });
   } catch { res.status(400).json({ error: 'Malformed signature request' }); }
+});
+app.post('/api/auth/logout', (req, res) => {
+  // Switching wallets on a shared browser must actually end the previous
+  // session server-side, not merely forget it in the tab.
+  const token = sessionToken(req);
+  if (token) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hash(token));
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`);
+  res.json({ ok: true });
 });
 app.get('/api/commissions', (_req, res) => {
   const rows = db.prepare('SELECT * FROM commissions ORDER BY created_at DESC LIMIT 200').all();
