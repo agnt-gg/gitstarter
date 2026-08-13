@@ -11,7 +11,6 @@ const PORT = Number(process.env.PORT || 3417);
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
 const CLUSTER = process.env.SOLANA_CLUSTER || 'devnet';
 const PROGRAM_ID = process.env.PROGRAM_ID || '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
-const TOKEN_MINT = process.env.TOKEN_MINT || 'HvdV1cjbBeQzKi4GUKVxXJcZY7TM6KUBG8unNDrDy3hz';
 const TREASURY_WALLET = process.env.TREASURY_WALLET || '4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY';
 const CONFIG_PDA = process.env.CONFIG_PDA || 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29';
 const DB_PATH = path.resolve(process.env.DATABASE_PATH || path.join(__dirname, '..', 'data', 'gitstarter.sqlite'));
@@ -64,7 +63,7 @@ app.get('/api/auth/session', (req, res) => {
   if (!row) return res.status(401).json({ error: 'No active wallet session' });
   res.json({ wallet: row.wallet, expiresAt: row.expires_at });
 });
-app.get('/api/config', (_req, res) => res.json({ cluster: CLUSTER, rpcUrl: RPC_URL, programId: PROGRAM_ID, tokenMint: TOKEN_MINT, treasuryWallet: TREASURY_WALLET, configPda: CONFIG_PDA, tokenDecimals: 6, feeBasisPoints: 100 }));
+app.get('/api/config', (_req, res) => res.json({ cluster: CLUSTER, rpcUrl: RPC_URL, programId: PROGRAM_ID, settlementAsset: 'SOL', treasuryWallet: TREASURY_WALLET, configPda: CONFIG_PDA, lamportsPerSol: 1_000_000_000, feeBasisPoints: 100, feePolicy: 'successful_releases_only' }));
 app.post('/api/auth/challenge', (req, res) => {
   let wallet;
   try { wallet = cleanText(req.body.wallet, 64); bs58.decode(wallet); } catch { return res.status(400).json({ error: 'Invalid wallet' }); }

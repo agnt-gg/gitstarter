@@ -14,6 +14,10 @@ test('health and public config expose no secrets', async () => {
   assert.deepEqual(health, { ok: true, database: 'sqlite', cluster: 'devnet' });
   const config = await fetch(base + '/api/config').then(r => r.json());
   assert.equal(config.feeBasisPoints, 100);
+  assert.equal(config.settlementAsset, 'SOL');
+  assert.equal(config.lamportsPerSol, 1_000_000_000);
+  assert.equal(config.feePolicy, 'successful_releases_only');
+  assert.equal('tokenMint' in config, false);
   assert.equal(JSON.stringify(config).includes('keypair'), false);
 });
 test('repository links accept HTTP and reject unsafe schemes', () => {

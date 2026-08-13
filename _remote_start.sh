@@ -6,7 +6,6 @@ PORT=3417
 SOLANA_RPC_URL=https://api.devnet.solana.com
 SOLANA_CLUSTER=devnet
 PROGRAM_ID=6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy
-TOKEN_MINT=HvdV1cjbBeQzKi4GUKVxXJcZY7TM6KUBG8unNDrDy3hz
 TREASURY_WALLET=4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY
 CONFIG_PDA=DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29
 DATABASE_PATH=/var/www/gitstarter.agnt.gg/data/gitstarter.sqlite

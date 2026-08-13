@@ -10,11 +10,9 @@ repository = "https://github.com/agnt-gg/gitstarter"
 crate-type = ["cdylib", "lib"]
 name = "gitstarter_escrow"
 
-# Deliberately minimal. The only dependencies are the Solana runtime bindings
-# and borsh. In particular we do NOT depend on spl-token: the two things we
-# need from it (a TransferChecked instruction and the token-account layout)
-# are hand-encoded in `spl` below. That removes an entire class of
-# dependency-version breakage and makes every byte we send auditable here.
+# Deliberately minimal: native SOL settlement needs only the Solana runtime
+# bindings and borsh. There is no token program, mint, associated-token account,
+# approval, swap, or liquidity dependency in the value path.
 [dependencies]
 solana-program = "1.18"
 borsh = "0.10.4"
