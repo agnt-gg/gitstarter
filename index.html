@@ -419,6 +419,14 @@ footer.ft a{color:var(--accent-fg)}
 .wallet-next{color:var(--fg-muted);font-size:18px}
 .security-note{display:flex;gap:10px;align-items:flex-start;margin-top:16px;padding:12px;border:1px solid var(--border-muted);border-radius:8px;background:var(--canvas-subtle);color:var(--fg-muted);font-size:12px}
 .security-note svg{margin-top:1px;color:var(--success-fg)}
+.account-card{display:none;margin-top:10px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--canvas-subtle)}
+.account-card.on{display:block}
+.account-name{display:flex;align-items:center;gap:8px;font-weight:600}
+.account-dot{width:8px;height:8px;border-radius:50%;background:var(--success-emph);box-shadow:0 0 0 3px var(--success-subtle)}
+.account-address{display:block;margin:6px 0 10px;color:var(--fg-muted);font:12px var(--mono);word-break:break-all}
+.account-state{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:var(--fg-muted)}
+.account-state.signed{color:var(--success-fg)}
+.star-icon{color:#bf8700;fill:#f2cc60}
 .project-shell{display:grid;grid-template-columns:minmax(0,1fr) 280px}
 .project-main{padding:24px;border-right:1px solid var(--border-muted)}
 .project-side{padding:24px;background:var(--canvas-subtle)}
@@ -470,9 +478,9 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
       <svg width="16" height="16" viewBox="0 0 16 16" style="color:var(--fg-muted)"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.249.249 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z"/></svg>
       <span class="owner">gitstarter</span><span class="sep">/</span><span class="name">commissions</span>
       <div class="repo-actions">
-        <a class="btn" href="https://github.com/agnt-gg/gitstarter" target="_blank" rel="noopener noreferrer" aria-label="Open GitStarter source on GitHub">
-          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38l-.01-1.49c-2.01.37-2.53-.49-2.7-.94-.09-.24-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48l-.01 2.2c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"/></svg>
-          Source
+        <a class="btn" href="https://github.com/agnt-gg/gitstarter" target="_blank" rel="noopener noreferrer" aria-label="Star GitStarter on GitHub">
+          <svg class="star-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z"/></svg>
+          Star on GitHub
         </a>
         <button class="btn primary" id="bNew">
           <svg width="16" height="16" viewBox="0 0 16 16"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg>
@@ -519,6 +527,12 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 
     <section>
       <h2>Your account</h2>
+      <div id="accountEmpty" class="hint">Connect a wallet to create your GitStarter identity.</div>
+      <div id="accountCard" class="account-card">
+        <div class="account-name"><span class="account-dot"></span><span id="wAlias">—</span></div>
+        <span class="account-address" id="wAddress">—</span>
+        <div class="account-state" id="wAuth"><span>Wallet connected</span><button class="btn" id="bFinishAuth" type="button">Finish sign-in</button></div>
+      </div>
       <div class="stat"><b id="wBal">—</b> GIT wallet balance</div>
       <div class="stat"><b id="wProj">—</b> commissions created</div>
     </section>
@@ -534,7 +548,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 <div class="overlay" id="overlay"><div class="dlg" id="dlg"></div></div>
 <div class="toast" id="toast"></div>
 
-<script src="/app.js?v=20260813-enterprise-wallets" defer></script>
+<script src="/app.js?v=20260813-account-flow" defer></script>
 
 </body>
 </html>

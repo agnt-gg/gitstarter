@@ -42,14 +42,28 @@ async function rpc(method, params) {
   if (body.error) throw new Error(`RPC ${body.error.message}`);
   return body.result;
 }
+function sessionToken(req) {
+  const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (bearer) return bearer;
+  const match = (req.headers.cookie || '').match(/(?:^|;\s*)gitstarter_session=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : '';
+}
+function activeSession(req) {
+  const token = sessionToken(req);
+  return token && db.prepare('SELECT wallet,expires_at FROM sessions WHERE token_hash=? AND expires_at>?').get(hash(token), Date.now());
+}
 function requireAuth(req, res, next) {
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const row = token && db.prepare('SELECT wallet FROM sessions WHERE token_hash=? AND expires_at>?').get(hash(token), Date.now());
+  const row = activeSession(req);
   if (!row) return res.status(401).json({ error: 'Wallet authentication required' });
   req.wallet = row.wallet; next();
 }
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: 'sqlite', cluster: CLUSTER }));
+app.get('/api/auth/session', (req, res) => {
+  const row = activeSession(req);
+  if (!row) return res.status(401).json({ error: 'No active wallet session' });
+  res.json({ wallet: row.wallet, expiresAt: row.expires_at });
+});
 app.get('/api/config', (_req, res) => res.json({ cluster: CLUSTER, rpcUrl: RPC_URL, programId: PROGRAM_ID, tokenMint: TOKEN_MINT, treasuryWallet: TREASURY_WALLET, configPda: CONFIG_PDA, tokenDecimals: 6, feeBasisPoints: 100 }));
 app.post('/api/auth/challenge', (req, res) => {
   let wallet;
@@ -68,9 +82,11 @@ app.post('/api/auth/verify', (req, res) => {
     const token = crypto.randomBytes(32).toString('base64url'), now = Date.now();
     db.transaction(() => {
       db.prepare('UPDATE auth_nonces SET used_at=? WHERE wallet=? AND used_at IS NULL').run(now, wallet);
-      db.prepare('INSERT INTO sessions(token_hash,wallet,expires_at,created_at) VALUES(?,?,?,?)').run(hash(token), wallet, now + 24 * 60 * 60_000, now);
+      db.prepare('INSERT INTO sessions(token_hash,wallet,expires_at,created_at) VALUES(?,?,?,?)').run(hash(token), wallet, now + 30 * 24 * 60 * 60_000, now);
     })();
-    res.json({ token, wallet, expiresAt: now + 24 * 60 * 60_000 });
+    const expiresAt = now + 30 * 24 * 60 * 60_000;
+    res.setHeader('Set-Cookie', `gitstarter_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`);
+    res.json({ wallet, expiresAt });
   } catch { res.status(400).json({ error: 'Malformed signature request' }); }
 });
 app.get('/api/commissions', (_req, res) => {

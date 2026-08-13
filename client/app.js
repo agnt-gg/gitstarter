@@ -6,7 +6,7 @@ const { createSolanaClient } = require('@metamask/connect-solana');
 const { PublicKey, Transaction, TransactionInstruction, SystemProgram } = web3;
 const $ = id => document.getElementById(id);
 const TOKEN_PROGRAM = spl.TOKEN_PROGRAM_ID;
-const state = { config:null, connection:null, wallet:null, provider:null, session:null, metadata:[], projects:[], filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light' };
+const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light' };
 const WALLETS = [
   {id:'phantom',name:'Phantom',logo:'/wallets/phantom.svg',url:'https://phantom.com/download',provider:()=>window.phantom?.solana},
   {id:'solflare',name:'Solflare',logo:'/wallets/solflare.svg',url:'https://www.solflare.com/download',provider:()=>window.solflare},
@@ -24,6 +24,7 @@ const ICON_PATHS={circle:'M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM0 8a8 8 
 function statusIcon(ui){return `<span class="status-glyph ${ui.cls}" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="${ICON_PATHS[ui.icon]}"></path></svg></span>`;}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function safeHttpUrl(value){try{const url=new URL(value);return url.protocol==='https:'||url.protocol==='http:'?url.href:null;}catch{return null;}}
+function walletAlias(address){const adjectives=['Amber','Bold','Calm','Cobalt','Golden','Keen','Lunar','Nimble','Quiet','Solar','Swift','Violet'];const nouns=['Badger','Builder','Falcon','Fox','Heron','Otter','Panda','Raven','Tiger','Wolf','Wren','Yak'];let hash=2166136261;for(const char of address){hash^=char.charCodeAt(0);hash=Math.imul(hash,16777619);}const value=hash>>>0;return `${adjectives[value%adjectives.length]}-${nouns[(value>>>8)%nouns.length]}-${address.slice(-4)}`;}
 function fmtBase(n){return (Number(n)/1e6).toLocaleString(undefined,{maximumFractionDigits:6});}
 function u64(buffer, offset){return Number(buffer.readBigUInt64LE(offset));}
 function i64(buffer, offset){return Number(buffer.readBigInt64LE(offset));}
@@ -39,8 +40,8 @@ function decodeCommission(account){
   return {creator,mint,treasury,seed,goal,pledged,released,refunded,pledgerCount,refundedPledgerCount,agent,pendingAgent,hasPendingAgent,hasAgent,status,milestoneCount,milestoneBps:milestoneBps.slice(0,milestoneCount),milestonesDone,deadline};
 }
 async function api(path, options={}){
-  options.headers={'content-type':'application/json',...(state.session?{authorization:'Bearer '+state.session}:{}),...(options.headers||{})};
-  const r=await fetch(path,options); const body=await r.json(); if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`); return body;
+  options.credentials='same-origin';options.headers={'content-type':'application/json',...(options.headers||{})};
+  const r=await fetch(path,options);const body=await r.json();if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);return body;
 }
 function installedProvider(wallet){
   const provider=wallet.provider();
@@ -48,12 +49,12 @@ function installedProvider(wallet){
 }
 function walletProvider(){return state.provider;}
 function closeIcon(){return '<button class="closeX" id="bX" type="button" aria-label="Close dialog">×</button>';}
-async function connectMetaMask(){
-  const client=await createSolanaClient({dapp:{name:'GitStarter',url:window.location.origin}});
+async function connectMetaMask(silent=false){
+  const client=await createSolanaClient({dapp:{name:'GitStarter',url:window.location.origin},api:{supportedNetworks:{devnet:state.config.rpcUrl}},analytics:{enabled:false}});
   const wallet=client.getWallet();
-  const {accounts}=await wallet.features['standard:connect'].connect();
+  const accounts=silent?wallet.accounts:(await wallet.features['standard:connect'].connect()).accounts;
   const account=accounts?.[0];
-  if(!account)throw new Error('MetaMask did not return a Solana account');
+  if(!account){if(silent)return null;throw new Error('MetaMask did not return a Solana account');}
   const chain=state.config?.cluster==='mainnet-beta'?'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp':'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1';
   return {
     publicKey:new PublicKey(account.address),
@@ -72,24 +73,45 @@ function openWalletModal(){
   $('overlay').classList.add('on');
 }
 async function connectWallet(walletId){
+  if(state.connecting)return;
   const wallet=WALLETS.find(item=>item.id===walletId);
   if(!wallet)throw new Error('Unsupported wallet');
-  let provider=wallet.connect?await wallet.connect():installedProvider(wallet);
-  if(!provider){window.open(wallet.url,'_blank','noopener,noreferrer');return;}
-  const result=wallet.connect?{publicKey:provider.publicKey}:await provider.connect();
-  state.provider=provider;
-  state.wallet=result?.publicKey||provider.publicKey;
-  if(!state.wallet)throw new Error(`${wallet.name} did not return a wallet address`);
-  await authenticate(provider);
-  closeDialog();
-  await refresh();
+  state.connecting=true;
+  try{
+    const provider=wallet.connect?await wallet.connect():installedProvider(wallet);
+    if(!provider){window.open(wallet.url,'_blank','noopener,noreferrer');return;}
+    const result=wallet.connect?{publicKey:provider.publicKey}:await provider.connect();
+    const publicKey=result?.publicKey||provider.publicKey;
+    if(!publicKey)throw new Error(`${wallet.name} did not return a wallet address`);
+    const address=publicKey.toBase58();
+    if(state.sessionWallet&&state.sessionWallet!==address){state.session=null;state.sessionWallet=null;}
+    state.provider=provider;state.wallet=publicKey;state.walletName=wallet.name;state.authStatus=state.session?'authenticated':'connected';localStorage.setItem('gitstarter.wallet',wallet.id);
+    closeDialog();render();
+    if(state.session){await refresh();return;}
+    if(wallet.id==='metamask'){showNotice('MetaMask connected. Sign one message to finish your GitStarter account.');return;}
+    try{await authenticate();}catch(error){state.authStatus='connected';render();showError(new Error(`Wallet connected. Finish sign-in to create commissions. ${friendlyWalletError(error)}`));return;}
+    await refresh();
+  }finally{state.connecting=false;}
 }
-async function authenticate(provider){
-  const wallet=state.wallet.toBase58(); const challenge=await api('/api/auth/challenge',{method:'POST',body:JSON.stringify({wallet})});
-  if(typeof provider.signMessage!=='function')throw new Error('This wallet does not support secure message sign-in');
-  const bytes=new TextEncoder().encode(challenge.message); const signed=await provider.signMessage(bytes,'utf8');
-  const signature=bs58Encode(signed.signature||signed); const result=await api('/api/auth/verify',{method:'POST',body:JSON.stringify({wallet,message:challenge.message,signature})});
-  state.session=result.token;
+async function authenticate(){
+  if(state.authStatus==='signing'||state.session)return;
+  if(!state.wallet||!state.provider)throw new Error('Connect a wallet first');
+  state.authStatus='signing';render();
+  try{
+    const wallet=state.wallet.toBase58();const challenge=await api('/api/auth/challenge',{method:'POST',body:JSON.stringify({wallet})});
+    if(typeof state.provider.signMessage!=='function')throw new Error('This wallet does not support secure message sign-in');
+    const bytes=new TextEncoder().encode(challenge.message);const signed=await state.provider.signMessage(bytes,'utf8');
+    const signature=bs58Encode(signed.signature||signed);const result=await api('/api/auth/verify',{method:'POST',body:JSON.stringify({wallet,message:challenge.message,signature})});
+    state.session=true;state.sessionWallet=wallet;state.authStatus='authenticated';render();
+  }catch(error){state.authStatus='connected';render();throw error;}
+}
+async function requireSession(){if(!state.wallet){openWalletModal();return false;}if(!state.session)await authenticate();if(!state.provider){openWalletModal();showError(new Error('Your GitStarter session is active. Reattach your wallet to sign transactions.'));return false;}return true;}
+async function restoreSession(){
+  let session;try{session=await api('/api/auth/session');}catch{return;}
+  state.session=true;state.sessionWallet=session.wallet;state.authStatus='authenticated';state.wallet=new PublicKey(session.wallet);
+  const walletId=localStorage.getItem('gitstarter.wallet'),wallet=WALLETS.find(item=>item.id===walletId);
+  if(wallet){state.walletName=wallet.name;try{let provider;if(wallet.id==='metamask')provider=await connectMetaMask(true);else{provider=installedProvider(wallet);if(provider){const result=await provider.connect({onlyIfTrusted:true});const key=result?.publicKey||provider.publicKey;if(!key||key.toBase58()!==session.wallet)provider=null;}}if(provider)state.provider=provider;}catch{state.provider=null;}}
+  render();
 }
 function bs58Encode(bytes){const alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';let digits=[0];for(const byte of bytes){let carry=byte;for(let j=0;j<digits.length;j++){carry+=digits[j]<<8;digits[j]=carry%58;carry=(carry/58)|0;}while(carry){digits.push(carry%58);carry=(carry/58)|0;}}let out='';for(let k=0;k<bytes.length&&bytes[k]===0;k++)out+='1';for(let q=digits.length-1;q>=0;q--)out+=alphabet[digits[q]];return out;}
 async function send(transaction){
@@ -104,7 +126,9 @@ async function refresh(){
 function currentWallet(){return state.wallet?.toBase58();}
 function render(){
   document.documentElement.dataset.theme=state.theme; $('themeLabel').textContent=state.theme==='light'?'Dark':'Light';
-  const wallet=currentWallet(); $('bWallet').textContent=wallet?wallet.slice(0,4)+'…'+wallet.slice(-4):'Connect wallet';
+  const wallet=currentWallet();$('bWallet').textContent=wallet?`${state.walletName||'Wallet'} · ${wallet.slice(0,4)}…${wallet.slice(-4)}`:'Connect wallet';
+  $('accountEmpty').style.display=wallet?'none':'block';$('accountCard').classList.toggle('on',!!wallet);
+  if(wallet){$('wAlias').textContent=walletAlias(wallet);$('wAddress').textContent=wallet;const auth=$('wAuth');if(state.authStatus==='authenticated'){auth.className='account-state signed';auth.innerHTML='<span>✓ Signed in to GitStarter</span>';}else if(state.authStatus==='signing'){auth.className='account-state';auth.innerHTML='<span>Waiting for signature…</span>';}else{auth.className='account-state';auth.innerHTML='<span>Wallet connected</span><button class="btn" id="bFinishAuth" type="button">Finish sign-in</button>';}}
   const labels=[...new Set(state.projects.flatMap(p=>Array.isArray(p.meta?.labels)?p.meta.labels:[]))].sort();
   let visible=state.projects.filter(p=>(state.filter==='all'||p.status===state.filter)&&(state.label==='all'||p.meta?.labels?.includes(state.label))&&(!($('q').value)||JSON.stringify(p.meta||{}).toLowerCase().includes($('q').value.toLowerCase())));
   visible=[...visible].sort((a,b)=>state.sort==='funding'?b.pledged-a.pledged:state.sort==='deadline'?a.deadline-b.deadline:(b.meta?.createdAt||0)-(a.meta?.createdAt||0));
@@ -138,8 +162,8 @@ function openProject(address){
   $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>${esc(m.title||'Unindexed commission')} <span class="state ${ui.cls}">${esc(ui.label)}</span></h1><div class="sub mono">${p.address}</div></div>${closeIcon()}</div></div><div class="project-shell"><main class="project-main"><p class="project-description">${esc(m.description||'This on-chain commission has not been indexed yet.')}</p><h2 class="section-title">Settlement</h2><div class="metric-grid"><div class="metric"><b>${fmtBase(p.pledged)} GIT</b><span>Net pledged</span></div><div class="metric"><b>${fmtBase(p.released)} GIT</b><span>Released</span></div><div class="metric"><b>${fmtBase(p.refunded)} GIT</b><span>Refunded</span></div></div><h2 class="section-title">Actions</h2><div class="action-panel">${actions}</div></main><aside class="project-side"><h2 class="section-title">Contract</h2><ul class="fact-list"><li><span>Network</span><b>${esc(state.config.cluster)}</b></li><li><span>Goal</span><b>${fmtBase(p.goal)} GIT</b></li><li><span>Milestones</span><b>${p.milestoneCount}</b></li><li><span>Protocol fee</span><b>1% per value movement</b></li><li><span>Deadline</span><b>${new Date(p.deadline*1000).toLocaleString()}</b></li><li><span>Creator</span><b class="mono">${p.creator}</b></li>${safeHttpUrl(m.repositoryUrl)?`<li><span>Repository</span><b><a href="${esc(safeHttpUrl(m.repositoryUrl))}" target="_blank" rel="noopener noreferrer">Open repository ↗</a></b></li>`:''}</ul></aside></div>`;
   $('overlay').classList.add('on');
 }
-function openCreate(){
-  if(!state.wallet)return openWalletModal();
+async function openCreate(){
+  if(!await requireSession())return;
   $('dlg').className='dlg dlg-create';
   $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>Create a commission</h1><div class="sub">Define the work, funding target, and release schedule on Solana ${esc(state.config.cluster)}.</div></div>${closeIcon()}</div></div><div class="form-section"><h2>Commission details</h2><p>Give backers a precise description of what will be delivered.</p><div class="field"><label for="nTitle">Title</label><input id="nTitle" type="text" maxlength="120" placeholder="A concise outcome"></div><div class="field"><label for="nDescription">Description</label><textarea id="nDescription" placeholder="Scope, acceptance criteria, and expected deliverables"></textarea></div><div class="grid2"><div class="field"><label for="nRepo">Repository URL <span class="hint">optional</span></label><input id="nRepo" type="text" placeholder="https://github.com/owner/repo"></div><div class="field"><label for="nLicense">License</label><input id="nLicense" type="text" value="MIT"></div></div><div class="field"><label for="nLabels">Labels <span class="hint">optional</span></label><input id="nLabels" type="text" placeholder="cli, media, typescript"><div class="hint">Comma-separated. Labels become live filters on the commission list.</div></div></div><div class="form-section"><h2>Funding and delivery</h2><p>Funds remain in program-controlled escrow until milestones are released or refunded.</p><div class="grid2"><div class="field"><label for="nGoal">Funding goal (GIT)</label><input id="nGoal" type="number" min="0.000001" step="0.000001" placeholder="1000"></div><div class="field"><label for="nDeadline">Funding deadline</label><input id="nDeadline" type="datetime-local"></div></div><div class="field"><label for="nMilestones">Milestone percentages</label><input id="nMilestones" type="text" value="25,40,20,15"><div class="hint">Comma-separated percentages. They must total 100.</div></div></div><div class="dlg-footer"><span class="hint">Your wallet will confirm the on-chain creation transaction.</span><button class="btn" type="button" id="bX">Cancel</button><button class="btn primary lg" id="doCreate">Create and sign</button></div>`;
   $('overlay').classList.add('on');
@@ -149,9 +173,12 @@ async function createCommission(){
   const seed=Date.now();const program=new PublicKey(state.config.programId),config=new PublicKey(state.config.configPda),mint=new PublicKey(state.config.tokenMint);const [commission]=PublicKey.findProgramAddressSync([Buffer.from('commission'),state.wallet.toBuffer(),writeU64(seed)],program);const [vault]=PublicKey.findProgramAddressSync([Buffer.from('vault'),commission.toBuffer()],program);const count=Buffer.alloc(4);count.writeUInt32LE(percentages.length);const data=Buffer.concat([Buffer.from([1]),writeU64(seed),writeU64(goal),count,...percentages.map(x=>{const b=Buffer.alloc(2);b.writeUInt16LE(x*100);return b;}),writeI64(deadline)]);const ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:true},{pubkey:config,isSigner:false,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:vault,isSigner:false,isWritable:true},{pubkey:mint,isSigner:false,isWritable:false},{pubkey:SystemProgram.programId,isSigner:false,isWritable:false},{pubkey:TOKEN_PROGRAM,isSigner:false,isWritable:false}],data});const signature=await send(new Transaction().add(ix));await api('/api/commissions',{method:'POST',body:JSON.stringify({address:commission.toBase58(),txSignature:signature,title,description,repositoryUrl:$('nRepo').value.trim()||null,license:$('nLicense').value.trim()||'MIT',labels:$('nLabels').value.split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).slice(0,8)})});closeDialog();await refresh();}
 async function pledge(address){const p=state.projects.find(x=>x.address===address),amount=Math.round(Number($('pledgeAmount').value)*1e6);if(!amount)throw new Error('Enter a pledge amount');const program=new PublicKey(state.config.programId),commission=new PublicKey(address),mint=new PublicKey(state.config.tokenMint),config=new PublicKey(state.config.configPda);const [vault]=PublicKey.findProgramAddressSync([Buffer.from('vault'),commission.toBuffer()],program),[pledgePda]=PublicKey.findProgramAddressSync([Buffer.from('pledge'),commission.toBuffer(),state.wallet.toBuffer()],program);const source=await spl.getAssociatedTokenAddress(mint,state.wallet),treasury=await spl.getAssociatedTokenAddress(mint,new PublicKey(state.config.treasuryWallet));const keys=[{pubkey:state.wallet,isSigner:true,isWritable:true},{pubkey:config,isSigner:false,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:pledgePda,isSigner:false,isWritable:true},{pubkey:vault,isSigner:false,isWritable:true},{pubkey:source,isSigner:false,isWritable:true},{pubkey:treasury,isSigner:false,isWritable:true},{pubkey:mint,isSigner:false,isWritable:false},{pubkey:SystemProgram.programId,isSigner:false,isWritable:false},{pubkey:TOKEN_PROGRAM,isSigner:false,isWritable:false}];await send(new Transaction().add(new TransactionInstruction({programId:program,keys,data:Buffer.concat([Buffer.from([2]),writeU64(amount)])})));closeDialog();await refresh();}
 async function simpleAction(action,address,index){const p=state.projects.find(x=>x.address===address),program=new PublicKey(state.config.programId),commission=new PublicKey(address),mint=new PublicKey(state.config.tokenMint),[vault]=PublicKey.findProgramAddressSync([Buffer.from('vault'),commission.toBuffer()],program),treasury=await spl.getAssociatedTokenAddress(mint,new PublicKey(state.config.treasuryWallet));let ix;if(action==='nominate'){const nominated=new PublicKey($('agentWallet').value.trim());ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:nominated,isSigner:false,isWritable:false}],data:Buffer.from([3])});}else if(action==='accept')ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true}],data:Buffer.from([8])});else if(action==='cancel')ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true}],data:Buffer.from([6])});else if(action==='release'){const agentToken=await spl.getAssociatedTokenAddress(mint,new PublicKey(p.agent));ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:vault,isSigner:false,isWritable:true},{pubkey:agentToken,isSigner:false,isWritable:true},{pubkey:treasury,isSigner:false,isWritable:true},{pubkey:mint,isSigner:false,isWritable:false},{pubkey:TOKEN_PROGRAM,isSigner:false,isWritable:false}],data:Buffer.from([4,Number(index)])});}else if(action==='refund'){const [pledgePda]=PublicKey.findProgramAddressSync([Buffer.from('pledge'),commission.toBuffer(),state.wallet.toBuffer()],program),dest=await spl.getAssociatedTokenAddress(mint,state.wallet);ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:pledgePda,isSigner:false,isWritable:true},{pubkey:vault,isSigner:false,isWritable:true},{pubkey:dest,isSigner:false,isWritable:true},{pubkey:treasury,isSigner:false,isWritable:true},{pubkey:mint,isSigner:false,isWritable:false},{pubkey:TOKEN_PROGRAM,isSigner:false,isWritable:false}],data:Buffer.from([5])});}await send(new Transaction().add(ix));closeDialog();await refresh();}
-function showError(error){console.error(error);const t=$('toast');t.textContent=error.message||String(error);t.classList.add('on');setTimeout(()=>t.classList.remove('on'),5000);}
-document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]');if(!t)return;if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate();else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
+function friendlyWalletError(error){const message=error?.message||String(error);if(/already pending|wallet_requestPermissions/i.test(message))return 'A MetaMask request is already open. Complete it in the extension, then select Finish sign-in.';if(error?.code===4001||/user rejected/i.test(message))return 'The wallet request was cancelled.';return message;}
+function showToast(message){const t=$('toast');t.textContent=message;t.classList.add('on');setTimeout(()=>t.classList.remove('on'),6000);}
+function showNotice(message){showToast(message);}
+function showError(error){console.error(error);showToast(friendlyWalletError(error));}
+document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]');if(!t)return;if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('overlay').classList.contains('on'))closeDialog();});
 $('q').addEventListener('input',render);
 document.addEventListener('change',event=>{if(event.target.id==='sortSelect'){state.sort=event.target.value;render();}});
-(async()=>{try{state.config=await api('/api/config');state.connection=new web3.Connection(state.config.rpcUrl,'confirmed');await refresh();}catch(e){showError(e);}})();
+(async()=>{try{state.config=await api('/api/config');state.connection=new web3.Connection(state.config.rpcUrl,'confirmed');await refresh();await restoreSession();}catch(e){showError(e);}})();

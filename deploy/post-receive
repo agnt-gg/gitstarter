@@ -1,0 +1,20 @@
+#!/bin/bash
+set -u
+GIT_DIR=/root/gitstarter.git
+BRANCH=main
+STAGE=/root/gitstarter-deploy-stage
+LIVE=/var/www/gitstarter.agnt.gg/app
+PM2_NAME=gitstarter-api
+log(){ echo ">>> $*"; }
+stage_rev(){ rm -rf "$STAGE" && mkdir -p "$STAGE" && git --work-tree="$STAGE" --git-dir="$GIT_DIR" checkout -f "$1" -- . && ln -s "$LIVE/node_modules" "$STAGE/node_modules"; }
+gate(){ node -c "$1/server/server.js" && (cd "$1" && npm test && npm run build:client); }
+sync_live(){ rsync -a --exclude='.env' --exclude='data/' --exclude='node_modules/' "$STAGE/" "$LIVE/"; }
+deploy_rev(){ stage_rev "$1" && gate "$STAGE" && sync_live && node -c "$LIVE/server/server.js"; }
+online(){ pm2 jlist | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=JSON.parse(s).find(x=>x.name==='$PM2_NAME');process.exit(p&&p.pm2_env.status==='online'?0:1)})"; }
+while read oldrev newrev ref; do
+  [[ "$ref" == "refs/heads/$BRANCH" ]] || continue
+  log "Deploying $newrev"
+  if ! deploy_rev "$newrev"; then log "Gate failed; restoring $oldrev"; [[ "$oldrev" != 0000000000000000000000000000000000000000 ]] && deploy_rev "$oldrev"; rm -rf "$STAGE"; exit 1; fi
+  pm2 reload "$PM2_NAME" --update-env >/dev/null 2>&1 && sleep 3
+  if online && curl -fsS http://127.0.0.1:3417/api/health | grep -q '"ok":true'; then log "Deploy complete"; rm -rf "$STAGE"; else log "Health failed; rolling back"; deploy_rev "$oldrev" && pm2 reload "$PM2_NAME" --update-env >/dev/null 2>&1; rm -rf "$STAGE"; exit 1; fi
+done
