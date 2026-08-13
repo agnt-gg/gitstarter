@@ -7,7 +7,7 @@ LIVE=/var/www/gitstarter.agnt.gg/app
 PM2_NAME=gitstarter-api
 log(){ echo ">>> $*"; }
 stage_rev(){ rm -rf "$STAGE" && mkdir -p "$STAGE" && git --work-tree="$STAGE" --git-dir="$GIT_DIR" checkout -f "$1" -- . && ln -s "$LIVE/node_modules" "$STAGE/node_modules"; }
-gate(){ node -c "$1/server/server.js" && (cd "$1" && npm test && npm run build:client); }
+gate(){ node -c "$1/server/server.js" && node -c "$1/public/app.js" && test -s "$1/public/index.html" && (cd "$1" && npm test); }
 sync_live(){ rsync -a --exclude='.env' --exclude='data/' --exclude='node_modules/' "$STAGE/" "$LIVE/"; }
 deploy_rev(){ stage_rev "$1" && gate "$STAGE" && sync_live && node -c "$LIVE/server/server.js"; }
 online(){ pm2 jlist | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=JSON.parse(s).find(x=>x.name==='$PM2_NAME');process.exit(p&&p.pm2_env.status==='online'?0:1)})"; }
