@@ -2,7 +2,11 @@ const { Buffer } = require('buffer');
 globalThis.Buffer = Buffer;
 const web3 = require('@solana/web3.js');
 const { createSolanaClient } = require('@metamask/connect-solana');
-const { PublicKey, Transaction, TransactionInstruction, SystemProgram } = web3;
+const { PublicKey, Transaction } = web3;
+// The same module the server and the agent API build from. Transaction encoding
+// duplicated across two codebases is how a client eventually signs something
+// subtly different from what everyone believes it signs.
+const escrow = require('../shared/escrow');
 const $ = id => document.getElementById(id);
 const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL;
 const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light' };
@@ -37,7 +41,10 @@ function verifyConfig(config){
   if(!PINNED.rpcHosts.includes(host))throw new Error('Refusing to continue: the server reported an untrusted RPC endpoint. Do not sign anything.');
   return config;
 }
-const STATUS = ['funding','funded','building','shipped','refunded'];
+const STATUS = escrow.STATUS;
+// Built from the pinned constants rather than the server's response, so a
+// hostile /api/config cannot influence a single byte of what gets signed.
+const ESCROW_CTX = { programId:PINNED.programId, configPda:PINNED.configPda, treasury:PINNED.treasuryWallet };
 const STATUS_UI = {
   funding:{label:'Open',detail:'Open for pledges',cls:'blue',icon:'circle'}, funded:{label:'Funded',detail:'Funded — accepting agent',cls:'yellow',icon:'clock'}, building:{label:'In progress',detail:'In progress',cls:'purple',icon:'play'}, shipped:{label:'Delivered',detail:'Delivered',cls:'green',icon:'check'}, refunded:{label:'Closed',detail:'Closed — refundable',cls:'gray',icon:'x'}
 };
@@ -50,19 +57,6 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function safeHttpUrl(value){try{const url=new URL(value);return url.protocol==='https:'||url.protocol==='http:'?url.href:null;}catch{return null;}}
 function walletAlias(address){const adjectives=['Amber','Bold','Calm','Cobalt','Golden','Keen','Lunar','Nimble','Quiet','Solar','Swift','Violet'];const nouns=['Badger','Builder','Falcon','Fox','Heron','Otter','Panda','Raven','Tiger','Wolf','Wren','Yak'];let hash=2166136261;for(const char of address){hash^=char.charCodeAt(0);hash=Math.imul(hash,16777619);}const value=hash>>>0;return `${adjectives[value%adjectives.length]}-${nouns[(value>>>8)%nouns.length]}-${address.slice(-4)}`;}
 function fmtBase(n){return (Number(n)/LAMPORTS_PER_SOL).toLocaleString(undefined,{maximumFractionDigits:9});}
-function u64(buffer, offset){return Number(buffer.readBigUInt64LE(offset));}
-function i64(buffer, offset){return Number(buffer.readBigInt64LE(offset));}
-function writeU64(value){const b=Buffer.alloc(8);b.writeBigUInt64LE(BigInt(value));return b;}
-function writeI64(value){const b=Buffer.alloc(8);b.writeBigInt64LE(BigInt(value));return b;}
-function decodeCommission(account){
-  const b=Buffer.from(account.data); let o=1;
-  const pk=()=>{const p=new PublicKey(b.subarray(o,o+32));o+=32;return p.toBase58();};
-  const creator=pk(), mint=pk(), treasury=pk();
-  const seed=u64(b,o);o+=8; const goal=u64(b,o);o+=8; const pledged=u64(b,o);o+=8; const released=u64(b,o);o+=8; const refunded=u64(b,o);o+=8;
-  const pledgerCount=b.readUInt32LE(o);o+=4; const refundedPledgerCount=b.readUInt32LE(o);o+=4; const agent=pk(), pendingAgent=pk(); const hasPendingAgent=!!b[o++], hasAgent=!!b[o++]; const status=STATUS[b[o++]]||'unknown';
-  const milestoneCount=b[o++]; const milestoneBps=[]; for(let i=0;i<8;i++){milestoneBps.push(b.readUInt16LE(o));o+=2;} const milestonesDone=b[o++]; const deadline=i64(b,o);
-  return {creator,mint,treasury,seed,goal,pledged,released,refunded,pledgerCount,refundedPledgerCount,agent,pendingAgent,hasPendingAgent,hasAgent,status,milestoneCount,milestoneBps:milestoneBps.slice(0,milestoneCount),milestonesDone,deadline};
-}
 async function api(path, options={}){
   options.credentials='same-origin';options.headers={'content-type':'application/json',...(options.headers||{})};
   const r=await fetch(path,options);const body=await r.json();if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);return body;
@@ -147,7 +141,7 @@ async function send(transaction){
 async function refresh(){
   state.metadata=await api('/api/commissions'); const meta=new Map(state.metadata.map(m=>[m.address,m]));
   const accounts=await state.connection.getProgramAccounts(new PublicKey(state.config.programId),{commitment:'confirmed',filters:[{dataSize:240},{memcmp:{offset:0,bytes:'3'}}]});
-  state.projects=accounts.map(({pubkey,account})=>({address:pubkey.toBase58(),...decodeCommission(account),meta:meta.get(pubkey.toBase58())})).filter(project=>project.meta).sort((a,b)=>b.meta.createdAt-a.meta.createdAt); render();
+  state.projects=accounts.map(({pubkey,account})=>({address:pubkey.toBase58(),...escrow.decodeCommission(account.data),meta:meta.get(pubkey.toBase58())})).filter(project=>project.meta).sort((a,b)=>b.meta.createdAt-a.meta.createdAt); render();
 }
 function currentWallet(){return state.wallet?.toBase58();}
 function render(){
@@ -176,9 +170,9 @@ function openProject(address){
   const m=p.meta||{},wallet=currentWallet(),ui=STATUS_UI[p.status]||STATUS_UI.refunded;
   let actions='';
   if(p.status==='funding'&&wallet)actions=`<div class="field"><label for="pledgeAmount">Pledge amount</label><input id="pledgeAmount" type="number" min="0.000001" step="0.000001" placeholder="0.00"><div class="hint">Amount in SOL. Your wallet will confirm the escrow transaction.</div></div><div class="action-row"><button class="btn primary lg" data-action="pledge" data-id="${p.address}">Pledge SOL</button></div>`;
-  if(p.status==='funded'&&wallet===p.creator&&!p.hasPendingAgent)actions=`<div class="field"><label for="agentWallet">Agent wallet address</label><input id="agentWallet" type="text" placeholder="Solana address"><div class="hint">The nominated wallet must separately accept the contract.</div></div><div class="action-row"><button class="btn primary" data-action="nominate" data-id="${p.address}">Nominate agent</button></div>`;
-  if(p.status==='funded'&&p.hasPendingAgent&&wallet===p.pendingAgent)actions=`<div class="action-row"><button class="btn primary lg" data-action="accept" data-id="${p.address}">Accept contract</button></div>`;
-  if(p.status==='funded'&&p.hasPendingAgent&&wallet!==p.pendingAgent)actions=`<p class="hint">Waiting for <span class="mono">${p.pendingAgent}</span> to accept.</p>`;
+  if(p.status==='funded'&&wallet===p.creator&&!p.pendingAgent)actions=`<div class="field"><label for="agentWallet">Agent wallet address</label><input id="agentWallet" type="text" placeholder="Solana address"><div class="hint">The nominated wallet must separately accept the contract.</div></div><div class="action-row"><button class="btn primary" data-action="nominate" data-id="${p.address}">Nominate agent</button></div>`;
+  if(p.status==='funded'&&p.pendingAgent&&wallet===p.pendingAgent)actions=`<div class="action-row"><button class="btn primary lg" data-action="accept" data-id="${p.address}">Accept contract</button></div>`;
+  if(p.status==='funded'&&p.pendingAgent&&wallet!==p.pendingAgent)actions=`<p class="hint">Waiting for <span class="mono">${esc(p.pendingAgent)}</span> to accept.</p>${wallet===p.creator?`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="revoke" data-id="${p.address}">Withdraw nomination</button></div><p class="hint" style="margin-top:8px">Frees the commission so you can nominate someone else. Only possible while the nomination is unaccepted.</p>`:''}`;
   if(p.status==='building'&&wallet===p.creator)actions=`<div class="action-row">${p.milestoneBps.map((bps,i)=>`<button class="btn" data-action="release" data-index="${i}" data-id="${p.address}" ${p.milestonesDone&(1<<i)?'disabled':''}>${p.milestonesDone&(1<<i)?'Released':'Release'} milestone ${i+1} · ${bps/100}%</button>`).join('')}</div><p class="hint" style="margin-top:12px">Releasing pays the agent immediately and cannot be undone. Unreleased funds return to backers after the deadline.</p>`;
   if(p.status==='building'&&wallet===p.agent)actions=`<p class="hint">You hold this contract. Releases are made by the creator as milestones are accepted.</p><div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Return remaining funds and end contract</button></div><p class="hint" style="margin-top:8px">Ends your claim on the ${fmtBase(p.pledged-p.released)} SOL still in escrow and reopens it for refund immediately. Milestones already released are yours to keep.</p>`;
   if((p.status==='funding'||p.status==='funded')&&wallet===p.creator)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Cancel commission</button></div>`;
@@ -197,16 +191,24 @@ async function openCreate(){
 }
 async function createCommission(){
   const title=$('nTitle').value.trim(),description=$('nDescription').value.trim(),goal=Math.round(Number($('nGoal').value)*LAMPORTS_PER_SOL),deadline=Math.floor(new Date($('nDeadline').value).getTime()/1000),percentages=$('nMilestones').value.split(',').map(Number);if(!title||!description||!goal||!deadline||percentages.some(x=>!x)||percentages.reduce((a,b)=>a+b,0)!==100)throw new Error('Complete all fields; milestones must sum to 100');
-  const seed=Date.now(),program=new PublicKey(state.config.programId),config=new PublicKey(state.config.configPda);const [commission]=PublicKey.findProgramAddressSync([Buffer.from('commission'),state.wallet.toBuffer(),writeU64(seed)],program),[vault]=PublicKey.findProgramAddressSync([Buffer.from('vault'),commission.toBuffer()],program);const count=Buffer.alloc(4);count.writeUInt32LE(percentages.length);const data=Buffer.concat([Buffer.from([1]),writeU64(seed),writeU64(goal),count,...percentages.map(x=>{const b=Buffer.alloc(2);b.writeUInt16LE(x*100);return b;}),writeI64(deadline)]);const ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:true},{pubkey:config,isSigner:false,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:vault,isSigner:false,isWritable:true},{pubkey:SystemProgram.programId,isSigner:false,isWritable:false}],data});const signature=await send(new Transaction().add(ix));await api('/api/commissions',{method:'POST',body:JSON.stringify({address:commission.toBase58(),txSignature:signature,title,description,repositoryUrl:$('nRepo').value.trim()||null,license:$('nLicense').value.trim()||'MIT',labels:$('nLabels').value.split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).slice(0,8)})});closeDialog();await refresh();}
-async function pledge(address){const amount=Math.round(Number($('pledgeAmount').value)*LAMPORTS_PER_SOL);if(!amount)throw new Error('Enter a pledge amount');const program=new PublicKey(state.config.programId),commission=new PublicKey(address),config=new PublicKey(state.config.configPda),[vault]=PublicKey.findProgramAddressSync([Buffer.from('vault'),commission.toBuffer()],program),[pledgePda]=PublicKey.findProgramAddressSync([Buffer.from('pledge'),commission.toBuffer(),state.wallet.toBuffer()],program);const keys=[{pubkey:state.wallet,isSigner:true,isWritable:true},{pubkey:config,isSigner:false,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:pledgePda,isSigner:false,isWritable:true},{pubkey:vault,isSigner:false,isWritable:true},{pubkey:SystemProgram.programId,isSigner:false,isWritable:false}];await send(new Transaction().add(new TransactionInstruction({programId:program,keys,data:Buffer.concat([Buffer.from([2]),writeU64(amount)])})));closeDialog();await refresh();}
-async function simpleAction(action,address,index){const p=state.projects.find(x=>x.address===address),program=new PublicKey(state.config.programId),commission=new PublicKey(address),[vault]=PublicKey.findProgramAddressSync([Buffer.from('vault'),commission.toBuffer()],program);let ix;if(action==='nominate'){const nominated=new PublicKey($('agentWallet').value.trim());ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:nominated,isSigner:false,isWritable:false}],data:Buffer.from([3])});}else if(action==='accept')ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true}],data:Buffer.from([8])});else if(action==='cancel')ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true}],data:Buffer.from([6])});else if(action==='release')ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:false},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:vault,isSigner:false,isWritable:true},{pubkey:new PublicKey(p.agent),isSigner:false,isWritable:true},{pubkey:new PublicKey(state.config.treasuryWallet),isSigner:false,isWritable:true}],data:Buffer.from([4,Number(index)])});else if(action==='refund'){const [pledgePda]=PublicKey.findProgramAddressSync([Buffer.from('pledge'),commission.toBuffer(),state.wallet.toBuffer()],program);ix=new TransactionInstruction({programId:program,keys:[{pubkey:state.wallet,isSigner:true,isWritable:true},{pubkey:commission,isSigner:false,isWritable:true},{pubkey:pledgePda,isSigner:false,isWritable:true},{pubkey:vault,isSigner:false,isWritable:true}],data:Buffer.from([5])});}await send(new Transaction().add(ix));closeDialog();await refresh();}
+  const seed=Date.now();const {commission,instruction}=escrow.build.createCommission(ESCROW_CTX,{creator:state.wallet,seed,goalLamports:goal,milestoneBasisPoints:percentages.map(x=>x*100),deadlineUnix:deadline});const signature=await send(new Transaction().add(instruction));await api('/api/commissions',{method:'POST',body:JSON.stringify({address:commission.toBase58(),txSignature:signature,title,description,repositoryUrl:$('nRepo').value.trim()||null,license:$('nLicense').value.trim()||'MIT',labels:$('nLabels').value.split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).slice(0,8)})});closeDialog();await refresh();}
+async function pledge(address){const amountLamports=Math.round(Number($('pledgeAmount').value)*LAMPORTS_PER_SOL);if(!amountLamports)throw new Error('Enter a pledge amount');const {instruction}=escrow.build.pledge(ESCROW_CTX,{backer:state.wallet,commission:address,amountLamports});await send(new Transaction().add(instruction));closeDialog();await refresh();}
+async function simpleAction(action,address,index){
+  const p=state.projects.find(x=>x.address===address);let built;
+  if(action==='nominate')built=escrow.build.selectAgent(ESCROW_CTX,{creator:state.wallet,commission:address,agent:$('agentWallet').value.trim()});
+  else if(action==='revoke')built=escrow.build.revokeAgent(ESCROW_CTX,{creator:state.wallet,commission:address});
+  else if(action==='accept')built=escrow.build.acceptAgent(ESCROW_CTX,{agent:state.wallet,commission:address});
+  else if(action==='cancel')built=escrow.build.cancel(ESCROW_CTX,{signer:state.wallet,commission:address});
+  else if(action==='release')built=escrow.build.releaseMilestone(ESCROW_CTX,{creator:state.wallet,commission:address,agent:p.agent,milestoneIndex:Number(index)});
+  else if(action==='refund')built=escrow.build.refund(ESCROW_CTX,{backer:state.wallet,commission:address});
+  else throw new Error(`Unknown action: ${action}`);
+  await send(new Transaction().add(built.instruction));closeDialog();await refresh();}
 // Maps EscrowError discriminants to language a user can act on. Anchoring these
 // to the numbers the program actually returns keeps a rejected transaction from
 // surfacing as an opaque "custom program error: 0x18".
-const CHAIN_ERRORS={2:'You are not authorised to take that action on this commission.',7:'That action is not available at this stage of the contract.',11:'That milestone has already been released.',13:'There is nothing left to refund on this pledge.',14:'This commission cannot be cancelled until its deadline has passed.',15:'GitStarter is paused for new commissions and pledges.',20:'The escrow does not hold enough to cover that release.',21:'The treasury account did not match the one recorded at creation.',22:'Choose a deadline in the future.',23:'This commission has passed its deadline and is no longer accepting pledges.',24:'A creator cannot pay themselves as the agent. Nominate a different wallet.'};
 function friendlyWalletError(error){const message=error?.message||String(error);
-  const custom=/custom program error:\s*0x([0-9a-f]+)/i.exec(message)||/Custom":\s*(\d+)/.exec(message);
-  if(custom){const code=custom[0].includes('0x')?parseInt(custom[1],16):Number(custom[1]);if(CHAIN_ERRORS[code])return CHAIN_ERRORS[code];}
+  const chain=escrow.explainError(error);
+  if(chain&&chain.name!=='Unknown')return chain.message;
   if(/already pending|wallet_requestPermissions/i.test(message))return 'A MetaMask request is already open. Complete it in the extension, then select Finish sign-in.';
   if(error?.code===4001||/user rejected|User rejected/i.test(message))return 'The wallet request was cancelled.';
   if(/insufficient lamports|insufficient funds/i.test(message))return 'That wallet does not hold enough SOL for this transaction plus fees.';

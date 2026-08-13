@@ -5,7 +5,10 @@ const express = require('express');
 const nacl = require('tweetnacl');
 const bs58Module = require('bs58');
 const bs58 = bs58Module.default || bs58Module;
+const { Transaction } = require('@solana/web3.js');
 const { openDatabase } = require('./db');
+const escrow = require('../shared/escrow');
+const { llmsTxt } = require('./llms');
 
 const PORT = Number(process.env.PORT || 3417);
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
@@ -183,10 +186,258 @@ app.post('/api/commissions', requireAuth, async (req, res, next) => {
     res.status(201).json(record);
   } catch (error) { next(error); }
 });
+// ── agent API ───────────────────────────────────────────────────────────────
+// Everything below is for autonomous, headless callers. Two rules shape it:
+//
+//   1. It never holds a key and never signs. Transaction endpoints return an
+//      UNSIGNED transaction; the caller signs locally and submits it. A server
+//      that could sign would be a server that could steal.
+//   2. It is a convenience, not an authority. /llms.txt documents the raw
+//      instruction encoding so an agent can build the identical transaction
+//      without this API at all, and verify what it is handed.
+
+const CHAIN_CACHE_MS = 5_000;
+let chainCache = { at: 0, value: null, inflight: null };
+
+/// One getProgramAccounts call serves every concurrent reader for a few seconds.
+/// Without this, a handful of polling agents would rate-limit the RPC endpoint
+/// for everyone, which is a self-inflicted outage rather than a load problem.
+async function chainCommissions() {
+  const now = Date.now();
+  if (chainCache.value && now - chainCache.at < CHAIN_CACHE_MS) return chainCache.value;
+  if (chainCache.inflight) return chainCache.inflight;
+  chainCache.inflight = (async () => {
+    try {
+      const accounts = await rpc('getProgramAccounts', [PROGRAM_ID, {
+        commitment: 'confirmed', encoding: 'base64',
+        filters: [{ dataSize: escrow.COMMISSION_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '3' } }],
+      }]);
+      const value = new Map();
+      for (const entry of accounts) {
+        try {
+          value.set(entry.pubkey, escrow.decodeCommission(Buffer.from(entry.account.data[0], 'base64')));
+        } catch { /* not a commission we understand; skip rather than fail the request */ }
+      }
+      chainCache = { at: Date.now(), value, inflight: null };
+      return value;
+    } catch (error) {
+      chainCache.inflight = null;
+      throw error;
+    }
+  })();
+  return chainCache.inflight;
+}
+
+const explorerUrl = address =>
+  `https://solscan.io/account/${address}${CLUSTER === 'mainnet-beta' ? '' : `?cluster=${encodeURIComponent(CLUSTER)}`}`;
+const toSol = lamports => lamports / escrow.LAMPORTS_PER_SOL;
+
+function presentCommission(address, chain, meta, wallet) {
+  const remaining = escrow.escrowRemaining(chain);
+  return {
+    address,
+    explorer: explorerUrl(address),
+    status: chain.status,
+    creator: chain.creator,
+    agent: chain.agent,
+    pendingAgent: chain.pendingAgent,
+    treasury: chain.treasury,
+    goalLamports: chain.goal,
+    goalSol: toSol(chain.goal),
+    pledgedLamports: chain.pledged,
+    pledgedSol: toSol(chain.pledged),
+    releasedLamports: chain.released,
+    releasedSol: toSol(chain.released),
+    refundedLamports: chain.refunded,
+    refundedSol: toSol(chain.refunded),
+    escrowRemainingLamports: remaining,
+    escrowRemainingSol: toSol(remaining),
+    percentFunded: chain.goal ? Math.min(100, (chain.pledged / chain.goal) * 100) : 0,
+    backers: chain.pledgerCount,
+    milestones: chain.milestoneBps.map((bps, index) => ({
+      index,
+      basisPoints: bps,
+      percent: bps / 100,
+      released: !!(chain.milestonesDone & (1 << index)),
+      // What this slice pays out at the current pledged total, net of the fee.
+      grossLamports: Math.floor((chain.pledged * bps) / escrow.BPS_DENOMINATOR),
+      agentLamports: Math.floor((chain.pledged * bps) / escrow.BPS_DENOMINATOR)
+        - Math.floor(Math.floor((chain.pledged * bps) / escrow.BPS_DENOMINATOR) * escrow.FEE_BASIS_POINTS / escrow.BPS_DENOMINATOR),
+    })),
+    deadlineUnix: chain.deadline,
+    deadline: new Date(chain.deadline * 1000).toISOString(),
+    expired: Math.floor(Date.now() / 1000) >= chain.deadline,
+    title: meta?.title ?? null,
+    description: meta?.description ?? null,
+    repositoryUrl: meta?.repository_url ?? null,
+    license: meta?.license ?? null,
+    labels: meta ? JSON.parse(meta.labels_json) : [],
+    indexed: !!meta,
+    createdAt: meta?.created_at ?? null,
+    ...(wallet ? { walletActions: escrow.availableActions(chain, wallet) } : {}),
+  };
+}
+
+function metadataByAddress() {
+  const rows = db.prepare('SELECT * FROM commissions').all();
+  return new Map(rows.map(row => [row.address, row]));
+}
+
+app.get('/api/v1/commissions', async (req, res, next) => {
+  try {
+    if (!rateLimit(`v1:${req.ip}`, 120, 60_000)) return res.status(429).json({ error: 'Rate limit exceeded. Poll no faster than once every few seconds.' });
+    const [chain, meta] = [await chainCommissions(), metadataByAddress()];
+    let wallet = null;
+    if (req.query.wallet) { try { wallet = cleanWallet(req.query.wallet); } catch { return res.status(400).json({ error: 'Invalid wallet' }); } }
+
+    let items = [...chain.entries()].map(([address, c]) => presentCommission(address, c, meta.get(address), wallet));
+    if (req.query.status) {
+      const wanted = String(req.query.status).split(',').map(s => s.trim());
+      items = items.filter(i => wanted.includes(i.status));
+    }
+    if (req.query.label) items = items.filter(i => i.labels.includes(String(req.query.label)));
+    if (req.query.creator) items = items.filter(i => i.creator === req.query.creator);
+    if (req.query.agent) items = items.filter(i => i.agent === req.query.agent || i.pendingAgent === req.query.agent);
+    if (req.query.indexed === 'true') items = items.filter(i => i.indexed);
+    if (req.query.openOnly === 'true') items = items.filter(i => !i.expired && ['funding', 'funded'].includes(i.status));
+    if (req.query.actionable === 'true' && wallet) items = items.filter(i => i.walletActions?.length);
+
+    items.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    res.json({
+      cluster: CLUSTER, programId: PROGRAM_ID, treasury: TREASURY_WALLET,
+      feeBasisPoints: escrow.FEE_BASIS_POINTS, feePolicy: 'successful_releases_only',
+      count: items.length, commissions: items,
+    });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/v1/commissions/:address', async (req, res, next) => {
+  try {
+    let address;
+    try { address = cleanWallet(req.params.address); } catch { return res.status(400).json({ error: 'Invalid address' }); }
+    let wallet = null;
+    if (req.query.wallet) { try { wallet = cleanWallet(req.query.wallet); } catch { return res.status(400).json({ error: 'Invalid wallet' }); } }
+    const chain = await chainCommissions();
+    const found = chain.get(address);
+    if (!found) return res.status(404).json({ error: 'No such commission on this cluster' });
+    const meta = db.prepare('SELECT * FROM commissions WHERE address=?').get(address);
+    res.json(presentCommission(address, found, meta, wallet));
+  } catch (error) { next(error); }
+});
+
+/// Builds an unsigned transaction. The caller signs it with their own key and
+/// submits it themselves; nothing here can move funds on its own.
+const TX_BUILDERS = {
+  'create-commission': async body => {
+    const creator = cleanWallet(body.creator);
+    const goalLamports = requireLamports(body, 'goal');
+    const milestones = Array.isArray(body.milestoneBasisPoints) && body.milestoneBasisPoints.length
+      ? body.milestoneBasisPoints.map(Number) : [escrow.BPS_DENOMINATOR];
+    if (milestones.length > escrow.MAX_MILESTONES) throw badRequest(`At most ${escrow.MAX_MILESTONES} milestones`);
+    if (milestones.some(v => !Number.isInteger(v) || v <= 0)) throw badRequest('Milestone basis points must be positive integers');
+    if (milestones.reduce((a, b) => a + b, 0) !== escrow.BPS_DENOMINATOR) throw badRequest('Milestone basis points must sum to 10000');
+    if (goalLamports < escrow.BPS_DENOMINATOR) throw badRequest(`Goal must be at least ${escrow.BPS_DENOMINATOR} lamports`);
+    const now = Math.floor(Date.now() / 1000);
+    const deadlineUnix = body.deadlineUnix ? Number(body.deadlineUnix)
+      : now + Math.round(Number(body.deadlineDays ?? 14) * 86_400);
+    if (!Number.isFinite(deadlineUnix) || deadlineUnix <= now) throw badRequest('Deadline must be in the future');
+    if (deadlineUnix > now + escrow.MAX_COMMISSION_DURATION_SECONDS) throw badRequest('Deadline may not exceed 180 days');
+    const seed = body.seed ? Number(body.seed) : Date.now();
+    const built = escrow.build.createCommission(ctx(), { creator, seed, goalLamports, milestoneBasisPoints: milestones, deadlineUnix });
+    return { feePayer: creator, built, extra: { seed, commission: built.commission.toBase58(), vault: built.vault.toBase58(), deadlineUnix } };
+  },
+  pledge: async body => {
+    const backer = cleanWallet(body.backer), commission = cleanWallet(body.commission);
+    const amountLamports = requireLamports(body, 'amount');
+    if (amountLamports <= 0) throw badRequest('Amount must be positive');
+    const built = escrow.build.pledge(ctx(), { backer, commission, amountLamports });
+    return { feePayer: backer, built, extra: { amountLamports } };
+  },
+  'select-agent': async body => {
+    const creator = cleanWallet(body.creator), commission = cleanWallet(body.commission), agent = cleanWallet(body.agent);
+    if (creator === agent) throw badRequest('A creator cannot nominate themselves as the paid agent');
+    return { feePayer: creator, built: escrow.build.selectAgent(ctx(), { creator, commission, agent }) };
+  },
+  'revoke-agent': async body => {
+    const creator = cleanWallet(body.creator), commission = cleanWallet(body.commission);
+    return { feePayer: creator, built: escrow.build.revokeAgent(ctx(), { creator, commission }) };
+  },
+  'accept-agent': async body => {
+    const agent = cleanWallet(body.agent), commission = cleanWallet(body.commission);
+    return { feePayer: agent, built: escrow.build.acceptAgent(ctx(), { agent, commission }) };
+  },
+  'release-milestone': async body => {
+    const creator = cleanWallet(body.creator), commission = cleanWallet(body.commission);
+    const milestoneIndex = Number(body.milestoneIndex);
+    if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0 || milestoneIndex >= escrow.MAX_MILESTONES) throw badRequest('milestoneIndex out of range');
+    // The agent is read from chain rather than taken from the caller, so a typo
+    // cannot build a transaction that pays the wrong wallet.
+    const chain = await chainCommissions();
+    const found = chain.get(commission);
+    if (!found) throw badRequest('No such commission');
+    if (!found.agent) throw badRequest('This commission has no accepted agent yet');
+    const built = escrow.build.releaseMilestone(ctx(), { creator, commission, agent: found.agent, milestoneIndex });
+    return { feePayer: creator, built, extra: { agent: found.agent, milestoneIndex } };
+  },
+  refund: async body => {
+    const backer = cleanWallet(body.backer), commission = cleanWallet(body.commission);
+    return { feePayer: backer, built: escrow.build.refund(ctx(), { backer, commission }) };
+  },
+  cancel: async body => {
+    const signer = cleanWallet(body.signer), commission = cleanWallet(body.commission);
+    return { feePayer: signer, built: escrow.build.cancel(ctx(), { signer, commission }) };
+  },
+};
+
+const ctx = () => ({ programId: PROGRAM_ID, configPda: CONFIG_PDA, treasury: TREASURY_WALLET });
+const badRequest = message => Object.assign(new Error(message), { status: 400 });
+function requireLamports(body, field) {
+  const lamports = body[`${field}Lamports`] ?? (body[`${field}Sol`] != null ? Math.round(Number(body[`${field}Sol`]) * escrow.LAMPORTS_PER_SOL) : null);
+  if (lamports == null || !Number.isFinite(Number(lamports))) throw badRequest(`Provide ${field}Lamports or ${field}Sol`);
+  return Math.round(Number(lamports));
+}
+
+app.post('/api/v1/tx/:action', async (req, res, next) => {
+  try {
+    if (!rateLimit(`tx:${req.ip}`, 60, 60_000)) return res.status(429).json({ error: 'Rate limit exceeded' });
+    const builder = TX_BUILDERS[req.params.action];
+    if (!builder) return res.status(404).json({ error: `Unknown action. Valid actions: ${Object.keys(TX_BUILDERS).join(', ')}` });
+    const { feePayer, built, extra } = await builder(req.body || {});
+    const { blockhash, lastValidBlockHeight } = (await rpc('getLatestBlockhash', [{ commitment: 'confirmed' }])).value;
+    const transaction = new Transaction({ feePayer: built.instruction.keys[0].pubkey, recentBlockhash: blockhash }).add(built.instruction);
+    res.json({
+      action: req.params.action,
+      cluster: CLUSTER,
+      programId: PROGRAM_ID,
+      feePayer,
+      recentBlockhash: blockhash,
+      lastValidBlockHeight,
+      transaction: transaction.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64'),
+      encoding: 'base64',
+      accounts: built.instruction.keys.map(k => ({ pubkey: k.pubkey.toBase58(), isSigner: k.isSigner, isWritable: k.isWritable })),
+      ...(extra || {}),
+      verify: `Before signing, confirm programId is ${PROGRAM_ID} and that you recognise every writable account. This server never needs your private key.`,
+    });
+  } catch (error) { next(error); }
+});
+
+app.get('/llms.txt', (_req, res) => {
+  res.type('text/plain; charset=utf-8').send(llmsTxt({
+    cluster: CLUSTER, programId: PROGRAM_ID, configPda: CONFIG_PDA,
+    treasury: TREASURY_WALLET, rpcUrl: PUBLIC_RPC_URL,
+  }));
+});
+
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 app.use(express.static(PUBLIC_DIR, { etag: true, maxAge: '1h', index: 'index.html' }));
 app.get(/^(?!\/api(?:\/|$)).*/, (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
-app.use((error, _req, res, _next) => { console.error(error); res.status(error.status || 500).json({ error: error.status ? error.message : 'Internal server error' }); });
+app.use((error, _req, res, _next) => {
+  // A 400 is the caller being told what they got wrong; only a 5xx is our fault.
+  // Logging both at the same volume buries real faults in agent typos.
+  const status = error.status || 500;
+  if (status >= 500) console.error(error);
+  res.status(status).json({ error: error.status ? error.message : 'Internal server error' });
+});
 
 if (require.main === module) app.listen(PORT, '127.0.0.1', () => console.log(`gitstarter listening on 127.0.0.1:${PORT}`));
 module.exports = { app, db, cleanHttpUrl };
