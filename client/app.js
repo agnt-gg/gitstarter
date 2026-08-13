@@ -120,7 +120,7 @@ async function send(transaction){
 async function refresh(){
   state.metadata=await api('/api/commissions'); const meta=new Map(state.metadata.map(m=>[m.address,m]));
   const accounts=await state.connection.getProgramAccounts(new PublicKey(state.config.programId),{commitment:'confirmed',filters:[{dataSize:240},{memcmp:{offset:0,bytes:'3'}}]});
-  state.projects=accounts.map(({pubkey,account})=>({address:pubkey.toBase58(),...decodeCommission(account),meta:meta.get(pubkey.toBase58())})).sort((a,b)=>(b.meta?.createdAt||0)-(a.meta?.createdAt||0)); render();
+  state.projects=accounts.map(({pubkey,account})=>({address:pubkey.toBase58(),...decodeCommission(account),meta:meta.get(pubkey.toBase58())})).filter(project=>project.meta).sort((a,b)=>b.meta.createdAt-a.meta.createdAt); render();
 }
 function currentWallet(){return state.wallet?.toBase58();}
 function render(){
