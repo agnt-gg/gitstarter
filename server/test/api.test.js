@@ -2,7 +2,7 @@
 process.env.DATABASE_PATH = require('node:path').join(require('node:os').tmpdir(), `gitstarter-${process.pid}.sqlite`);
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { app, db } = require('../server');
+const { app, db, cleanHttpUrl } = require('../server');
 let server, base;
 test.before(async () => { server = app.listen(0, '127.0.0.1'); await new Promise(r => server.once('listening', r)); base = `http://127.0.0.1:${server.address().port}`; });
 test.after(async () => { await new Promise(r => server.close(r)); db.close(); });
@@ -12,6 +12,11 @@ test('health and public config expose no secrets', async () => {
   const config = await fetch(base + '/api/config').then(r => r.json());
   assert.equal(config.feeBasisPoints, 100);
   assert.equal(JSON.stringify(config).includes('keypair'), false);
+});
+test('repository links accept HTTP and reject unsafe schemes', () => {
+  assert.equal(cleanHttpUrl('https://github.com/agnt-gg/gitstarter'), 'https://github.com/agnt-gg/gitstarter');
+  assert.throws(() => cleanHttpUrl('javascript:alert(1)'), /HTTP or HTTPS/);
+  assert.throws(() => cleanHttpUrl('not a url'), /valid URL/);
 });
 test('commission writes require wallet auth', async () => {
   const response = await fetch(base + '/api/commissions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });

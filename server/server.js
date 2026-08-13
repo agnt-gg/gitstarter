@@ -28,6 +28,13 @@ function cleanText(value, max) {
   if (!text || text.length > max) throw Object.assign(new Error(`Text must be 1-${max} characters`), { status: 400 });
   return text;
 }
+function cleanHttpUrl(value) {
+  const text = cleanText(value, 500);
+  let url;
+  try { url = new URL(text); } catch { throw Object.assign(new Error('Repository URL must be a valid URL'), { status: 400 }); }
+  if (!['https:', 'http:'].includes(url.protocol)) throw Object.assign(new Error('Repository URL must use HTTP or HTTPS'), { status: 400 });
+  return url.href;
+}
 async function rpc(method, params) {
   const response = await fetch(RPC_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
   if (!response.ok) throw new Error(`RPC HTTP ${response.status}`);
@@ -88,7 +95,7 @@ app.post('/api/commissions', requireAuth, async (req, res, next) => {
     const record = {
       address, creator: req.wallet, txSignature,
       title: cleanText(req.body.title, 160), description: cleanText(req.body.description, 10000),
-      repositoryUrl: req.body.repositoryUrl ? cleanText(req.body.repositoryUrl, 500) : null,
+      repositoryUrl: req.body.repositoryUrl ? cleanHttpUrl(req.body.repositoryUrl) : null,
       license: cleanText(req.body.license || 'MIT', 64),
       labels: Array.isArray(req.body.labels) ? req.body.labels.slice(0, 12).map(v => cleanText(v, 32)) : []
     };
@@ -102,4 +109,4 @@ app.get(/^(?!\/api(?:\/|$)).*/, (_req, res) => res.sendFile(path.join(PUBLIC_DIR
 app.use((error, _req, res, _next) => { console.error(error); res.status(error.status || 500).json({ error: error.status ? error.message : 'Internal server error' }); });
 
 if (require.main === module) app.listen(PORT, '127.0.0.1', () => console.log(`gitstarter listening on 127.0.0.1:${PORT}`));
-module.exports = { app, db };
+module.exports = { app, db, cleanHttpUrl };

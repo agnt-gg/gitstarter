@@ -1,4 +1,5 @@
 node_modules/
+.chrome-qa/
 data/
 .env
 *.keypair.json

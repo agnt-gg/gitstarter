@@ -9,6 +9,7 @@
     "build:client": "esbuild client/app.js --bundle --format=iife --global-name=GitStarterApp --outfile=public/app.js --minify"
   },
   "dependencies": {
+    "@metamask/connect-solana": "^2.1.1",
     "@solana/spl-token": "0.4.13",
     "@solana/web3.js": "1.98.4",
     "better-sqlite3": "11.10.0",
