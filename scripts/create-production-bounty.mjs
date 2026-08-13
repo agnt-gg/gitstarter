@@ -23,7 +23,9 @@ const creator = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync
 const connection = new Connection(RPC_URL, 'confirmed');
 const seed = Date.now();
 const goalLamports = 50_000_000;
-const deadline = Math.floor(Date.now() / 1000) + (14 * 24 * 60 * 60);
+const deadline = Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60);
+const DELIVERY_WINDOW_SECONDS = 2 * 24 * 60 * 60;
+const REVIEW_WINDOW_SECONDS = 24 * 60 * 60;
 
 function u64(value) {
   const buffer = Buffer.alloc(8);
@@ -54,7 +56,7 @@ const instruction = new TransactionInstruction({
     { pubkey: vault, isSigner: false, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
   ],
-  data: Buffer.concat([Buffer.from([1]), u64(seed), u64(goalLamports), milestoneCount, milestone, i64(deadline)]),
+  data: Buffer.concat([Buffer.from([1]), u64(seed), u64(goalLamports), milestoneCount, milestone, i64(deadline), i64(DELIVERY_WINDOW_SECONDS), i64(REVIEW_WINDOW_SECONDS)]),
 });
 const txSignature = await sendAndConfirmTransaction(
   connection,

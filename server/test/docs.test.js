@@ -248,6 +248,28 @@ test('the docs never instruct anyone to hand over a key', () => {
   }
 });
 
+test('no source file hardcodes the account size', () => {
+  // A literal 240 in server.js silently rejected every real commission after the
+  // account layout grew: the docs tests could not see it because it was a bare
+  // number rather than a documented constant. Any size check must come from
+  // shared/escrow.js so there is exactly one place to change.
+  const CLIENT = fs.readFileSync(path.join(ROOT, 'client', 'app.js'), 'utf8');
+  const sources = { 'server/server.js': SERVER, 'client/app.js': CLIENT };
+  for (const [name, source] of Object.entries(sources)) {
+    for (const stale of [240, 315, 316]) {
+      assert.equal(
+        new RegExp(`(?:dataSize|length)\\s*[!=]==?\\s*${stale}\\b`).test(source),
+        false,
+        `${name} compares an account size against the literal ${stale}; use escrow.COMMISSION_ACCOUNT_BYTES`,
+      );
+    }
+    assert.ok(
+      /COMMISSION_ACCOUNT_BYTES/.test(source),
+      `${name} must source the account size from the shared module`,
+    );
+  }
+});
+
 test('the docs explain how a silent creator is handled', () => {
   // This is the mechanism that stops delivered work being taken for free. If it
   // is not documented, agents will not know to submit, and the protection they

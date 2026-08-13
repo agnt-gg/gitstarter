@@ -173,7 +173,11 @@ app.post('/api/commissions', requireAuth, async (req, res, next) => {
     const accountValue = chainAccount?.value;
     if (!accountValue || accountValue.owner !== PROGRAM_ID) return res.status(409).json({ error: 'Commission account is missing or has the wrong owner' });
     const accountData = Buffer.from(accountValue.data[0], 'base64');
-    if (accountData.length !== 240 || accountData[0] !== 2) return res.status(409).json({ error: 'Address is not a GitStarter commission' });
+    // Sourced from shared/escrow.js so an account-layout change cannot leave a
+    // stale literal here silently rejecting every real commission.
+    if (accountData.length !== escrow.COMMISSION_ACCOUNT_BYTES || accountData[0] !== 2) {
+      return res.status(409).json({ error: 'Address is not a GitStarter commission' });
+    }
     if (bs58.encode(accountData.subarray(1, 33)) !== req.wallet) return res.status(403).json({ error: 'Authenticated wallet is not the on-chain creator' });
     const record = {
       address, creator: req.wallet, txSignature,
