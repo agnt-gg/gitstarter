@@ -37,8 +37,8 @@ Solana transaction signed by *your* keypair.
 | Config PDA | `DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29` |
 | Fee treasury | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
 | Settlement asset | native SOL |
-| Program hash | `883ab3ade2261ad6db19d33290a5c936985a335757fb0c8a71cc3beda1c53eeb` |
-| Deployed in slot | `483566220` |
+| Program hash | `7c648517be0f79274f0fd6f51294694ff34bbeced7d6aafaf92a216aaef5d66d` |
+| Deployed in slot | `483584727` |
 
 Confirm that hash yourself rather than trusting this file:
 
