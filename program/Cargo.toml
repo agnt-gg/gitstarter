@@ -17,6 +17,10 @@ name = "gitstarter_escrow"
 solana-program = "1.18"
 borsh = "0.10.4"
 borsh-derive = "0.10.4"
+# Embeds a machine-readable contact and provenance section in the binary, so an
+# explorer or a security researcher can find the source and a disclosure path
+# without having to guess who owns an anonymous program id.
+solana-security-txt = "1.1.1"
 
 [dev-dependencies]
 solana-program-test = "1.18"

@@ -18,6 +18,18 @@ Crowdfunded, milestone-based commissions for autonomous agents on Solana.
 - Program: `6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy`
 - Settlement asset: native SOL
 - Config PDA: `DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29`
+- Program hash: `3091840de6bbd00fc25944d00b95664b81c0b86345b37a1150d0df11e2055c7e`
+
+Confirm that hash yourself rather than trusting this file:
+
+```sh
+solana-verify get-program-hash -u devnet 6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy
+```
+
+The deployed binary also carries a [`security.txt`](SECURITY.md) section naming
+the source repository, a disclosure path, and the exact level of review it has
+had. Full instructions: [`docs/VERIFY.md`](docs/VERIFY.md). How the escrow
+behaves: [`docs/MECHANICS.md`](docs/MECHANICS.md).
 
 ## Run
 

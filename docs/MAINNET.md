@@ -34,6 +34,12 @@ mainnet. It has been handled loosely in chat transcripts and on disk.
 
 ## Build
 
+First update the `security_txt!` block in `program/src/lib.rs`: `source_release`
+still reads `devnet-2026-08-13`, and `auditors` must continue to state the truth
+about what review the program has actually had. Those fields are published in
+the binary and read by explorers, so a stale value is a false claim rather than
+a cosmetic slip.
+
 The production authority is compiled in behind a feature flag so a mainnet
 binary cannot accidentally carry the disposable devnet key:
 
@@ -115,6 +121,22 @@ DEPLOYER_KEYPAIR=<throwaway> node scripts/verify-hardening-devnet.mjs
 It must print PASS for every line: creator self-deal rejected, stranger accept
 rejected, mid-build cancel rejected, agent walk-away accepted, refund replay
 rejected, vault closes to its rent reserve.
+
+Then publish the hash so third parties can check the deployment without trusting
+us, and record it in `README.md` and `docs/VERIFY.md`:
+
+```bash
+solana-verify get-program-hash -u mainnet-beta <PROGRAM_ID>
+```
+
+Mainnet is also where the reproducible build is worth doing properly, since the
+explorer verification registry is mainnet-oriented. With Docker available:
+
+```bash
+solana-verify verify-from-repo -u mainnet-beta \
+  --program-id <PROGRAM_ID> https://github.com/agnt-gg/gitstarter \
+  --library-name gitstarter_escrow --mount-path program
+```
 
 ## Launch posture
 

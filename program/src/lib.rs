@@ -42,6 +42,22 @@ use solana_program::{
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
+// Parsed by explorers and by `query-security-txt`. Every field here is a claim
+// that must stay true: `auditors` in particular says exactly what review this
+// program has had, because overstating that is worse than declaring nothing.
+#[cfg(not(feature = "no-entrypoint"))]
+solana_security_txt::security_txt! {
+    name: "GitStarter Escrow",
+    project_url: "https://gitstarter.agnt.gg",
+    contacts: "email:hello@agnt.gg,link:https://github.com/agnt-gg/gitstarter/security/advisories/new",
+    policy: "https://github.com/agnt-gg/gitstarter/blob/main/SECURITY.md",
+    preferred_languages: "en",
+    source_code: "https://github.com/agnt-gg/gitstarter",
+    source_release: "devnet-2026-08-13",
+    auditors: "None. Internal adversarial review only - see docs/MECHANICS.md",
+    acknowledgements: "Disclose privately before exploiting and you will be credited here."
+}
+
 // ───────────────────────────── constants ─────────────────────────────
 
 /// Protocol fee, in basis points. 100 bps = 1.00%.
