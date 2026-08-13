@@ -86,16 +86,42 @@ pub const INITIALIZER: Pubkey =
 
 pub const MAX_MILESTONES: usize = 8;
 
-/// Hard ceiling on how far out a deadline may be set.
-///
-/// Without it, `deadline` only had a lower bound, so a commission could be
-/// created with a deadline centuries away. Once such a commission reached
-/// Building, every exit was closed: the creator cannot cancel mid-build, the
-/// deadline never arrives, and refunds require Cancelled or Funding. The escrow
-/// became permanently unreachable, and a creator/agent pair could hold it for
-/// ransom. Bounding the deadline converts that permanent lock into a worst-case
-/// wait, without weakening the mid-build protection an agent relies on.
-pub const MAX_COMMISSION_DURATION: i64 = 180 * 86_400;
+// ── clocks ──────────────────────────────────────────────────────────────────
+//
+// One deadline used to cover both raising the money and doing the work, which
+// meant a late-funded commission silently gave its agent less time. The phases
+// are now separate, each with its own bound, and each expiring to the outcome
+// that is fair at that point:
+//
+//   funding  expires -> refund   (nobody worked, so backers get their SOL back)
+//   delivery expires -> refund   (the agent failed, same conclusion)
+//   review   expires -> RELEASE  (the agent delivered and the creator went quiet)
+//
+// That last inversion is the whole point. Silence used to be free for a creator
+// sitting on delivered work; now silence pays.
+
+/// Ceiling on the funding phase. Also bounds the worst-case lock: a commission
+/// can hold SOL for at most MAX_FUNDING_DURATION + MAX_DELIVERY_WINDOW.
+pub const MAX_FUNDING_DURATION: i64 = 30 * 86_400;
+
+/// Delivery clock, measured from the moment the agent accepts. Agents building
+/// software work in hours, so the floor is deliberately low.
+pub const MIN_DELIVERY_WINDOW: i64 = 3_600;
+pub const MAX_DELIVERY_WINDOW: i64 = 30 * 86_400;
+pub const DEFAULT_DELIVERY_WINDOW: i64 = 3 * 86_400;
+
+/// How long a creator has to review a submitted delivery before anyone may
+/// release it on the agent's behalf. Chosen by the creator at creation time and
+/// visible to the agent before they accept, so it is a disclosed term rather
+/// than a surprise.
+pub const MIN_REVIEW_WINDOW: i64 = 3_600;
+pub const MAX_REVIEW_WINDOW: i64 = 14 * 86_400;
+pub const DEFAULT_REVIEW_WINDOW: i64 = 2 * 86_400;
+
+/// A nomination nobody accepts lapses, so an unresponsive nominee cannot park a
+/// funded commission. Until it lapses the claim is exclusive, which is what
+/// stops several agents from speculatively building the same thing.
+pub const NOMINATION_WINDOW: i64 = 3 * 86_400;
 
 pub const SEED_CONFIG: &[u8] = b"config";
 pub const SEED_COMMISSION: &[u8] = b"commission";
@@ -142,6 +168,10 @@ pub enum EscrowError {
     DeadlineTooFar = 25,
     GoalTooSmall = 26,
     NoPendingAgent = 27,
+    NoSubmission = 28,
+    ReviewWindowOpen = 29,
+    BadWindow = 30,
+    SubmissionPending = 31,
 }
 
 impl From<EscrowError> for ProgramError {
@@ -215,9 +245,33 @@ pub struct Commission {
     pub milestone_bps: [u16; MAX_MILESTONES],
     /// Bitmap of released milestones; bit i == milestone i.
     pub milestones_done: u8,
+    /// End of the funding phase.
     pub deadline: i64,
     pub bump: u8,
     pub vault_bump: u8,
+
+    // ── delivery and review ──────────────────────────────────────────────
+    /// Seconds the agent gets, counted from acceptance. Fixed at creation so an
+    /// agent knows the terms before committing.
+    pub delivery_window: i64,
+    /// Absolute delivery deadline. Zero until an agent accepts.
+    pub delivery_deadline: i64,
+    /// Seconds a creator has to review a submission before anyone may release it.
+    pub review_window: i64,
+    /// When the current delivery was submitted. Zero means nothing is pending.
+    pub submitted_at: i64,
+    /// Which milestone the pending submission is for.
+    pub submitted_index: u8,
+    /// Hash of whatever the agent submitted as evidence — a commit, an artifact,
+    /// a URL. The chain stores the commitment, never the content.
+    pub evidence_hash: [u8; 32],
+    /// When the standing nomination was made, so a stale claim can lapse.
+    pub nominated_at: i64,
+    /// Counters that make conduct legible. Both are monotonic and derived from
+    /// actions the counterparty already took publicly.
+    pub submissions: u8,
+    pub rejections: u8,
+    pub auto_releases: u8,
 }
 impl Commission {
     pub const LEN: usize = 1
@@ -241,6 +295,16 @@ impl Commission {
         + 1
         + 8
         + 1
+        + 1
+        + 8
+        + 8
+        + 8
+        + 8
+        + 1
+        + 32
+        + 8
+        + 1
+        + 1
         + 1;
 
     /// Pledged lamports still owed by this commission.
@@ -249,6 +313,25 @@ impl Commission {
             .checked_sub(self.released)
             .and_then(|v| v.checked_sub(self.refunded))
             .ok_or_else(|| EscrowError::MathOverflow.into())
+    }
+
+    /// A submission is pending when it has been made and not yet resolved by a
+    /// release or a rejection.
+    pub fn has_pending_submission(&self) -> bool {
+        self.submitted_at > 0
+    }
+
+    /// True once the creator's review window has elapsed on a pending
+    /// submission, at which point anyone may release it on the agent's behalf.
+    pub fn review_expired(&self, now: i64) -> bool {
+        self.has_pending_submission() && now >= self.submitted_at.saturating_add(self.review_window)
+    }
+
+    /// Clears the pending submission. Called on release and on rejection.
+    pub fn clear_submission(&mut self) {
+        self.submitted_at = 0;
+        self.submitted_index = 0;
+        self.evidence_hash = [0u8; 32];
     }
 }
 
@@ -311,7 +394,13 @@ pub enum Instruction {
         seed: u64,
         goal: u64,
         milestone_bps: Vec<u16>,
+        /// End of the funding phase.
         deadline: i64,
+        /// Seconds the agent gets once they accept. Zero selects the default.
+        delivery_window: i64,
+        /// Seconds the creator gets to review a delivery before anyone may
+        /// release it. Zero selects the default.
+        review_window: i64,
     },
 
     /// 2. Pledge native SOL into escrow.
@@ -322,8 +411,12 @@ pub enum Instruction {
     /// Accounts: [creator(s)] [commission(w)] [agent]
     SelectAgent,
 
-    /// 4. Creator accepts a milestone; escrow releases that slice.
-    /// Accounts: [creator(s)] [commission(w)] [vault(w)] [agent(w)] [treasury(w)]
+    /// 4. Release a milestone slice from escrow.
+    ///
+    /// The creator may call this at any time. Anyone may call it once the
+    /// review window on a submitted delivery has elapsed — that is what makes a
+    /// silent creator pay rather than costing the agent their work.
+    /// Accounts: [signer(s)] [commission(w)] [vault(w)] [agent(w)] [treasury(w)]
     ReleaseMilestone { index: u8 },
 
     /// 5. Backer withdraws their pro-rata share of whatever was never released.
@@ -343,10 +436,24 @@ pub enum Instruction {
     /// Accounts: [agent(s)] [commission(w)]
     AcceptAgent,
 
-    /// 9. Creator withdraws a nomination the nominee never accepted, so one
-    ///    unresponsive counterparty cannot strand a successfully funded raise.
-    /// Accounts: [creator(s)] [commission(w)]
+    /// 9. Withdraw a nomination the nominee never accepted, so one unresponsive
+    ///    counterparty cannot strand a successfully funded raise. The creator
+    ///    may do this at will; anyone may once the nomination has lapsed.
+    /// Accounts: [signer(s)] [commission(w)]
     RevokeAgent,
+
+    /// 10. Agent submits a delivery for review, starting the review clock.
+    ///
+    /// `evidence_hash` is an opaque 32-byte commitment — a commit id, an
+    /// artifact digest, a hash of a URL. The chain stores the commitment and
+    /// never the content, so this cannot become a data-availability problem.
+    /// Accounts: [agent(s)] [commission(w)]
+    SubmitDelivery { index: u8, evidence_hash: [u8; 32] },
+
+    /// 11. Creator rejects a submitted delivery, stopping the review clock and
+    ///     recording the refusal publicly. The agent may submit again.
+    /// Accounts: [creator(s)] [commission(w)]
+    RejectDelivery,
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -464,7 +571,18 @@ pub fn process_instruction(
             goal,
             milestone_bps,
             deadline,
-        } => create_commission(program_id, accounts, seed, goal, milestone_bps, deadline),
+            delivery_window,
+            review_window,
+        } => create_commission(
+            program_id,
+            accounts,
+            seed,
+            goal,
+            milestone_bps,
+            deadline,
+            delivery_window,
+            review_window,
+        ),
         Instruction::Pledge { amount } => pledge(program_id, accounts, amount),
         Instruction::SelectAgent => select_agent(program_id, accounts),
         Instruction::ReleaseMilestone { index } => release_milestone(program_id, accounts, index),
@@ -473,6 +591,11 @@ pub fn process_instruction(
         Instruction::SetPaused { paused } => set_paused(program_id, accounts, paused),
         Instruction::AcceptAgent => accept_agent(program_id, accounts),
         Instruction::RevokeAgent => revoke_agent(program_id, accounts),
+        Instruction::SubmitDelivery {
+            index,
+            evidence_hash,
+        } => submit_delivery(program_id, accounts, index, evidence_hash),
+        Instruction::RejectDelivery => reject_delivery(program_id, accounts),
     }
 }
 
@@ -533,6 +656,8 @@ fn create_commission(
     goal: u64,
     milestone_bps: Vec<u16>,
     deadline: i64,
+    delivery_window: i64,
+    review_window: i64,
 ) -> ProgramResult {
     let ai = &mut accounts.iter();
     let creator = next_account_info(ai)?;
@@ -566,8 +691,25 @@ fn create_commission(
     if deadline <= now {
         return Err(EscrowError::DeadlineInPast.into());
     }
-    if deadline > now.saturating_add(MAX_COMMISSION_DURATION) {
+    if deadline > now.saturating_add(MAX_FUNDING_DURATION) {
         return Err(EscrowError::DeadlineTooFar.into());
+    }
+    // Zero means "use the default", so a caller who does not care about these
+    // terms still gets sane ones rather than a commission that can never move.
+    let delivery_window = if delivery_window == 0 {
+        DEFAULT_DELIVERY_WINDOW
+    } else {
+        delivery_window
+    };
+    let review_window = if review_window == 0 {
+        DEFAULT_REVIEW_WINDOW
+    } else {
+        review_window
+    };
+    if !(MIN_DELIVERY_WINDOW..=MAX_DELIVERY_WINDOW).contains(&delivery_window)
+        || !(MIN_REVIEW_WINDOW..=MAX_REVIEW_WINDOW).contains(&review_window)
+    {
+        return Err(EscrowError::BadWindow.into());
     }
     if milestone_bps.is_empty() || milestone_bps.len() > MAX_MILESTONES {
         return Err(EscrowError::BadMilestones.into());
@@ -655,6 +797,16 @@ fn create_commission(
         deadline,
         bump: c_bump,
         vault_bump: v_bump,
+        delivery_window,
+        delivery_deadline: 0,
+        review_window,
+        submitted_at: 0,
+        submitted_index: 0,
+        evidence_hash: [0u8; 32],
+        nominated_at: 0,
+        submissions: 0,
+        rejections: 0,
+        auto_releases: 0,
     };
     save(commission_ai, &c)?;
     msg!("SOL commission created");
@@ -805,6 +957,9 @@ fn select_agent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     }
     c.pending_agent = *agent.key;
     c.has_pending_agent = true;
+    // Timestamping the claim is what lets it expire. An exclusive claim that
+    // never lapses is just a different way to park a commission.
+    c.nominated_at = Clock::get()?.unix_timestamp;
     save(commission_ai, &c)?;
     msg!("agent nominated");
     Ok(())
@@ -832,12 +987,94 @@ fn accept_agent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     c.has_agent = true;
     c.has_pending_agent = false;
     c.status = Status::Building;
+    // The delivery clock starts now, not at creation. An agent who accepts late
+    // in a funding window gets the same time to work as one who accepts early.
+    c.delivery_deadline = Clock::get()?
+        .unix_timestamp
+        .checked_add(c.delivery_window)
+        .ok_or(EscrowError::MathOverflow)?;
     save(commission_ai, &c)?;
-    msg!("agent accepted");
+    msg!("agent accepted, delivery due {}", c.delivery_deadline);
     Ok(())
 }
 
 fn revoke_agent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let ai = &mut accounts.iter();
+    let signer = next_account_info(ai)?;
+    let commission_ai = next_account_info(ai)?;
+    assert_signer(signer)?;
+    let mut c = load_commission(commission_ai, program_id)?;
+    // Only an unaccepted nomination may be withdrawn. Once an agent has signed,
+    // their contract is theirs and only they can end it early.
+    if c.has_agent || !c.has_pending_agent {
+        return Err(EscrowError::NoPendingAgent.into());
+    }
+    // The creator may withdraw at will. Anyone may clear a claim that has gone
+    // stale, so a nominee who never answers cannot hold the commission shut and
+    // keep other agents from being considered.
+    let lapsed = Clock::get()?.unix_timestamp >= c.nominated_at.saturating_add(NOMINATION_WINDOW);
+    if c.creator != *signer.key && !lapsed {
+        return Err(EscrowError::Unauthorized.into());
+    }
+    c.pending_agent = Pubkey::default();
+    c.has_pending_agent = false;
+    c.nominated_at = 0;
+    save(commission_ai, &c)?;
+    msg!("nomination withdrawn");
+    Ok(())
+}
+
+// 10 ── SubmitDelivery ───────────────────────────────────────────────
+//
+// The chain previously had no idea whether work had happened; it only saw money
+// move. That blind spot is exactly what made stiffing an agent free. Recording
+// a delivery starts a clock that resolves to payment on silence.
+fn submit_delivery(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    index: u8,
+    evidence_hash: [u8; 32],
+) -> ProgramResult {
+    let ai = &mut accounts.iter();
+    let agent = next_account_info(ai)?;
+    let commission_ai = next_account_info(ai)?;
+    assert_signer(agent)?;
+    let mut c = load_commission(commission_ai, program_id)?;
+    if c.status != Status::Building || !c.has_agent {
+        return Err(EscrowError::BadStatus.into());
+    }
+    if c.agent != *agent.key {
+        return Err(EscrowError::Unauthorized.into());
+    }
+    if index as usize >= c.milestone_count as usize {
+        return Err(EscrowError::BadMilestones.into());
+    }
+    if c.milestones_done & (1u8 << index) != 0 {
+        return Err(EscrowError::MilestoneAlreadyReleased.into());
+    }
+    // Submitting after the delivery deadline is refused: past that point the
+    // escrow is refundable, and letting a late submission reopen it would take
+    // back a refund backers are already entitled to.
+    if Clock::get()?.unix_timestamp >= c.delivery_deadline {
+        return Err(EscrowError::DeadlinePassed.into());
+    }
+    // Re-submitting replaces the pending claim and restarts the review clock.
+    // Only the agent can do that, and it only ever costs them time.
+    c.submitted_at = Clock::get()?.unix_timestamp;
+    c.submitted_index = index;
+    c.evidence_hash = evidence_hash;
+    c.submissions = c.submissions.saturating_add(1);
+    save(commission_ai, &c)?;
+    msg!("delivery submitted for milestone {}", index);
+    Ok(())
+}
+
+// 11 ── RejectDelivery ───────────────────────────────────────────────
+//
+// A creator can still refuse work. What they can no longer do is refuse it
+// silently and for free: rejection is an on-chain act attributable to their
+// address, and it stops a clock that would otherwise have paid the agent.
+fn reject_delivery(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let ai = &mut accounts.iter();
     let creator = next_account_info(ai)?;
     let commission_ai = next_account_info(ai)?;
@@ -846,33 +1083,46 @@ fn revoke_agent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     if c.creator != *creator.key {
         return Err(EscrowError::Unauthorized.into());
     }
-    // Only an unaccepted nomination may be withdrawn. Once an agent has signed,
-    // their contract is theirs and only they can end it early.
-    if c.has_agent || !c.has_pending_agent {
-        return Err(EscrowError::NoPendingAgent.into());
+    if !c.has_pending_submission() {
+        return Err(EscrowError::NoSubmission.into());
     }
-    c.pending_agent = Pubkey::default();
-    c.has_pending_agent = false;
+    // Once the window has elapsed the agent's claim has already matured; the
+    // creator cannot retroactively cancel a release anyone is entitled to make.
+    if c.review_expired(Clock::get()?.unix_timestamp) {
+        return Err(EscrowError::ReviewWindowOpen.into());
+    }
+    c.clear_submission();
+    c.rejections = c.rejections.saturating_add(1);
     save(commission_ai, &c)?;
-    msg!("nomination withdrawn");
+    msg!("delivery rejected");
     Ok(())
 }
 
 // 4 ── ReleaseMilestone ──────────────────────────────────────────────
 fn release_milestone(program_id: &Pubkey, accounts: &[AccountInfo], index: u8) -> ProgramResult {
     let ai = &mut accounts.iter();
-    let creator = next_account_info(ai)?;
+    let signer = next_account_info(ai)?;
     let commission_ai = next_account_info(ai)?;
     let vault_ai = next_account_info(ai)?;
     let agent = next_account_info(ai)?;
     let treasury = next_account_info(ai)?;
-    assert_signer(creator)?;
+    assert_signer(signer)?;
     let mut c = load_commission(commission_ai, program_id)?;
-    if c.creator != *creator.key {
-        return Err(EscrowError::Unauthorized.into());
-    }
     if c.status != Status::Building || !c.has_agent {
         return Err(EscrowError::BadStatus.into());
+    }
+    // The creator may pay at any time, including before a formal submission —
+    // paying early is never something to obstruct.
+    //
+    // Anyone else may only complete a release the agent has already earned: a
+    // delivery for *this* milestone whose review window has run out. That is the
+    // mechanism that converts creator silence into payment, and it deliberately
+    // needs no arbiter, no oracle and no privileged caller.
+    let now = Clock::get()?.unix_timestamp;
+    let is_creator = c.creator == *signer.key;
+    let matured = c.review_expired(now) && c.submitted_index == index;
+    if !is_creator && !matured {
+        return Err(EscrowError::ReviewWindowOpen.into());
     }
     if *agent.key != c.agent {
         return Err(EscrowError::BadOwner.into());
@@ -919,6 +1169,13 @@ fn release_milestone(program_id: &Pubkey, accounts: &[AccountInfo], index: u8) -
         .released
         .checked_add(gross)
         .ok_or(EscrowError::MathOverflow)?;
+    // Releasing settles whatever submission was outstanding for this milestone.
+    if c.has_pending_submission() && c.submitted_index == index {
+        if !is_creator {
+            c.auto_releases = c.auto_releases.saturating_add(1);
+        }
+        c.clear_submission();
+    }
     if completes_schedule {
         c.status = Status::Delivered;
     }
@@ -951,11 +1208,22 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // A commission that met its goal and then expired without an agent holds
     // backer money exactly as a Funding one does. Requiring a third party to pay
     // for a Cancel first served no purpose.
+    let now = Clock::get()?.unix_timestamp;
+    // An agent who accepted and then delivered nothing leaves the escrow in
+    // exactly the state an unfunded one is in, so it refunds on the same terms
+    // once their delivery clock runs out.
+    let delivery_expired = c.status == Status::Building && now >= c.delivery_deadline;
     let refundable = c.status == Status::Cancelled
-        || (matches!(c.status, Status::Funding | Status::Funded)
-            && Clock::get()?.unix_timestamp >= c.deadline);
+        || (matches!(c.status, Status::Funding | Status::Funded) && now >= c.deadline)
+        || delivery_expired;
     if !refundable {
         return Err(EscrowError::BadStatus.into());
+    }
+    // Work that has been delivered and not yet judged is not abandoned work.
+    // Refunding around a live claim would hand the creator back the exact
+    // free-work outcome the review clock exists to prevent.
+    if c.has_pending_submission() && !c.review_expired(now) {
+        return Err(EscrowError::SubmissionPending.into());
     }
     assert_pda(
         &[SEED_VAULT, commission_ai.key.as_ref()],
@@ -1058,8 +1326,25 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // cannot harm backers — it only releases the remaining escrow for refund
     // immediately instead of making everyone wait out the deadline.
     let agent_may_walk_away = c.has_agent && c.agent == *signer.key && c.status == Status::Building;
-    if !creator_may_cancel && !agent_may_walk_away && now < c.deadline {
+    // Which clock has to have run depends on the phase. Once an agent is
+    // building, the funding deadline is behind us and irrelevant; what matters
+    // is whether they still have time left to deliver.
+    let expiry = if c.status == Status::Building {
+        c.delivery_deadline
+    } else {
+        c.deadline
+    };
+    if !creator_may_cancel && !agent_may_walk_away && now < expiry {
         return Err(EscrowError::DeadlineNotPassed.into());
+    }
+    // A delivery awaiting judgement blocks cancellation from every direction,
+    // including the agent's own. Otherwise a creator could watch work land and
+    // then cancel out from under it, which is precisely the theft this change
+    // exists to stop. The escape hatch is not privileged: once the review window
+    // lapses, anyone may release the milestone, and cancelling becomes possible
+    // again afterwards.
+    if c.has_pending_submission() && !c.review_expired(now) {
+        return Err(EscrowError::SubmissionPending.into());
     }
     c.status = Status::Cancelled;
     save(commission_ai, &c)?;
@@ -1181,6 +1466,18 @@ mod tests {
         );
     }
 
+    /// The off-chain decoder and the documentation both hard-code this number,
+    /// and a mismatch makes every commission silently undecodable rather than
+    /// loudly broken. Pinning it here gives them something to check against.
+    #[test]
+    fn commission_account_size_is_pinned() {
+        assert_eq!(
+            Commission::LEN,
+            316,
+            "account size changed; update shared/escrow.js, the dataSize filters, and the layout tables"
+        );
+    }
+
     #[test]
     fn state_sizes_match_serialized_length() {
         let c = dummy_commission();
@@ -1229,6 +1526,55 @@ mod tests {
             deadline: 0,
             bump: 0,
             vault_bump: 0,
+            delivery_window: DEFAULT_DELIVERY_WINDOW,
+            delivery_deadline: 0,
+            review_window: DEFAULT_REVIEW_WINDOW,
+            submitted_at: 0,
+            submitted_index: 0,
+            evidence_hash: [0u8; 32],
+            nominated_at: 0,
+            submissions: 0,
+            rejections: 0,
+            auto_releases: 0,
         }
+    }
+
+    #[test]
+    fn review_clock_matures_exactly_once_the_window_elapses() {
+        let mut c = dummy_commission();
+        assert!(!c.has_pending_submission(), "nothing pending by default");
+        assert!(
+            !c.review_expired(i64::MAX),
+            "an absent submission can never mature into a payable claim"
+        );
+
+        c.submitted_at = 1_000;
+        c.review_window = 100;
+        assert!(c.has_pending_submission());
+        assert!(!c.review_expired(1_099), "still inside the review window");
+        assert!(c.review_expired(1_100), "the boundary itself is payable");
+        assert!(c.review_expired(2_000));
+
+        c.clear_submission();
+        assert!(!c.has_pending_submission());
+        assert!(!c.review_expired(i64::MAX));
+        assert_eq!(c.evidence_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn clock_bounds_are_ordered_and_sane_for_agents() {
+        // Agents deliver in hours, so the floors have to permit that.
+        assert!(MIN_DELIVERY_WINDOW <= DEFAULT_DELIVERY_WINDOW);
+        assert!(DEFAULT_DELIVERY_WINDOW <= MAX_DELIVERY_WINDOW);
+        assert!(MIN_REVIEW_WINDOW <= DEFAULT_REVIEW_WINDOW);
+        assert!(DEFAULT_REVIEW_WINDOW <= MAX_REVIEW_WINDOW);
+        assert_eq!(MIN_DELIVERY_WINDOW, 3_600, "one hour must be expressible");
+        assert_eq!(MIN_REVIEW_WINDOW, 3_600);
+        // The worst case a backer's SOL can be locked is both phases back to back.
+        assert_eq!(
+            MAX_FUNDING_DURATION + MAX_DELIVERY_WINDOW,
+            60 * 86_400,
+            "total lock must stay far below the old 180-day ceiling"
+        );
     }
 }

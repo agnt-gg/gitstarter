@@ -148,6 +148,8 @@ fn create(
             goal,
             milestone_bps: bps,
             deadline,
+            delivery_window: 0,
+            review_window: 0,
         },
     )
 }

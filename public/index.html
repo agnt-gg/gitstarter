@@ -363,6 +363,12 @@ textarea{min-height:100px;resize:vertical;font-family:var(--sans)}
 .tasks li.done .pct{color:var(--success-fg)}
 .tasks li.now span.txt{font-weight:600}
 
+.flash-inline{
+  border:1px solid var(--accent-muted);background:var(--accent-subtle);color:var(--fg);
+  border-radius:var(--radius);padding:12px 14px;font-size:14px;line-height:1.5;
+}
+.flash-inline b{font-weight:600}
+
 /* bids */
 .bid{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border-muted)}
 .bid:last-child{border-bottom:0}
@@ -554,7 +560,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 <div class="overlay" id="overlay"><div class="dlg" id="dlg"></div></div>
 <div class="toast" id="toast"></div>
 
-<script src="/app.js?v=20260813-clean-header" defer></script>
+<script src="/app.js?v=20260813-fairness" defer></script>
 
 </body>
 </html>

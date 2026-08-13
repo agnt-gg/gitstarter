@@ -38,6 +38,7 @@ test('instruction encoding matches the program', () => {
   const create = escrow.build.createCommission(ctx, {
     creator, seed: 7, goalLamports: 1_000_000,
     milestoneBasisPoints: [5000, 5000], deadlineUnix: 1_900_000_000,
+    deliveryWindowSeconds: 7_200, reviewWindowSeconds: 3_600,
   });
   const d = create.instruction.data;
   assert.equal(d[0], 1);
@@ -47,7 +48,10 @@ test('instruction encoding matches the program', () => {
   assert.equal(d.readUInt16LE(21), 5000);
   assert.equal(d.readUInt16LE(23), 5000);
   assert.equal(Number(d.readBigInt64LE(25)), 1_900_000_000);
-  assert.equal(d.length, 33);
+  // The two clocks are appended after the funding deadline.
+  assert.equal(Number(d.readBigInt64LE(33)), 7_200, 'delivery window');
+  assert.equal(Number(d.readBigInt64LE(41)), 3_600, 'review window');
+  assert.equal(d.length, 49);
   assert.deepEqual(create.instruction.keys.map(k => k.pubkey.toBase58()),
     [creator, CONFIG, create.commission.toBase58(), create.vault.toBase58(), SYSTEM]);
   assert.deepEqual(create.instruction.keys.map(k => [k.isSigner, k.isWritable]),
@@ -63,6 +67,20 @@ test('instruction encoding matches the program', () => {
   assert.deepEqual([...escrow.build.cancel(ctx, { signer: creator, commission: LIVE_COMMISSION }).instruction.data], [6]);
   assert.deepEqual([...escrow.build.acceptAgent(ctx, { agent, commission: LIVE_COMMISSION }).instruction.data], [8]);
   assert.deepEqual([...escrow.build.revokeAgent(ctx, { creator, commission: LIVE_COMMISSION }).instruction.data], [9]);
+
+  // Delivery submission carries the milestone index and a 32-byte commitment.
+  const submit = escrow.build.submitDelivery(ctx, {
+    agent, commission: LIVE_COMMISSION, milestoneIndex: 1, evidenceHash: 'ab'.repeat(32),
+  });
+  assert.equal(submit.instruction.data[0], 10);
+  assert.equal(submit.instruction.data[1], 1);
+  assert.equal(submit.instruction.data.length, 34, 'discriminant + index + 32-byte hash');
+  assert.deepEqual(submit.instruction.keys.map(k => k.pubkey.toBase58()), [agent, LIVE_COMMISSION]);
+  assert.throws(() => escrow.build.submitDelivery(ctx, {
+    agent, commission: LIVE_COMMISSION, milestoneIndex: 0, evidenceHash: 'abcd',
+  }), /exactly 32 bytes/, 'a short commitment must be refused, not silently padded');
+
+  assert.deepEqual([...escrow.build.rejectDelivery(ctx, { creator, commission: LIVE_COMMISSION }).instruction.data], [11]);
 
   const release = escrow.build.releaseMilestone(ctx, { creator, commission: LIVE_COMMISSION, agent, milestoneIndex: 1 });
   assert.deepEqual([...release.instruction.data], [4, 1]);
@@ -174,7 +192,20 @@ test('transaction endpoints validate before touching the network', async () => {
 
   const tooFar = await post('create-commission', { creator: TREASURY, goalSol: 1, deadlineDays: 400 });
   assert.equal(tooFar.status, 400);
-  assert.match((await tooFar.json()).error, /180 days/);
+  assert.match((await tooFar.json()).error, /30 days/);
+
+  // The delivery and review clocks are bounded on both sides.
+  const shortDelivery = await post('create-commission', { creator: TREASURY, goalSol: 1, deliveryWindowSeconds: 60 });
+  assert.equal(shortDelivery.status, 400);
+  assert.match((await shortDelivery.json()).error, /Delivery window/);
+
+  const longReview = await post('create-commission', { creator: TREASURY, goalSol: 1, reviewHours: 24 * 30 });
+  assert.equal(longReview.status, 400);
+  assert.match((await longReview.json()).error, /Review window/);
+
+  const badIndex = await post('submit-delivery', { agent: TREASURY, commission: LIVE_COMMISSION, milestoneIndex: 99 });
+  assert.equal(badIndex.status, 400);
+  assert.match((await badIndex.json()).error, /milestoneIndex/);
 
   const tooSmall = await post('create-commission', { creator: TREASURY, goalLamports: 500 });
   assert.equal(tooSmall.status, 400);

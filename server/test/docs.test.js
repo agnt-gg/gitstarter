@@ -143,19 +143,38 @@ test('documented constants match the program', () => {
       `${name} must state the real account size`);
     assert.ok(doc.includes(String(escrow.BPS_DENOMINATOR)),
       `${name} must state the real basis-point denominator`);
-    // Every stated ceiling must agree with the program. Merely finding "180"
-    // somewhere is not enough: the docs say it more than once, so one of them
+    // Every stated ceiling must agree with the program. Merely finding the
+    // number somewhere is not enough: the docs say it more than once, so one
     // could drift while the other keeps a substring check happy.
-    const days = escrow.MAX_COMMISSION_DURATION_SECONDS / 86_400;
+    const days = escrow.MAX_FUNDING_DURATION_SECONDS / 86_400;
     const stated = [...doc.matchAll(/(?:at most|exceeds?|cannot exceed|may not exceed)\s+\**(\d+) days/gi)];
-    assert.ok(stated.length, `${name} must state the deadline ceiling`);
+    assert.ok(stated.length, `${name} must state the funding ceiling`);
     for (const [, value] of stated) {
       assert.equal(Number(value), days, `${name} states a ${value}-day ceiling; the program enforces ${days}`);
     }
+    // The delivery and review bounds are what an agent reads before committing
+    // their time, so a stale number here is a broken promise rather than a typo.
+    assert.ok(
+      new RegExp(`1 hour to ${escrow.MAX_DELIVERY_WINDOW_SECONDS / 86_400} days`).test(doc),
+      `${name} must state the real delivery window bounds`,
+    );
+    assert.ok(
+      new RegExp(`1 hour to ${escrow.MAX_REVIEW_WINDOW_SECONDS / 86_400} days`).test(doc),
+      `${name} must state the real review window bounds`,
+    );
+    assert.ok(
+      new RegExp(`${escrow.DEFAULT_REVIEW_WINDOW_SECONDS / 3_600} hours`).test(doc),
+      `${name} must state the default review window`,
+    );
   }
-  assert.equal(escrow.MAX_COMMISSION_DURATION_SECONDS, 180 * 86_400);
+  assert.equal(escrow.MAX_FUNDING_DURATION_SECONDS, 30 * 86_400);
   assert.equal(escrow.FEE_BASIS_POINTS, 100);
   assert.equal(escrow.MAX_MILESTONES, 8);
+  // Pinned by program/src/lib.rs::commission_account_size_is_pinned. A drift
+  // here makes every commission silently undecodable.
+  assert.equal(escrow.COMMISSION_ACCOUNT_BYTES, 316);
+  assert.equal(escrow.MIN_DELIVERY_WINDOW_SECONDS, 3_600);
+  assert.equal(escrow.MIN_REVIEW_WINDOW_SECONDS, 3_600);
 });
 
 test('the documented account layout matches the decoder', () => {
@@ -226,6 +245,27 @@ test('the docs never instruct anyone to hand over a key', () => {
     }
     assert.ok(/never send a private key|never holds a key|no [\w ]{0,40}asks for a private key/i.test(doc),
       `${name} must state plainly that no key is ever required`);
+  }
+});
+
+test('the docs explain how a silent creator is handled', () => {
+  // This is the mechanism that stops delivered work being taken for free. If it
+  // is not documented, agents will not know to submit, and the protection they
+  // are relying on simply will not engage.
+  for (const [name, doc] of Object.entries(DOCS)) {
+    assert.ok(/review/i.test(doc), `${name} must describe the review window`);
+    assert.ok(
+      /anyone can release|anyone may release|releasableByAnyone|released by anyone/i.test(doc),
+      `${name} must state that a matured delivery can be released by anyone`,
+    );
+    assert.ok(
+      /submit-delivery|SubmitDelivery/.test(doc),
+      `${name} must document how an agent records a delivery`,
+    );
+    assert.ok(
+      /reject/i.test(doc),
+      `${name} must document that a creator can still refuse, on the record`,
+    );
   }
 });
 

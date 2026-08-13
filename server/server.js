@@ -267,6 +267,31 @@ function presentCommission(address, chain, meta, wallet) {
     deadlineUnix: chain.deadline,
     deadline: new Date(chain.deadline * 1000).toISOString(),
     expired: Math.floor(Date.now() / 1000) >= chain.deadline,
+
+    // The clocks, and where this commission currently sits against them. An
+    // agent deciding whether to take work needs the terms before committing.
+    deliveryWindowSeconds: chain.deliveryWindow,
+    reviewWindowSeconds: chain.reviewWindow,
+    deliveryDeadlineUnix: chain.deliveryDeadline || null,
+    deliveryDeadline: chain.deliveryDeadline ? new Date(chain.deliveryDeadline * 1000).toISOString() : null,
+    deliveryExpired: chain.status === 'building' && Math.floor(Date.now() / 1000) >= chain.deliveryDeadline,
+    nominationLapsesAt: chain.nominationLapsesAt ? new Date(chain.nominationLapsesAt * 1000).toISOString() : null,
+    submission: chain.submission
+      ? {
+        milestoneIndex: chain.submission.milestoneIndex,
+        submittedAt: new Date(chain.submission.submittedAt * 1000).toISOString(),
+        evidenceHash: chain.submission.evidenceHash,
+        reviewEndsAt: new Date(chain.submission.reviewEndsAt * 1000).toISOString(),
+        // Once this is true the agent has earned the milestone and anyone may
+        // complete the payment.
+        releasableByAnyone: escrow.reviewExpired(chain),
+      }
+      : null,
+    conduct: {
+      submissions: chain.submissions,
+      rejections: chain.rejections,
+      autoReleases: chain.autoReleases,
+    },
     title: meta?.title ?? null,
     description: meta?.description ?? null,
     repositoryUrl: meta?.repository_url ?? null,
@@ -341,10 +366,37 @@ const TX_BUILDERS = {
     const deadlineUnix = body.deadlineUnix ? Number(body.deadlineUnix)
       : now + Math.round(Number(body.deadlineDays ?? 14) * 86_400);
     if (!Number.isFinite(deadlineUnix) || deadlineUnix <= now) throw badRequest('Deadline must be in the future');
-    if (deadlineUnix > now + escrow.MAX_COMMISSION_DURATION_SECONDS) throw badRequest('Deadline may not exceed 180 days');
+    if (deadlineUnix > now + escrow.MAX_FUNDING_DURATION_SECONDS) throw badRequest('A funding deadline may not exceed 30 days');
+    const deliveryWindowSeconds = body.deliveryWindowSeconds != null ? Number(body.deliveryWindowSeconds)
+      : body.deliveryDays != null ? Math.round(Number(body.deliveryDays) * 86_400) : 0;
+    const reviewWindowSeconds = body.reviewWindowSeconds != null ? Number(body.reviewWindowSeconds)
+      : body.reviewHours != null ? Math.round(Number(body.reviewHours) * 3_600) : 0;
+    // Zero means "use the program defaults"; anything else must be in range.
+    if (deliveryWindowSeconds !== 0
+      && (deliveryWindowSeconds < escrow.MIN_DELIVERY_WINDOW_SECONDS || deliveryWindowSeconds > escrow.MAX_DELIVERY_WINDOW_SECONDS)) {
+      throw badRequest('Delivery window must be between 1 hour and 30 days');
+    }
+    if (reviewWindowSeconds !== 0
+      && (reviewWindowSeconds < escrow.MIN_REVIEW_WINDOW_SECONDS || reviewWindowSeconds > escrow.MAX_REVIEW_WINDOW_SECONDS)) {
+      throw badRequest('Review window must be between 1 hour and 14 days');
+    }
     const seed = body.seed ? Number(body.seed) : Date.now();
-    const built = escrow.build.createCommission(ctx(), { creator, seed, goalLamports, milestoneBasisPoints: milestones, deadlineUnix });
-    return { feePayer: creator, built, extra: { seed, commission: built.commission.toBase58(), vault: built.vault.toBase58(), deadlineUnix } };
+    const built = escrow.build.createCommission(ctx(), {
+      creator, seed, goalLamports, milestoneBasisPoints: milestones, deadlineUnix,
+      deliveryWindowSeconds, reviewWindowSeconds,
+    });
+    return {
+      feePayer: creator,
+      built,
+      extra: {
+        seed,
+        commission: built.commission.toBase58(),
+        vault: built.vault.toBase58(),
+        deadlineUnix,
+        deliveryWindowSeconds: deliveryWindowSeconds || escrow.DEFAULT_DELIVERY_WINDOW_SECONDS,
+        reviewWindowSeconds: reviewWindowSeconds || escrow.DEFAULT_REVIEW_WINDOW_SECONDS,
+      },
+    };
   },
   pledge: async body => {
     const backer = cleanWallet(body.backer), commission = cleanWallet(body.commission);
@@ -379,6 +431,24 @@ const TX_BUILDERS = {
     const built = escrow.build.releaseMilestone(ctx(), { creator, commission, agent: found.agent, milestoneIndex });
     return { feePayer: creator, built, extra: { agent: found.agent, milestoneIndex } };
   },
+  'submit-delivery': async body => {
+    const agent = cleanWallet(body.agent), commission = cleanWallet(body.commission);
+    const milestoneIndex = Number(body.milestoneIndex ?? 0);
+    if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0 || milestoneIndex >= escrow.MAX_MILESTONES) {
+      throw badRequest('milestoneIndex out of range');
+    }
+    // Accept any string and commit to its hash. Agents should not have to think
+    // about byte lengths, and the chain must never hold the content itself.
+    const evidenceHash = /^[0-9a-f]{64}$/i.test(body.evidenceHash || '')
+      ? body.evidenceHash
+      : crypto.createHash('sha256').update(cleanText(body.evidence || body.evidenceHash || 'delivered', 2000)).digest('hex');
+    const built = escrow.build.submitDelivery(ctx(), { agent, commission, milestoneIndex, evidenceHash });
+    return { feePayer: agent, built, extra: { milestoneIndex, evidenceHash } };
+  },
+  'reject-delivery': async body => {
+    const creator = cleanWallet(body.creator), commission = cleanWallet(body.commission);
+    return { feePayer: creator, built: escrow.build.rejectDelivery(ctx(), { creator, commission }) };
+  },
   refund: async body => {
     const backer = cleanWallet(body.backer), commission = cleanWallet(body.commission);
     return { feePayer: backer, built: escrow.build.refund(ctx(), { backer, commission }) };
@@ -396,6 +466,80 @@ function requireLamports(body, field) {
   if (lamports == null || !Number.isFinite(Number(lamports))) throw badRequest(`Provide ${field}Lamports or ${field}Sol`);
   return Math.round(Number(lamports));
 }
+
+/// Reputation, computed from chain state on demand.
+///
+/// Nothing here is self-reported and nothing is stored: every number is derived
+/// from commissions anyone can fetch and recompute. The headline figure is
+/// `paidOnDelivery` — of the deliveries this creator was handed, how many they
+/// actually paid for rather than letting a clock decide.
+app.get('/api/v1/reputation/:wallet', async (req, res, next) => {
+  try {
+    let wallet;
+    try { wallet = cleanWallet(req.params.wallet); } catch { return res.status(400).json({ error: 'Invalid wallet' }); }
+    if (!rateLimit(`rep:${req.ip}`, 60, 60_000)) return res.status(429).json({ error: 'Rate limit exceeded' });
+    const chain = await chainCommissions();
+    const now = Math.floor(Date.now() / 1000);
+
+    const asCreator = [...chain.values()].filter(c => c.creator === wallet);
+    const asAgent = [...chain.values()].filter(c => c.agent === wallet);
+    const sum = (list, pick) => list.reduce((total, c) => total + pick(c), 0);
+    const ratio = (numerator, denominator) => (denominator ? numerator / denominator : null);
+
+    // Distinct counterparties, because a wallet that only ever trades with
+    // itself has volume but no reputation. Showing this makes the cheapest
+    // sybil pattern visible instead of flattering.
+    const creatorCounterparties = new Set(asCreator.map(c => c.agent).filter(Boolean));
+    const agentCounterparties = new Set(asAgent.map(c => c.creator).filter(Boolean));
+
+    const creatorRejections = sum(asCreator, c => c.rejections);
+    const creatorAutoReleases = sum(asCreator, c => c.autoReleases);
+    const creatorSubmissions = sum(asCreator, c => c.submissions);
+    const deliveriesResolved = creatorRejections + creatorAutoReleases;
+    const releasedMilestones = c => {
+      let n = 0;
+      for (let i = 0; i < c.milestoneCount; i++) if (c.milestonesDone & (1 << i)) n++;
+      return n;
+    };
+
+    res.json({
+      wallet,
+      cluster: CLUSTER,
+      computedAt: new Date().toISOString(),
+      creator: {
+        commissions: asCreator.length,
+        funded: asCreator.filter(c => c.status !== 'funding').length,
+        delivered: asCreator.filter(c => c.status === 'shipped').length,
+        cancelled: asCreator.filter(c => c.status === 'refunded').length,
+        distinctAgents: creatorCounterparties.size,
+        solReleased: sum(asCreator, c => c.released) / escrow.LAMPORTS_PER_SOL,
+        deliveriesReceived: creatorSubmissions,
+        rejections: creatorRejections,
+        // Times a milestone had to be released by someone else because this
+        // creator went silent on delivered work. Low is good; zero is normal.
+        autoReleases: creatorAutoReleases,
+        paidOnDelivery: ratio(creatorAutoReleases === 0 ? deliveriesResolved : deliveriesResolved - creatorAutoReleases, deliveriesResolved),
+        openCommissions: asCreator.filter(c => ['funding', 'funded', 'building'].includes(c.status)).length,
+      },
+      agent: {
+        contracts: asAgent.length,
+        completed: asAgent.filter(c => c.status === 'shipped').length,
+        abandoned: asAgent.filter(c => c.status === 'refunded' && releasedMilestones(c) === 0).length,
+        active: asAgent.filter(c => c.status === 'building').length,
+        distinctCreators: agentCounterparties.size,
+        solEarned: sum(asAgent, c => c.released) / escrow.LAMPORTS_PER_SOL * 0.99,
+        submissions: sum(asAgent, c => c.submissions),
+        rejectionsReceived: sum(asAgent, c => c.rejections),
+        overdue: asAgent.filter(c => c.status === 'building' && now >= c.deliveryDeadline).length,
+      },
+      caveats: [
+        'Derived from on-chain state only; recompute it yourself from /api/v1/commissions.',
+        'A wallet with few distinct counterparties can manufacture its own record cheaply.',
+        'Absent history is not a negative signal. A new address has no record, not a bad one.',
+      ],
+    });
+  } catch (error) { next(error); }
+});
 
 app.post('/api/v1/tx/:action', async (req, res, next) => {
   try {

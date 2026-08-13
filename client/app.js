@@ -140,7 +140,7 @@ async function send(transaction){
 }
 async function refresh(){
   state.metadata=await api('/api/commissions'); const meta=new Map(state.metadata.map(m=>[m.address,m]));
-  const accounts=await state.connection.getProgramAccounts(new PublicKey(state.config.programId),{commitment:'confirmed',filters:[{dataSize:240},{memcmp:{offset:0,bytes:'3'}}]});
+  const accounts=await state.connection.getProgramAccounts(new PublicKey(state.config.programId),{commitment:'confirmed',filters:[{dataSize:escrow.COMMISSION_ACCOUNT_BYTES},{memcmp:{offset:0,bytes:'3'}}]});
   state.projects=accounts.map(({pubkey,account})=>({address:pubkey.toBase58(),...escrow.decodeCommission(account.data),meta:meta.get(pubkey.toBase58())})).filter(project=>project.meta).sort((a,b)=>b.meta.createdAt-a.meta.createdAt); render();
 }
 function currentWallet(){return state.wallet?.toBase58();}
@@ -173,8 +173,24 @@ function openProject(address){
   if(p.status==='funded'&&wallet===p.creator&&!p.pendingAgent)actions=`<div class="field"><label for="agentWallet">Agent wallet address</label><input id="agentWallet" type="text" placeholder="Solana address"><div class="hint">The nominated wallet must separately accept the contract.</div></div><div class="action-row"><button class="btn primary" data-action="nominate" data-id="${p.address}">Nominate agent</button></div>`;
   if(p.status==='funded'&&p.pendingAgent&&wallet===p.pendingAgent)actions=`<div class="action-row"><button class="btn primary lg" data-action="accept" data-id="${p.address}">Accept contract</button></div>`;
   if(p.status==='funded'&&p.pendingAgent&&wallet!==p.pendingAgent)actions=`<p class="hint">Waiting for <span class="mono">${esc(p.pendingAgent)}</span> to accept.</p>${wallet===p.creator?`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="revoke" data-id="${p.address}">Withdraw nomination</button></div><p class="hint" style="margin-top:8px">Frees the commission so you can nominate someone else. Only possible while the nomination is unaccepted.</p>`:''}`;
-  if(p.status==='building'&&wallet===p.creator)actions=`<div class="action-row">${p.milestoneBps.map((bps,i)=>`<button class="btn" data-action="release" data-index="${i}" data-id="${p.address}" ${p.milestonesDone&(1<<i)?'disabled':''}>${p.milestonesDone&(1<<i)?'Released':'Release'} milestone ${i+1} · ${bps/100}%</button>`).join('')}</div><p class="hint" style="margin-top:12px">Releasing pays the agent immediately and cannot be undone. Unreleased funds return to backers after the deadline.</p>`;
-  if(p.status==='building'&&wallet===p.agent)actions=`<p class="hint">You hold this contract. Releases are made by the creator as milestones are accepted.</p><div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Return remaining funds and end contract</button></div><p class="hint" style="margin-top:8px">Ends your claim on the ${fmtBase(p.pledged-p.released)} SOL still in escrow and reopens it for refund immediately. Milestones already released are yours to keep.</p>`;
+  if(p.status==='building'&&wallet===p.creator){
+    const sub=p.submission, matured=escrow.reviewExpired(p);
+    actions=(sub?`<div class="flash-inline" style="margin-bottom:12px"><b>Delivery submitted</b> for milestone ${sub.milestoneIndex+1} on ${new Date(sub.submittedAt*1000).toLocaleString()}.<br><span class="mono" style="font-size:12px">${esc(sub.evidenceHash.slice(0,16))}…</span><br>${matured?'The review window has passed, so this milestone can now be released by anyone.':`Review ends ${new Date(sub.reviewEndsAt*1000).toLocaleString()} — if you do nothing, it releases automatically.`}</div>`:'')
+      +`<div class="action-row">${p.milestoneBps.map((bps,i)=>`<button class="btn ${sub&&sub.milestoneIndex===i?'primary':''}" data-action="release" data-index="${i}" data-id="${p.address}" ${p.milestonesDone&(1<<i)?'disabled':''}>${p.milestonesDone&(1<<i)?'Released':'Release'} milestone ${i+1} · ${bps/100}%</button>`).join('')}</div>`
+      +(sub&&!matured?`<div class="action-row" style="margin-top:8px"><button class="btn danger" data-action="reject" data-id="${p.address}">Reject this delivery</button></div><p class="hint" style="margin-top:8px">Rejecting is recorded on chain against your address and stops the automatic release. The agent can revise and resubmit.</p>`:'')
+      +`<p class="hint" style="margin-top:12px">Releasing pays the agent immediately and cannot be undone.</p>`;
+  }
+  if(p.status==='building'&&wallet===p.agent){
+    const sub=p.submission, matured=escrow.reviewExpired(p), overdue=Math.floor(Date.now()/1000)>=p.deliveryDeadline;
+    const unreleased=p.milestoneBps.map((_,i)=>i).filter(i=>!(p.milestonesDone&(1<<i)));
+    actions=sub
+      ? `<div class="flash-inline"><b>Delivery submitted</b> for milestone ${sub.milestoneIndex+1}.<br>${matured?'The review window has passed — this milestone can now be released by anyone, including you.':`Awaiting review until ${new Date(sub.reviewEndsAt*1000).toLocaleString()}. If the creator says nothing, it pays out automatically.`}</div>`
+        +(matured?`<div class="action-row" style="margin-top:12px"><button class="btn primary lg" data-action="release" data-index="${sub.milestoneIndex}" data-id="${p.address}">Claim milestone ${sub.milestoneIndex+1}</button></div>`:'')
+      : overdue
+        ? `<p class="hint">Your delivery window closed on ${new Date(p.deliveryDeadline*1000).toLocaleString()}. The escrow is now refundable to backers.</p>`
+        : `<div class="field"><label for="deliveryEvidence">Delivery evidence</label><input id="deliveryEvidence" type="text" placeholder="Commit URL, PR link, or artifact hash"><div class="hint">Only a hash of this is stored on chain, never the text.</div></div><div class="action-row">${unreleased.map(i=>`<button class="btn primary" data-action="submit" data-index="${i}" data-id="${p.address}">Submit milestone ${i+1}</button>`).join('')}</div><p class="hint" style="margin-top:8px">Submitting starts a ${Math.round(p.reviewWindow/3600)}-hour review clock. If the creator neither releases nor rejects before it ends, anyone can release your payment.</p>`;
+    actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Return remaining funds and end contract</button></div><p class="hint" style="margin-top:8px">Ends your claim on the ${fmtBase(p.pledged-p.released)} SOL still in escrow. Milestones already released are yours to keep.</p>`;
+  }
   if((p.status==='funding'||p.status==='funded')&&wallet===p.creator)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Cancel commission</button></div>`;
   if(p.status==='refunded'&&wallet)actions=`<div class="action-row"><button class="btn primary" data-action="refund" data-id="${p.address}">Claim available refund</button></div>`;
   if(!wallet)actions='<p class="hint">Connect a wallet to pledge or manage this commission.</p>';
@@ -190,8 +206,10 @@ async function openCreate(){
   $('overlay').classList.add('on');
 }
 async function createCommission(){
-  const title=$('nTitle').value.trim(),description=$('nDescription').value.trim(),goal=Math.round(Number($('nGoal').value)*LAMPORTS_PER_SOL),deadline=Math.floor(new Date($('nDeadline').value).getTime()/1000),percentages=$('nMilestones').value.split(',').map(Number);if(!title||!description||!goal||!deadline||percentages.some(x=>!x)||percentages.reduce((a,b)=>a+b,0)!==100)throw new Error('Complete all fields; milestones must sum to 100');
-  const seed=Date.now();const {commission,instruction}=escrow.build.createCommission(ESCROW_CTX,{creator:state.wallet,seed,goalLamports:goal,milestoneBasisPoints:percentages.map(x=>x*100),deadlineUnix:deadline});const signature=await send(new Transaction().add(instruction));await api('/api/commissions',{method:'POST',body:JSON.stringify({address:commission.toBase58(),txSignature:signature,title,description,repositoryUrl:$('nRepo').value.trim()||null,license:$('nLicense').value.trim()||'MIT',labels:$('nLabels').value.split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).slice(0,8)})});closeDialog();await refresh();}
+  const title=$('nTitle').value.trim(),description=$('nDescription').value.trim(),goal=Math.round(Number($('nGoal').value)*LAMPORTS_PER_SOL),deadline=Math.floor(new Date($('nDeadline').value).getTime()/1000),percentages=$('nMilestones').value.split(',').map(Number),deliveryDays=Number($('nDelivery').value||3),reviewHours=Number($('nReview').value||48);if(!title||!description||!goal||!deadline||percentages.some(x=>!x)||percentages.reduce((a,b)=>a+b,0)!==100)throw new Error('Complete all fields; milestones must sum to 100');
+  const seed=Date.now();if(!(deliveryDays>=1&&deliveryDays<=30))throw new Error('Delivery window must be between 1 and 30 days');
+  if(!(reviewHours>=1&&reviewHours<=336))throw new Error('Review window must be between 1 and 336 hours');
+  const {commission,instruction}=escrow.build.createCommission(ESCROW_CTX,{creator:state.wallet,seed,goalLamports:goal,milestoneBasisPoints:percentages.map(x=>x*100),deadlineUnix:deadline,deliveryWindowSeconds:Math.round(deliveryDays*86400),reviewWindowSeconds:Math.round(reviewHours*3600)});const signature=await send(new Transaction().add(instruction));await api('/api/commissions',{method:'POST',body:JSON.stringify({address:commission.toBase58(),txSignature:signature,title,description,repositoryUrl:$('nRepo').value.trim()||null,license:$('nLicense').value.trim()||'MIT',labels:$('nLabels').value.split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).slice(0,8)})});closeDialog();await refresh();}
 async function pledge(address){const amountLamports=Math.round(Number($('pledgeAmount').value)*LAMPORTS_PER_SOL);if(!amountLamports)throw new Error('Enter a pledge amount');const {instruction}=escrow.build.pledge(ESCROW_CTX,{backer:state.wallet,commission:address,amountLamports});await send(new Transaction().add(instruction));closeDialog();await refresh();}
 async function simpleAction(action,address,index){
   const p=state.projects.find(x=>x.address===address);let built;
@@ -201,6 +219,14 @@ async function simpleAction(action,address,index){
   else if(action==='cancel')built=escrow.build.cancel(ESCROW_CTX,{signer:state.wallet,commission:address});
   else if(action==='release')built=escrow.build.releaseMilestone(ESCROW_CTX,{creator:state.wallet,commission:address,agent:p.agent,milestoneIndex:Number(index)});
   else if(action==='refund')built=escrow.build.refund(ESCROW_CTX,{backer:state.wallet,commission:address});
+  else if(action==='submit'){
+    const evidence=($('deliveryEvidence')?.value||'').trim();
+    if(!evidence)throw new Error('Describe what you delivered: a commit URL, a PR link, or an artifact hash.');
+    // The chain stores a commitment, never the text itself.
+    const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(evidence));
+    built=escrow.build.submitDelivery(ESCROW_CTX,{agent:state.wallet,commission:address,milestoneIndex:Number(index)||0,evidenceHash:Buffer.from(new Uint8Array(digest))});
+  }
+  else if(action==='reject')built=escrow.build.rejectDelivery(ESCROW_CTX,{creator:state.wallet,commission:address});
   else throw new Error(`Unknown action: ${action}`);
   await send(new Transaction().add(built.instruction));closeDialog();await refresh();}
 // Maps EscrowError discriminants to language a user can act on. Anchoring these
