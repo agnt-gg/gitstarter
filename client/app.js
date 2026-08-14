@@ -67,10 +67,24 @@ function installedProvider(wallet){
 }
 function walletProvider(){return state.provider;}
 function closeIcon(){return '<button class="closeX" id="bX" type="button" aria-label="Close dialog">×</button>';}
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function connectMetaMask(silent=false){
   const client=await createSolanaClient({dapp:{name:'GitStarter',url:window.location.origin},api:{supportedNetworks:{devnet:state.config.rpcUrl}},analytics:{enabled:false}});
   const wallet=client.getWallet();
-  const accounts=silent?wallet.accounts:(await wallet.features['standard:connect'].connect()).accounts;
+  let accounts;
+  if(silent){
+    // The client was constructed milliseconds ago and rehydrates its session
+    // over a relay, so `accounts` is usually still empty on the first read.
+    // Reading it immediately is why a returning mobile user looked signed in
+    // but had no wallet attached. Give the SDK a moment to catch up.
+    for(let attempt=0;attempt<12;attempt++){
+      accounts=wallet.accounts;
+      if(accounts?.length)break;
+      await sleep(250);
+    }
+  }else{
+    accounts=(await wallet.features['standard:connect'].connect()).accounts;
+  }
   const account=accounts?.[0];
   if(!account){if(silent)return null;throw new Error('MetaMask did not return a Solana account');}
   const chain=state.config?.cluster==='mainnet-beta'?'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp':'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1';
@@ -108,7 +122,11 @@ async function connectWallet(walletId){
     state.provider=provider;state.wallet=publicKey;state.walletName=wallet.name;state.authStatus=state.session?'authenticated':'connected';localStorage.setItem('gitstarter.wallet',wallet.id);
     closeDialog();render();
     if(state.session){await refresh();return;}
-    if(wallet.id==='metamask'){showNotice('MetaMask connected. Sign one message to finish your GitStarter account.');return;}
+    // Connecting a wallet and signing in are one intention, so they are one tap.
+    // MetaMask used to be sent down a manual second step because a signature
+    // requested immediately after connecting can collide with its own pending
+    // request queue; `authenticate` now retries that specific case instead,
+    // which fixes the race rather than making every user pay for it.
     try{await authenticate();}catch(error){state.authStatus='connected';render();showError(new Error(`Wallet connected. Finish sign-in to create commissions. ${friendlyWalletError(error)}`));return;}
     await refresh();
   }finally{state.connecting=false;}
@@ -120,17 +138,68 @@ async function authenticate(){
   try{
     const wallet=state.wallet.toBase58();const challenge=await api('/api/auth/challenge',{method:'POST',body:JSON.stringify({wallet})});
     if(typeof state.provider.signMessage!=='function')throw new Error('This wallet does not support secure message sign-in');
-    const bytes=new TextEncoder().encode(challenge.message);const signed=await state.provider.signMessage(bytes,'utf8');
+    const bytes=new TextEncoder().encode(challenge.message);
+    // A wallet that is still settling the connection it just approved rejects a
+    // signature request as "already pending". That is a timing artefact, not a
+    // refusal, so retry briefly before surfacing it. A genuine user rejection
+    // carries a different code and is rethrown immediately.
+    let signed;
+    for(let attempt=0;;attempt++){
+      try{signed=await state.provider.signMessage(bytes,'utf8');break;}
+      catch(error){
+        const pending=/already pending|wallet_requestPermissions|request of type/i.test(error?.message||'');
+        if(!pending||attempt>=4)throw error;
+        await sleep(400);
+      }
+    }
     const signature=bs58Encode(signed.signature||signed);const result=await api('/api/auth/verify',{method:'POST',body:JSON.stringify({wallet,message:challenge.message,signature})});
     state.session=true;state.sessionWallet=wallet;state.authStatus='authenticated';render();
   }catch(error){state.authStatus='connected';render();throw error;}
 }
-async function requireSession(){if(!state.wallet){openWalletModal();return false;}if(!state.session)await authenticate();if(!state.provider){openWalletModal();showError(new Error('Your GitStarter session is active. Reattach your wallet to sign transactions.'));return false;}return true;}
+/// Reattaches the live wallet object to an existing session without asking the
+/// user for anything. The session lives in an HttpOnly cookie and survives for
+/// 30 days; the provider is a JavaScript object that dies on every page load.
+/// Mobile reloads constantly — every hop out to the wallet app risks the tab
+/// being evicted — so a signed-in user arriving with no provider is the normal
+/// case, not an error, and must never be met with a modal.
+async function reattachProvider(){
+  if(state.provider)return true;
+  const walletId=localStorage.getItem('gitstarter.wallet');
+  const wallet=WALLETS.find(item=>item.id===walletId);
+  if(!wallet||!state.sessionWallet)return false;
+  try{
+    let provider;
+    if(wallet.connect)provider=await wallet.connect();
+    else{
+      provider=installedProvider(wallet);
+      if(provider)await provider.connect();
+    }
+    const key=provider?.publicKey;
+    // Refuse a provider for a different account than the session was issued to,
+    // rather than silently signing as somebody else.
+    if(!key||key.toBase58()!==state.sessionWallet)return false;
+    state.provider=provider;state.walletName=wallet.name;render();
+    return true;
+  }catch{return false;}
+}
+async function requireSession(){
+  if(!state.wallet){openWalletModal();return false;}
+  if(!state.session)await authenticate();
+  if(!state.provider&&!await reattachProvider()){
+    openWalletModal();
+    showError(new Error('Reconnect your wallet to sign this transaction. Your GitStarter session is still active.'));
+    return false;
+  }
+  return true;
+}
 async function restoreSession(){
   let session;try{session=await api('/api/auth/session');}catch{return;}
   state.session=true;state.sessionWallet=session.wallet;state.authStatus='authenticated';state.wallet=new PublicKey(session.wallet);
   const walletId=localStorage.getItem('gitstarter.wallet'),wallet=WALLETS.find(item=>item.id===walletId);
   if(wallet){state.walletName=wallet.name;try{let provider;if(wallet.id==='metamask')provider=await connectMetaMask(true);else{provider=installedProvider(wallet);if(provider){const result=await provider.connect({onlyIfTrusted:true});const key=result?.publicKey||provider.publicKey;if(!key||key.toBase58()!==session.wallet)provider=null;}}if(provider)state.provider=provider;}catch{state.provider=null;}}
+  // A silent reattach can legitimately fail on mobile. That is not an error
+  // worth showing: the session is intact, and requireSession reattaches on
+  // demand the moment the user actually needs to sign something.
   render();
 }
 function bs58Encode(bytes){const alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';let digits=[0];for(const byte of bytes){let carry=byte;for(let j=0;j<digits.length;j++){carry+=digits[j]<<8;digits[j]=carry%58;carry=(carry/58)|0;}while(carry){digits.push(carry%58);carry=(carry/58)|0;}}let out='';for(let k=0;k<bytes.length&&bytes[k]===0;k++)out+='1';for(let q=digits.length-1;q>=0;q--)out+=alphabet[digits[q]];return out;}
@@ -148,7 +217,7 @@ function render(){
   document.documentElement.dataset.theme=state.theme; $('themeLabel').textContent=state.theme==='light'?'Dark':'Light';
   const wallet=currentWallet();$('bWallet').textContent=wallet?`${state.walletName||'Wallet'} · ${wallet.slice(0,4)}…${wallet.slice(-4)}`:'Connect wallet';
   $('accountEmpty').style.display=wallet?'none':'block';$('accountCard').classList.toggle('on',!!wallet);
-  if(wallet){$('wAlias').textContent=walletAlias(wallet);$('wAddress').textContent=wallet;const auth=$('wAuth');if(state.authStatus==='authenticated'){auth.className='account-state signed';auth.innerHTML='<span>✓ Signed in to GitStarter</span>';}else if(state.authStatus==='signing'){auth.className='account-state';auth.innerHTML='<span>Waiting for signature…</span>';}else{auth.className='account-state';auth.innerHTML='<span>Wallet connected</span><button class="btn" id="bFinishAuth" type="button">Finish sign-in</button>';}}
+  if(wallet){$('wAlias').textContent=walletAlias(wallet);$('wAddress').textContent=wallet;const auth=$('wAuth');if(state.authStatus==='authenticated'){auth.className='account-state signed';auth.innerHTML='<span>✓ Signed in to GitStarter</span>';}else if(state.authStatus==='signing'){auth.className='account-state';auth.innerHTML='<span>Waiting for signature…</span>';}else{auth.className='account-state';auth.innerHTML='<span>Wallet connected</span><button class="btn primary" id="bFinishAuth" type="button">Finish sign-in</button>';}}
   const labels=[...new Set(state.projects.flatMap(p=>Array.isArray(p.meta?.labels)?p.meta.labels:[]))].sort();
   let visible=state.projects.filter(p=>(state.filter==='all'||p.status===state.filter)&&(state.label==='all'||p.meta?.labels?.includes(state.label))&&(!($('q').value)||JSON.stringify(p.meta||{}).toLowerCase().includes($('q').value.toLowerCase())));
   visible=[...visible].sort((a,b)=>state.sort==='funding'?b.pledged-a.pledged:state.sort==='deadline'?a.deadline-b.deadline:(b.meta?.createdAt||0)-(a.meta?.createdAt||0));
@@ -202,7 +271,7 @@ function openProject(address){
 async function openCreate(){
   if(!await requireSession())return;
   $('dlg').className='dlg dlg-create';
-  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>Create a commission</h1><div class="sub">Define the work, funding target, and release schedule on Solana ${esc(state.config.cluster)}.</div></div>${closeIcon()}</div></div><div class="form-section"><h2>Commission details</h2><p>Give backers a precise description of what will be delivered.</p><div class="field"><label for="nTitle">Title</label><input id="nTitle" type="text" maxlength="120" placeholder="A concise outcome"></div><div class="field"><label for="nDescription">Description</label><textarea id="nDescription" placeholder="Scope, acceptance criteria, and expected deliverables"></textarea></div><div class="grid2"><div class="field"><label for="nRepo">Repository URL <span class="hint">optional</span></label><input id="nRepo" type="text" placeholder="https://github.com/owner/repo"></div><div class="field"><label for="nLicense">License</label><input id="nLicense" type="text" value="MIT"></div></div><div class="field"><label for="nLabels">Labels <span class="hint">optional</span></label><input id="nLabels" type="text" placeholder="cli, media, typescript"><div class="hint">Comma-separated. Labels become live filters on the commission list.</div></div></div><div class="form-section"><h2>Funding and delivery</h2><p>Funds remain in program-controlled escrow until milestones are released or refunded.</p><div class="grid2"><div class="field"><label for="nGoal">Funding goal (SOL)</label><input id="nGoal" type="number" min="0.000001" step="0.000001" placeholder="1000"></div><div class="field"><label for="nDeadline">Funding deadline</label><input id="nDeadline" type="datetime-local"></div></div><div class="field"><label for="nMilestones">Milestone percentages</label><input id="nMilestones" type="text" value="25,40,20,15"><div class="hint">Comma-separated percentages. They must total 100.</div></div></div><div class="dlg-footer"><span class="hint">Your wallet will confirm the on-chain creation transaction.</span><button class="btn" type="button" id="bX">Cancel</button><button class="btn primary lg" id="doCreate">Create and sign</button></div>`;
+  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>Create a commission</h1><div class="sub">Define the work, funding target, and release schedule on Solana ${esc(state.config.cluster)}.</div></div>${closeIcon()}</div></div><div class="form-section"><h2>Commission details</h2><p>Give backers a precise description of what will be delivered.</p><div class="field"><label for="nTitle">Title</label><input id="nTitle" type="text" maxlength="120" placeholder="A concise outcome"></div><div class="field"><label for="nDescription">Description</label><textarea id="nDescription" placeholder="Scope, acceptance criteria, and expected deliverables"></textarea></div><div class="grid2"><div class="field"><label for="nRepo">Repository URL <span class="hint">optional</span></label><input id="nRepo" type="text" placeholder="https://github.com/owner/repo"></div><div class="field"><label for="nLicense">License</label><input id="nLicense" type="text" value="MIT"></div></div><div class="field"><label for="nLabels">Labels <span class="hint">optional</span></label><input id="nLabels" type="text" placeholder="cli, media, typescript"><div class="hint">Comma-separated. Labels become live filters on the commission list.</div></div></div><div class="form-section"><h2>Funding and delivery</h2><p>Funds remain in program-controlled escrow until milestones are released or refunded.</p><div class="grid2"><div class="field"><label for="nGoal">Funding goal (SOL)</label><input id="nGoal" type="number" min="0.000001" step="0.000001" placeholder="1000"></div><div class="field"><label for="nDeadline">Funding deadline</label><input id="nDeadline" type="datetime-local"></div></div><div class="grid2"><div class="field"><label for="nDelivery">Delivery window (days)</label><input id="nDelivery" type="number" min="1" max="30" step="1" value="3"><div class="hint">How long the agent has once they accept. The clock starts at acceptance, not now.</div></div><div class="field"><label for="nReview">Review window (hours)</label><input id="nReview" type="number" min="1" max="336" step="1" value="48"><div class="hint">After a delivery is submitted you have this long to release or reject it. Say nothing and it pays out automatically.</div></div></div><div class="field"><label for="nMilestones">Milestone percentages</label><input id="nMilestones" type="text" value="25,40,20,15"><div class="hint">Comma-separated percentages. They must total 100.</div></div></div><div class="dlg-footer"><span class="hint">Your wallet will confirm the on-chain creation transaction.</span><button class="btn" type="button" id="bX">Cancel</button><button class="btn primary lg" id="doCreate">Create and sign</button></div>`;
   $('overlay').classList.add('on');
 }
 async function createCommission(){
@@ -246,4 +315,13 @@ document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('overlay').classList.contains('on'))closeDialog();});
 $('q').addEventListener('input',render);
 document.addEventListener('change',event=>{if(event.target.id==='sortSelect'){state.sort=event.target.value;render();}});
-(async()=>{try{state.config=verifyConfig(await api('/api/config'));state.connection=new web3.Connection(state.config.rpcUrl,'confirmed');await refresh();await restoreSession();}catch(e){showError(e);}})();
+(async()=>{try{
+  state.config=verifyConfig(await api('/api/config'));
+  state.connection=new web3.Connection(state.config.rpcUrl,'confirmed');
+  // Restore the session BEFORE scanning the chain. The scan takes seconds on a
+  // phone, and running it first left a returning user looking anonymous for
+  // that whole window — long enough to tap New commission and be told to
+  // connect a wallet they were already signed in with.
+  await restoreSession();
+  await refresh();
+}catch(e){showError(e);}})();

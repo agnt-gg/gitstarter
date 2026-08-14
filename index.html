@@ -390,6 +390,10 @@ table.t td.n{text-align:right;font:500 13px var(--mono);font-variant-numeric:tab
 table.t tr:last-child td{border-bottom:0}
 
 /* toast */
+/* Anchored to the bottom on desktop, but the mobile breakpoint moves it to the
+   top: a form error fires while the on-screen keyboard is up, which covers the
+   bottom of the viewport entirely. A message rendered behind the keyboard is
+   indistinguishable from a button that silently does nothing. */
 .toast{
   position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(80px);
   background:var(--fg);color:var(--canvas);padding:10px 16px;border-radius:var(--radius);
@@ -397,6 +401,10 @@ table.t tr:last-child td{border-bottom:0}
   display:flex;align-items:center;gap:8px;
 }
 .toast.on{transform:translateX(-50%) translateY(0);opacity:1}
+@media(max-width:760px){
+  .toast{top:12px;bottom:auto;transform:translateX(-50%) translateY(-80px);max-width:calc(100vw - 24px)}
+  .toast.on{transform:translateX(-50%) translateY(0)}
+}
 .blank{padding:48px 16px;text-align:center;color:var(--fg-muted)}
 .blank h3{color:var(--fg);font-size:16px;margin:8px 0 4px}
 footer.ft{
@@ -437,8 +445,12 @@ footer.ft a{color:var(--accent-fg)}
 .account-name{display:flex;align-items:center;gap:8px;font-weight:600}
 .account-dot{width:8px;height:8px;border-radius:50%;background:var(--success-emph);box-shadow:0 0 0 3px var(--success-subtle)}
 .account-address{display:block;margin:6px 0 10px;color:var(--fg-muted);font:12px var(--mono);word-break:break-all}
-.account-state{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:var(--fg-muted)}
+.account-state{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--fg-muted)}
 .account-state.signed{color:var(--success-fg)}
+/* Signing in is the whole point of connecting, so on the rare occasion it has
+   to be offered as a separate step it gets a full-width primary button rather
+   than a 12px afterthought wedged beside muted text. */
+.account-state .btn{flex:1 1 100%;justify-content:center;margin-top:4px}
 .star-icon{color:#bf8700;fill:#f2cc60}
 .project-shell{display:grid;grid-template-columns:minmax(0,1fr) 280px}
 .project-main{padding:24px;border-right:1px solid var(--border-muted)}
@@ -543,7 +555,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
       <div id="accountCard" class="account-card">
         <div class="account-name"><span class="account-dot"></span><span id="wAlias">—</span></div>
         <span class="account-address" id="wAddress">—</span>
-        <div class="account-state" id="wAuth"><span>Wallet connected</span><button class="btn" id="bFinishAuth" type="button">Finish sign-in</button></div>
+        <div class="account-state" id="wAuth"><span>Wallet connected</span><button class="btn primary" id="bFinishAuth" type="button">Finish sign-in</button></div>
       </div>
       <div class="stat"><b id="wBal">—</b> SOL wallet balance</div>
       <div class="stat"><b id="wProj">—</b> commissions created</div>
