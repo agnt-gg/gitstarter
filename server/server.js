@@ -352,10 +352,30 @@ const rememberNotification = db.prepare(`
 /// unique index drops all but the first — which means this is correct across a
 /// restart, a crash mid-scan, or two servers scanning at once, none of which a
 /// remembered-previous-state diff would survive.
-function detectEvents(commissions, submissionsByCommission, nowUnix) {
+function detectEvents(commissions, submissionsByCommission, settled, nowUnix) {
   const events = [];
   const say = (wallet, kind, commission, milestoneIndex, body, dedupeKey) =>
     events.push({ wallet, kind, commission, milestoneIndex, body, dedupeKey });
+
+  // Outcomes come from the durable record, never from live accounts.
+  //
+  // Settling a commission judges a delivery and sweeps its account in the SAME
+  // transaction, so an account carrying state 'released' never exists for any
+  // scan to see. Reading these from the chain meant the two events that tell an
+  // agent what happened to their work could not fire at all — the same mistake
+  // that once erased an agent's reputation the moment they were paid.
+  for (const d of settled) {
+    const m = d.milestoneIndex + 1;
+    if (d.state === 'rejected') {
+      say(d.agent, 'delivery-rejected', d.commission, d.milestoneIndex,
+        `Your delivery for milestone ${m} was refused. You can contest it, which puts your objection on the creator's public record.`,
+        `rejected:${d.commission}:${d.milestoneIndex}:${d.agent}`);
+    } else if (d.state === 'released') {
+      say(d.agent, 'delivery-paid', d.commission, d.milestoneIndex,
+        `You were paid for milestone ${m}.`,
+        `paid:${d.commission}:${d.milestoneIndex}:${d.agent}`);
+    }
+  }
 
   for (const [address, c] of commissions) {
     const queue = submissionsByCommission.get(address) || [];
@@ -363,19 +383,6 @@ function detectEvents(commissions, submissionsByCommission, nowUnix) {
       const paid = (c.milestonesDone & (1 << s.milestoneIndex)) !== 0;
       const front = s.sequence === (c.milestoneRejected[s.milestoneIndex] ?? 0);
       const m = s.milestoneIndex + 1;
-
-      if (s.state === 'rejected') {
-        say(s.agent, 'delivery-rejected', address, s.milestoneIndex,
-          `Your delivery for milestone ${m} was refused. You can contest it, which puts your objection on the creator's public record.`,
-          `rejected:${address}:${s.milestoneIndex}:${s.agent}`);
-        continue;
-      }
-      if (s.state === 'released') {
-        say(s.agent, 'delivery-paid', address, s.milestoneIndex,
-          `You were paid for milestone ${m}.`,
-          `paid:${address}:${s.milestoneIndex}:${s.agent}`);
-        continue;
-      }
       if (s.state !== 'pending' || paid || !front) continue;
 
       // The case that actually costs money if nobody is looking: work has been
@@ -498,8 +505,23 @@ async function chainCommissions() {
       try { rememberChainState(submissions, intents); } catch { /* an index that fails must never fail a read */ }
       // Same rule: telling somebody what happened must never be the reason they
       // cannot read the board.
-      try { recordEvents(detectEvents(value, submissions, Math.floor(Date.now() / 1000))); }
-      catch (error) { console.error('notification scan failed', error); }
+      try {
+        // Reconciled the same way reputation is, so a swept delivery still has
+        // an outcome to report.
+        chainCache.submissions = submissions;
+        const settled = [];
+        for (const row of db.prepare('SELECT * FROM delivery_history').all()) {
+          const c = value.get(row.commission);
+          if (!c) continue;
+          const live = (submissions.get(row.commission) || [])
+            .find(s => s.agent === row.agent && s.milestoneIndex === row.milestone_index);
+          const state = live ? live.state : settledState(c, row.milestone_index, row.sequence, row.last_state);
+          if (state === 'released' || state === 'rejected') {
+            settled.push({ commission: row.commission, milestoneIndex: row.milestone_index, agent: row.agent, state });
+          }
+        }
+        recordEvents(detectEvents(value, submissions, settled, Math.floor(Date.now() / 1000)));
+      } catch (error) { console.error('notification scan failed', error); }
       chainCache = { at: Date.now(), value, submissions, intents, inflight: null };
       return value;
     } catch (error) {

@@ -39,6 +39,10 @@ function extract(source, name) {
 
 const detectEvents = new Function('escrow', `${extract(SERVER, 'detectEvents')} return detectEvents;`)(escrow);
 
+/// Most cases here are about pending work, which still comes from live
+/// accounts; those pass no settled outcomes at all.
+const withQueue = (commissions, queued, nowUnix) => detectEvents(commissions, queued, [], nowUnix);
+
 const CREATOR = 'Cre1111111111111111111111111111111111111111';
 const AGENT = 'Agn1111111111111111111111111111111111111111';
 const RIVAL = 'Riv1111111111111111111111111111111111111111';
@@ -59,7 +63,7 @@ const queue = (...list) => new Map([[ADDRESS, list]]);
 const kinds = events => events.map(e => `${e.kind}->${e.wallet.slice(0, 3)}`);
 
 test('the creator is told that work is waiting on them', () => {
-  const events = detectEvents(commission(), queue(delivery()), NOW);
+  const events = withQueue(commission(), queue(delivery()), NOW);
   assert.deepEqual(kinds(events), ['delivery-waiting->Cre']);
   assert.match(events[0].body, /pays out when the window closes/,
     'and told what silence costs, because silence is the expensive option');
@@ -68,7 +72,7 @@ test('the creator is told that work is waiting on them', () => {
 test('when the window lapses, both sides are told, and told different things', () => {
   // The creator has lost control of the outcome; the agent has money to take.
   // One event to both parties would necessarily be wrong for one of them.
-  const events = detectEvents(commission(), queue(delivery({ submittedAt: NOW - 7_200 })), NOW);
+  const events = withQueue(commission(), queue(delivery({ submittedAt: NOW - 7_200 })), NOW);
   assert.deepEqual(kinds(events).sort(), ['claimable->Agn', 'review-lapsed->Cre']);
   assert.match(events.find(e => e.wallet === AGENT).body, /yours to claim/);
 });
@@ -78,8 +82,8 @@ test('observing the same board again tells nobody twice', () => {
   // survives a restart, a crash mid-scan, and two servers scanning at once —
   // none of which a diff against remembered previous state would survive.
   const board = commission(), deliveries = queue(delivery());
-  const first = detectEvents(board, deliveries, NOW);
-  const later = detectEvents(board, deliveries, NOW + 900);
+  const first = withQueue(board, deliveries, NOW);
+  const later = withQueue(board, deliveries, NOW + 900);
   assert.deepEqual(
     first.map(e => e.dedupeKey), later.map(e => e.dedupeKey),
     'the same board state must produce identical keys however often it is scanned',
@@ -89,8 +93,8 @@ test('observing the same board again tells nobody twice', () => {
 test('a new delivery on the same milestone is a different event', () => {
   // Rejecting one and receiving another must not be silently deduped into the
   // first notification, or the creator is never told about the replacement.
-  const first = detectEvents(commission(), queue(delivery()), NOW);
-  const second = detectEvents(
+  const first = withQueue(commission(), queue(delivery()), NOW);
+  const second = withQueue(
     commission({ milestoneRejected: [1, 0] }),
     queue(delivery({ state: 'rejected' }), delivery({ agent: RIVAL, sequence: 1 })),
     NOW,
@@ -104,7 +108,7 @@ test('only the delivery at the front of the queue is anybody"s problem', () => {
   // Three agents delivered; two of them cannot be judged yet. Telling the
   // creator about all three would make the inbox describe work they cannot act
   // on, which is how an inbox becomes something people stop opening.
-  const events = detectEvents(commission(), queue(
+  const events = withQueue(commission(), queue(
     delivery({ sequence: 0 }),
     delivery({ agent: RIVAL, sequence: 1 }),
     delivery({ agent: 'Oth1111111111111111111111111111111111111111', sequence: 2 }),
@@ -113,17 +117,41 @@ test('only the delivery at the front of the queue is anybody"s problem', () => {
 });
 
 test('a judged delivery tells the agent what happened to it', () => {
-  const paid = detectEvents(commission({ milestonesDone: 0b1 }), queue(delivery({ state: 'released' })), NOW);
+  // Deliberately fed from the durable record with NO live account, because that
+  // is the only state that ever exists: settling a commission judges the
+  // delivery and sweeps its account in the same transaction, so an account
+  // carrying 'released' is never observable. Reading these from the chain
+  // shipped two events that could not fire.
+  const settled = state => [{ commission: ADDRESS, milestoneIndex: 0, agent: AGENT, state }];
+
+  const paid = detectEvents(commission({ milestonesDone: 0b1 }), new Map(), settled('released'), NOW);
   assert.deepEqual(kinds(paid), ['delivery-paid->Agn']);
 
-  const refused = detectEvents(commission({ milestoneRejected: [1, 0] }), queue(delivery({ state: 'rejected' })), NOW);
+  const refused = detectEvents(commission({ milestoneRejected: [1, 0] }), new Map(), settled('rejected'), NOW);
   assert.deepEqual(kinds(refused), ['delivery-rejected->Agn']);
   assert.match(refused[0].body, /contest it/,
     'a refusal must carry the one thing the agent can still do about it');
 });
 
-test('a milestone that already paid raises nothing further', () => {
+test('outcomes are never read from accounts that settlement deletes', () => {
+  // The regression itself, stated as a property: with the account gone and the
+  // durable record present, the agent must still be told.
   const events = detectEvents(
+    commission({ milestonesDone: 0b1 }),
+    new Map(),
+    [{ commission: ADDRESS, milestoneIndex: 0, agent: AGENT, state: 'released' }],
+    NOW,
+  );
+  assert.equal(events.length, 1, 'a swept delivery still has an outcome to report');
+
+  const scan = SERVER.slice(SERVER.indexOf('const settled = [];'), SERVER.indexOf('recordEvents(detectEvents'));
+  assert.match(scan, /FROM delivery_history/,
+    'the scan must reconcile outcomes from the record that outlives the accounts');
+  assert.match(scan, /settledState\(c, row\.milestone_index, row\.sequence, row\.last_state\)/);
+});
+
+test('a milestone that already paid raises nothing further', () => {
+  const events = withQueue(
     commission({ milestonesDone: 0b1 }),
     queue(delivery({ state: 'pending', submittedAt: NOW - 7_200 })),
     NOW,
