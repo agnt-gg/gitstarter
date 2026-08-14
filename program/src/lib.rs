@@ -617,14 +617,17 @@ pub enum Instruction {
     /// Accounts: [creator(s)] [commission(w)] [submission(w)]
     RejectDelivery,
 
-    /// 12. Backer reclaims the rent on a pledge account that can never be used
-    ///     again, on the path where refunds never happen.
+    /// 12. Returns a pledge account's rent once it can never be used again.
+    ///
+    /// Anyone may send this; the lamports always go to the backer recorded in
+    /// the account, so it can be bundled into whatever transaction settles the
+    /// commission rather than waiting for that backer to come back and ask.
     ///
     /// A refund already closes the pledge it settles. This covers the other
     /// ending: a commission that shipped, where every lamport was released to
     /// the agent and no backer will ever call Refund, so the account would
     /// otherwise sit on chain holding rent forever.
-    /// Accounts: [backer(s,w)] [commission(w)] [pledge(w)]
+    /// Accounts: [backer(w)] [commission(w)] [pledge(w)]
     ClosePledge,
 
     /// 13. Returns the vault's rent reserve to the creator once the escrow is
@@ -635,11 +638,12 @@ pub enum Instruction {
     /// Accounts: [signer(s)] [commission(w)] [vault(w)] [creator(w)]
     CloseVault,
 
-    /// 14. Agent reclaims the rent on a submission that has been settled.
+    /// 14. Returns a settled submission's rent to the agent who delivered it.
     ///
     /// Losing a race should not cost anything beyond the compute already spent,
-    /// so a rejected or superseded submission gives its rent straight back.
-    /// Accounts: [agent(s,w)] [commission(w)] [submission(w)]
+    /// so a rejected or superseded submission gives its deposit straight back.
+    /// Anyone may send this; it always pays the agent named on the submission.
+    /// Accounts: [agent(w)] [commission(w)] [submission(w)]
     CloseSubmission,
 
     /// 15. Agent reclaims the rent on an intent once the commission is settled.
@@ -1785,7 +1789,15 @@ fn close_pledge(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     let backer = next_account_info(ai)?;
     let commission_ai = next_account_info(ai)?;
     let pledge_ai = next_account_info(ai)?;
-    assert_signer(backer)?;
+    // Deliberately NOT signed by the backer.
+    //
+    // The rent can only ever be returned to the wallet recorded inside the
+    // pledge account, so there is nothing to gain by sending this for somebody
+    // else and nothing to steal by racing it. Requiring the backer's signature
+    // would mean their deposit stays locked until they personally come back and
+    // ask for it, which turns a refundable deposit into a chore. Anyone may
+    // crank it, which is what lets it ride along on a transaction that was
+    // being sent anyway.
 
     let mut c = load_commission(commission_ai, program_id)?;
     assert_pda(
@@ -1801,7 +1813,9 @@ fn close_pledge(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
         }
         Pledge::try_from_slice(&d).map_err(|_| ProgramError::InvalidAccountData)?
     };
-    // Only your own pledge, and only ever back to you.
+    // The destination must be the wallet this pledge actually belongs to. This
+    // is what makes an unsigned crank safe: the lamports have exactly one
+    // possible recipient, whoever sends the transaction.
     if p.backer != *backer.key || p.commission != *commission_ai.key {
         return Err(EscrowError::Unauthorized.into());
     }
@@ -1892,11 +1906,15 @@ fn close_submission(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRes
     let agent = next_account_info(ai)?;
     let commission_ai = next_account_info(ai)?;
     let submission_ai = next_account_info(ai)?;
-    assert_signer(agent)?;
+    // Deliberately NOT signed by the agent, for the same reason as ClosePledge:
+    // the deposit has exactly one possible destination, so an unsigned crank
+    // cannot misdirect it. An agent who competed and lost should get their money
+    // back because the commission settled, not because they remembered to come
+    // back and collect it.
 
     let mut c = load_commission(commission_ai, program_id)?;
     let submission = load_submission_for(&c, commission_ai, submission_ai, program_id)?;
-    // Only your own submission, and only ever back to you.
+    // The destination must be the agent recorded on the submission itself.
     if submission.agent != *agent.key {
         return Err(EscrowError::Unauthorized.into());
     }

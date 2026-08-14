@@ -583,16 +583,8 @@ function openProject(address){
   }
   if(p.status==='funding'&&wallet===p.creator)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Cancel commission</button></div><p class="hint" style="margin-top:8px">Only while it is still raising. Once funded, agents may already be working on it and the bounty stands.</p>`;
   if(p.status==='refunded'&&wallet)actions=`<div class="action-row"><button class="btn primary" data-action="refund" data-id="${p.address}">Claim available refund</button></div>`;
-  // Rent sitting in accounts that can never be used again is just locked SOL,
-  // so offer it back. This never touches escrow, which is why it is listed last
-  // and phrased as housekeeping rather than as part of the contract.
-  if(wallet){
-    const claims=escrow.reclaimableRent(p,wallet).claims;
-    const mine=claims.filter(claim=>claim.kind==='pledge');
-    const vault=claims.find(claim=>claim.kind==='vault');
-    if(mine.length)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="closePledge" data-id="${p.address}">Reclaim ${fmtBase(escrow.PLEDGE_RENT_LAMPORTS)} SOL pledge rent</button></div><p class="hint" style="margin-top:8px">This commission has paid out in full, so your pledge account is finished. Closing it returns the rent it was holding. Nothing else will close it for you, because no refund is coming.</p>`;
-    if(vault)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="closeVault" data-id="${p.address}">Return ${fmtBase(escrow.VAULT_RENT_LAMPORTS)} SOL vault rent to the creator</button></div><p class="hint" style="margin-top:8px">The escrow is empty and nobody can need this account again. Anyone can send this; the rent goes to ${esc(p.creator.slice(0,8))}\u2026 either way.</p>`;
-  }
+  // Nothing here about account deposits. They are returned automatically by the
+  // transaction that settles the commission — see `cleanupInstructions`.
   if(!wallet)actions='<p class="hint">Connect a wallet to pledge or manage this commission.</p>';
   else if(!actions)actions='<p class="hint">No action is available to this wallet at the current contract stage.</p>';
   $('dlg').className='dlg';
@@ -656,6 +648,55 @@ async function pledge(address){
     ?`Pledge confirmed \u2014 goal reached, ${fmtBase(after.pledged)} SOL in escrow.`
     :'Pledge confirmed.');
 }
+/// Instructions that return the deposits held by accounts this commission no
+/// longer needs.
+///
+/// Solana holds a refundable deposit on every account, so a finished commission
+/// leaves real money locked in a vault, a pledge record per backer, and a
+/// submission record per delivery. Returning it needs a transaction — but it
+/// does not need a NEW one, and it certainly does not need a person to notice.
+/// These ride along on the transaction that settles the commission, so the
+/// deposits come home as a side effect of finishing the job.
+///
+/// None of them can misdirect money: each pays only the wallet recorded inside
+/// the account being closed, which is why no additional signature is needed.
+async function cleanupInstructions(address,commission){
+  const program=new PublicKey(state.config.programId);
+  // Both records store their commission at offset 1, right after the tag byte.
+  const owned=(bytes,tag)=>state.connection.getProgramAccounts(program,{
+    commitment:'confirmed',
+    filters:[{dataSize:bytes},{memcmp:{offset:0,bytes:tag}},{memcmp:{offset:1,bytes:address}}],
+  });
+  let pledges=[],submissions=[];
+  try{
+    [pledges,submissions]=await Promise.all([
+      owned(escrow.PLEDGE_ACCOUNT_BYTES,'4'),
+      owned(escrow.SUBMISSION_ACCOUNT_BYTES,'5'),
+    ]);
+  }catch{return [];} // Housekeeping must never be the reason a payment fails.
+
+  const instructions=[escrow.build.closeVault(ESCROW_CTX,{
+    signer:state.wallet,commission:address,creator:commission.creator,
+  }).instruction];
+  for(const {account} of pledges){
+    try{
+      const {backer}=escrow.decodePledge(account.data);
+      instructions.push(escrow.build.closePledge(ESCROW_CTX,{backer,commission:address}).instruction);
+    }catch{/* not a record we understand; leave it alone */}
+  }
+  for(const {account} of submissions){
+    try{
+      const {agent,milestoneIndex}=escrow.decodeSubmission(account.data);
+      instructions.push(escrow.build.closeSubmission(ESCROW_CTX,{agent,commission:address,milestoneIndex}).instruction);
+    }catch{/* same */}
+  }
+  // A Solana transaction is size-limited, and every account it touches costs 32
+  // bytes of it. Cap the tail so a busy commission cannot make its own final
+  // payment too large to send; anything left over is closed by the next
+  // transaction that touches this commission, or by any passing cranker.
+  return instructions.slice(0,8);
+}
+
 async function simpleAction(action,address,index,agentArg){
   const p=state.projects.find(x=>x.address===address);let built,submitted=null;
   if(action==='invite')built=escrow.build.inviteAgent(ESCROW_CTX,{creator:state.wallet,commission:address,agent:$('agentWallet').value.trim()||state.wallet});
@@ -666,9 +707,6 @@ async function simpleAction(action,address,index,agentArg){
   // delivered and only the one at the front of the queue can be released.
   else if(action==='release')built=escrow.build.releaseMilestone(ESCROW_CTX,{signer:state.wallet,commission:address,agent:agentArg,milestoneIndex:Number(index)});
   else if(action==='refund')built=escrow.build.refund(ESCROW_CTX,{backer:state.wallet,commission:address});
-  else if(action==='closePledge')built=escrow.build.closePledge(ESCROW_CTX,{backer:state.wallet,commission:address});
-  else if(action==='closeSubmission')built=escrow.build.closeSubmission(ESCROW_CTX,{agent:state.wallet,commission:address,milestoneIndex:Number(index)});
-  else if(action==='closeVault')built=escrow.build.closeVault(ESCROW_CTX,{signer:state.wallet,commission:address,creator:p.creator});
   else if(action==='submit'){
     submitted=($('deliveryEvidence')?.value||'').trim();
     if(!submitted)throw new Error('Describe what you delivered: a commit URL, a PR link, or an artifact hash.');
@@ -678,7 +716,17 @@ async function simpleAction(action,address,index,agentArg){
   }
   else if(action==='reject')built=escrow.build.rejectDelivery(ESCROW_CTX,{creator:state.wallet,commission:address,agent:agentArg,milestoneIndex:Number(index)});
   else throw new Error(`Unknown action: ${action}`);
-  await send(new Transaction().add(built.instruction),showProgress);
+
+  // If this action ends the commission, sweep every finished account's deposit
+  // home in the same transaction. The user is signing once either way.
+  const transaction=new Transaction().add(built.instruction);
+  const allMilestones=(1<<p.milestoneCount)-1;
+  const settlesNow=
+    (action==='release'&&(p.milestonesDone|(1<<Number(index)))===allMilestones)
+    ||(action==='refund'&&p.refundedPledgerCount+1>=p.pledgerCount);
+  if(settlesNow)for(const instruction of await cleanupInstructions(address,p))transaction.add(instruction);
+
+  await send(transaction,showProgress);
   // Record what was delivered, now that the commitment it must match is on
   // chain. Without this the creator is asked to approve a payment against a
   // bare hash, which is not something a person can review.
@@ -708,10 +756,7 @@ async function simpleAction(action,address,index,agentArg){
     submit:'Delivered. It is judged in the order it arrived.',
     reject:'Delivery rejected. The next in the queue is now judgeable.',
     release:'Paid. That agent won the milestone.',
-    closeSubmission:'Submission closed. Its rent is back in your wallet.',
-    refund:'Refund complete \u2014 your escrow and your pledge rent are back.',
-    closePledge:'Pledge account closed. Its rent is back in your wallet.',
-    closeVault:'Vault closed. Its rent has gone back to the creator.',
+    refund:'Refund complete.',
     cancel:'Commission cancelled. Backers can withdraw.',
   }[action]||'Done.');
 }

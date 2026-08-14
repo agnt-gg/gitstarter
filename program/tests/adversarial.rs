@@ -1055,6 +1055,240 @@ async fn an_agent_cannot_restart_their_own_clock_to_stall_competitors() {
     assert_eq!(alice.sequence, 2, "a retry does not jump the queue");
 }
 
+/// Deposits come home without their owner doing anything.
+///
+/// Solana locks a refundable deposit in every account. Returning it needs a
+/// transaction, and the obvious design makes each party send their own — which
+/// quietly means an agent who competed and lost only gets their money back if
+/// they remember to come back and ask. Nobody does. So closing is unsigned: the
+/// lamports have exactly one possible destination, which makes it safe for a
+/// stranger to send, which in turn lets it ride along on the transaction that
+/// settles the commission.
+#[tokio::test]
+async fn a_deposit_comes_home_without_its_owner_asking() {
+    let mut w = world().await;
+    let (commission, vault) = board(&mut w, 30, 1_000_000, vec![10_000], 7_200, 3_600).await;
+
+    send(
+        &mut w.ctx,
+        &[submit_ix(w.alice.pubkey(), commission, 0, 1)],
+        &[&w.alice],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut w.ctx,
+        &[submit_ix(w.bob.pubkey(), commission, 0, 2)],
+        &[&w.bob],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut w.ctx,
+        &[release_ix(
+            w.creator.pubkey(),
+            commission,
+            vault,
+            w.alice.pubkey(),
+            w.treasury.pubkey(),
+            0,
+        )],
+        &[&w.creator],
+    )
+    .await
+    .unwrap();
+
+    // Bob lost. Carol — an unrelated wallet — returns his deposit for him, and it
+    // goes to Bob. Bob never signs anything and never has to know.
+    let unsigned_close = ix(
+        vec![
+            AccountMeta::new(w.bob.pubkey(), false),
+            AccountMeta::new(commission, false),
+            AccountMeta::new(submission_pda(commission, 0, w.bob.pubkey()), false),
+        ],
+        EscrowInstruction::CloseSubmission,
+    );
+    // No extra signers at all: the only signature on this transaction belongs to
+    // the fee payer, and it is not Bob's.
+    let bob_before = balance(&mut w.ctx, w.bob.pubkey()).await;
+    send(&mut w.ctx, &[unsigned_close], &[])
+        .await
+        .expect("a deposit must not be held hostage to its owner remembering to collect it");
+    assert_eq!(
+        balance(&mut w.ctx, w.bob.pubkey()).await - bob_before,
+        SUBMISSION_RENT,
+        "and every lamport of it reaches the agent who put it up"
+    );
+
+    // The same for a backer's pledge, and for the vault.
+    let backer_before = balance(&mut w.ctx, w.backer_a.pubkey()).await;
+    let creator_before = balance(&mut w.ctx, w.creator.pubkey()).await;
+    send(
+        &mut w.ctx,
+        &[
+            ix(
+                vec![
+                    AccountMeta::new(w.backer_a.pubkey(), false),
+                    AccountMeta::new(commission, false),
+                    AccountMeta::new(pledge_pda(commission, w.backer_a.pubkey()), false),
+                ],
+                EscrowInstruction::ClosePledge,
+            ),
+            ix(
+                vec![
+                    AccountMeta::new_readonly(w.carol.pubkey(), true),
+                    AccountMeta::new(commission, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new(w.creator.pubkey(), false),
+                ],
+                EscrowInstruction::CloseVault,
+            ),
+        ],
+        &[&w.carol],
+    )
+    .await
+    .expect("a stranger may sweep every finished account");
+    assert_eq!(
+        balance(&mut w.ctx, w.backer_a.pubkey()).await - backer_before,
+        PLEDGE_RENT
+    );
+    assert_eq!(
+        balance(&mut w.ctx, w.creator.pubkey()).await - creator_before,
+        VAULT_RENT
+    );
+    assert_eq!(
+        balance(&mut w.ctx, vault).await,
+        0,
+        "nothing is left locked"
+    );
+}
+
+/// Making the close unsigned means anyone can send it, so "has this actually
+/// settled?" is now the ONLY thing standing between a live commission and having
+/// its own bookkeeping deleted underneath it.
+#[tokio::test]
+async fn a_deposit_cannot_be_returned_while_the_commission_is_live() {
+    let mut w = world().await;
+    let (commission, vault) = board(&mut w, 32, 1_000_000, vec![10_000], 7_200, 3_600).await;
+
+    // A pledge record is what proves this backer is owed a refund. Closing it
+    // while the money is still in escrow would delete that proof and leave the
+    // lamports with no way home.
+    let close_pledge = ix(
+        vec![
+            AccountMeta::new(w.backer_a.pubkey(), false),
+            AccountMeta::new(commission, false),
+            AccountMeta::new(pledge_pda(commission, w.backer_a.pubkey()), false),
+        ],
+        EscrowInstruction::ClosePledge,
+    );
+    assert!(
+        send(&mut w.ctx, &[close_pledge.clone()], &[]).await.is_err(),
+        "a funded commission still owes this backer; their record must survive"
+    );
+
+    // Nor may the vault go while it is still holding escrow.
+    let close_vault = ix(
+        vec![
+            AccountMeta::new_readonly(w.carol.pubkey(), true),
+            AccountMeta::new(commission, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new(w.creator.pubkey(), false),
+        ],
+        EscrowInstruction::CloseVault,
+    );
+    assert!(
+        send(&mut w.ctx, &[close_vault], &[&w.carol]).await.is_err(),
+        "a vault holding escrow must never be closable, signed or not"
+    );
+
+    // Once it has genuinely settled, the same unsigned instruction works.
+    send(&mut w.ctx, &[submit_ix(w.alice.pubkey(), commission, 0, 1)], &[&w.alice])
+        .await
+        .unwrap();
+    send(
+        &mut w.ctx,
+        &[release_ix(
+            w.creator.pubkey(),
+            commission,
+            vault,
+            w.alice.pubkey(),
+            w.treasury.pubkey(),
+            0,
+        )],
+        &[&w.creator],
+    )
+    .await
+    .unwrap();
+    let before = balance(&mut w.ctx, w.backer_a.pubkey()).await;
+    send(&mut w.ctx, &[close_pledge], &[])
+        .await
+        .expect("a settled commission returns the deposit to anyone who asks on the backer's behalf");
+    assert_eq!(
+        balance(&mut w.ctx, w.backer_a.pubkey()).await - before,
+        PLEDGE_RENT
+    );
+}
+
+/// Unsigned does not mean unowned. The destination is read out of the account
+/// being closed, so there is no wallet a caller can substitute.
+#[tokio::test]
+async fn a_deposit_can_never_be_swept_into_the_wrong_wallet() {
+    let mut w = world().await;
+    let (commission, vault) = board(&mut w, 31, 1_000_000, vec![10_000], 7_200, 3_600).await;
+    send(
+        &mut w.ctx,
+        &[submit_ix(w.alice.pubkey(), commission, 0, 1)],
+        &[&w.alice],
+    )
+    .await
+    .unwrap();
+    send(
+        &mut w.ctx,
+        &[release_ix(
+            w.creator.pubkey(),
+            commission,
+            vault,
+            w.alice.pubkey(),
+            w.treasury.pubkey(),
+            0,
+        )],
+        &[&w.creator],
+    )
+    .await
+    .unwrap();
+
+    // Carol names herself as the recipient of Alice's submission deposit.
+    let theft = ix(
+        vec![
+            AccountMeta::new(w.carol.pubkey(), true),
+            AccountMeta::new(commission, false),
+            AccountMeta::new(submission_pda(commission, 0, w.alice.pubkey()), false),
+        ],
+        EscrowInstruction::CloseSubmission,
+    );
+    assert!(
+        send(&mut w.ctx, &[theft], &[&w.carol]).await.is_err(),
+        "the deposit must follow the account's own record, not the caller"
+    );
+
+    // And the same against a backer's pledge.
+    let pledge_theft = ix(
+        vec![
+            AccountMeta::new(w.carol.pubkey(), true),
+            AccountMeta::new(commission, false),
+            AccountMeta::new(pledge_pda(commission, w.backer_a.pubkey()), false),
+        ],
+        EscrowInstruction::ClosePledge,
+    );
+    assert!(
+        send(&mut w.ctx, &[pledge_theft], &[&w.carol])
+            .await
+            .is_err(),
+        "a pledge deposit belongs to the backer who put it up, whoever sends the crank"
+    );
+}
+
 /// Different milestones are independently winnable, so one agent losing a round
 /// does not lock them out of the rest of the job.
 #[tokio::test]

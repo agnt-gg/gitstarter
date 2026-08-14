@@ -134,11 +134,20 @@ test('it stays silent for people with nothing to do', () => {
   assert.equal(escrow.pendingAttention(contested_, STRANGER, { nowUnix: NOW, submissions }), null);
 });
 
-test('rent is offered as housekeeping, never as something urgent', () => {
+test('account deposits are never raised as something a person must do', () => {
+  // Solana holds a refundable deposit on every account, and it does have to come
+  // back. It used to come back by asking the user to press a button, which turned
+  // a bookkeeping detail into a chore on a screen that should only ever show
+  // obligations that involve real decisions. The deposits now ride home on the
+  // transaction that settles the commission, so there is nothing to say.
   const shipped = commission({ status: 'shipped', released: 10_000_000, milestonesDone: 0b1111 });
-  const attention = escrow.pendingAttention(shipped, CREATOR, { nowUnix: NOW });
-  assert.equal(attention.kind, 'rent');
-  assert.equal(attention.urgency, 'idle', 'reclaiming rent must never compete with a running clock');
+  for (const wallet of [CREATOR, ALICE, BOB, STRANGER]) {
+    const attention = escrow.pendingAttention(shipped, wallet, { nowUnix: NOW });
+    assert.equal(
+      attention, null,
+      `a settled commission must be silent, but it told ${wallet.slice(0, 5)} about ${attention?.kind}`,
+    );
+  }
 });
 
 test('an obligation with a clock outranks one without', () => {

@@ -60,6 +60,7 @@ const CLAIM_GRACE_WINDOW_SECONDS = 86_400;
 // ever disagree, every commission silently fails to decode.
 const COMMISSION_ACCOUNT_BYTES = 275;
 const SUBMISSION_ACCOUNT_BYTES = 109;
+const PLEDGE_ACCOUNT_BYTES = 83;
 const INTENT_ACCOUNT_BYTES = 75;
 // Rent-exemption minimums. Solana charges for 128 bytes of account overhead plus
 // the account's own data, at 6960 lamports per byte. These are locked up for as
@@ -302,6 +303,19 @@ function decodeSubmission(data) {
   return { commission, agent, milestoneIndex, sequence, submittedAt, evidenceHash, state };
 }
 
+/// Decodes a Pledge account — one backer's stake in one commission.
+function decodePledge(data) {
+  const b = Buffer.from(data);
+  if (b.length !== PLEDGE_ACCOUNT_BYTES) throw new Error('Not a pledge account');
+  let o = 1;
+  const pk = () => { const v = bs58.encode(b.subarray(o, o + 32)); o += 32; return v; };
+  const commission = pk(), backer = pk();
+  const amount = Number(b.readBigUInt64LE(o)); o += 8;
+  const refunded = Number(b.readBigUInt64LE(o)); o += 8;
+  const fullyRefunded = !!b[o++];
+  return { commission, backer, amount, refunded, fullyRefunded };
+}
+
 /// Decodes an Intent account — a non-binding "I am working on this".
 function decodeIntent(data) {
   const b = Buffer.from(data);
@@ -492,16 +506,13 @@ function pendingAttention(c, wallet, options = {}) {
     }
   }
 
-  // Housekeeping, offered but never urgent.
-  if (reclaimableRent(c, wallet, nowUnix).claims.length) {
-    return {
-      kind: 'rent',
-      urgency: 'idle',
-      label: 'Rent available to reclaim',
-      detail: 'These accounts are finished and their rent can come back.',
-      deadline: null,
-    };
-  }
+  // Deliberately nothing about account deposits here.
+  //
+  // Solana's rent is a refundable deposit on each account, and it does have to
+  // be returned — but that is plumbing, not an obligation, and surfacing it as
+  // something the user must notice and act on turned a bookkeeping detail into a
+  // chore. The deposits now ride home on the transaction that settles the
+  // commission, so there is nothing to tell anyone about.
   return null;
 }
 /// Whether a refund from this commission will be charged the connection fee.
@@ -611,14 +622,18 @@ const build = {
     };
   },
 
-  /// Returns a losing agent's submission rent once it can no longer be paid.
+  /// Returns a settled submission's deposit to the agent who delivered it.
+  ///
+  /// The agent does not sign: the lamports can only go to the wallet named on
+  /// the submission, so this rides along on whatever transaction settles the
+  /// commission instead of waiting for them to come back and collect.
   closeSubmission(ctx, { agent, commission, milestoneIndex }) {
     const submission = submissionPda(ctx.programId, commission, milestoneIndex, agent);
     return {
       commission: key(commission), submission,
       instruction: ix({
         programId: key(ctx.programId),
-        keys: [meta(agent, true, true), meta(commission, false, true), meta(submission, false, true)],
+        keys: [meta(agent, false, true), meta(commission, false, true), meta(submission, false, true)],
         data: Buffer.from([IX.closeSubmission]),
       }),
     };
@@ -725,8 +740,10 @@ const build = {
     };
   },
 
-  /// Returns an 83-byte pledge account's rent to its backer, on the shipped path
-  /// where no refund will ever close it.
+  /// Returns a pledge account's deposit to its backer, on the shipped path where
+  /// no refund will ever close it.
+  ///
+  /// The backer does not sign, for the same reason as closeSubmission.
   closePledge(ctx, { backer, commission }) {
     const pledge = pledgePda(ctx.programId, commission, backer);
     return {
@@ -734,7 +751,7 @@ const build = {
       instruction: ix({
         programId: key(ctx.programId),
         keys: [
-          meta(backer, true, true),
+          meta(backer, false, true),
           meta(commission, false, true),
           meta(pledge, false, true),
         ],
@@ -859,7 +876,7 @@ function explainError(error) {
 
 module.exports = {
   LAMPORTS_PER_SOL, BPS_DENOMINATOR, FEE_BASIS_POINTS, MAX_MILESTONES,
-  COMMISSION_ACCOUNT_BYTES, SUBMISSION_ACCOUNT_BYTES, INTENT_ACCOUNT_BYTES,
+  COMMISSION_ACCOUNT_BYTES, SUBMISSION_ACCOUNT_BYTES, INTENT_ACCOUNT_BYTES, PLEDGE_ACCOUNT_BYTES,
   VAULT_RENT_LAMPORTS, PLEDGE_RENT_LAMPORTS, COMMISSION_RENT_LAMPORTS,
   SUBMISSION_RENT_LAMPORTS, INTENT_RENT_LAMPORTS,
   MAX_FUNDING_DURATION_SECONDS,
@@ -870,6 +887,6 @@ module.exports = {
   frontOfQueue, queueFor, refundCarriesFee, reclaimableRent, pendingAttention,
   IX, STATUS, SUBMISSION_STATE, ERRORS, ERROR_HELP,
   commissionPda, vaultPda, pledgePda, submissionPda, intentPda,
-  decodeCommission, decodeSubmission, decodeIntent, escrowRemaining,
+  decodeCommission, decodeSubmission, decodeIntent, decodePledge, escrowRemaining,
   build, availableActions, explainError, canBuildTransactions,
 };
