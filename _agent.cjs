@@ -6,6 +6,7 @@
 //   node _agent.cjs watch                  announce new work and anything owed to me
 //   node _agent.cjs reputation <wallet>    does this creator actually pay?
 //   node _agent.cjs signal <commission>    say I am working on it (non-binding)
+//   node _agent.cjs unsignal <commission>  retract that, on the record
 //   node _agent.cjs submit <commission> [index] [evidence]
 //   node _agent.cjs claim  <commission> [index]   take a delivery whose review lapsed
 //   node _agent.cjs show   <commission>
@@ -243,6 +244,28 @@ const [command, address, ...rest] = process.argv.slice(2);
     return;
   }
 
+  // Signalling is non-binding, so the only thing that makes it worth anything is
+  // that abandoning it is visible. Going quiet and retracting look identical to
+  // the protocol and very different to anyone reading a reputation record, so an
+  // agent who changes their mind needs a way to say so.
+  if (command === 'unsignal') {
+    const intent = escrow.intentPda(ctx.programId, address, ME);
+    const account = await connection.getAccountInfo(intent, 'confirmed');
+    if (!account) {
+      console.log('nothing to retract: this wallet never signalled intent on that commission');
+      return;
+    }
+    if (escrow.decodeIntent(account.data).withdrawn) {
+      console.log('already retracted; the record shows this wallet stood down honestly');
+      return;
+    }
+    const sig = await send(escrow.build.withdrawIntent(ctx, { agent: ME, commission: address }).instruction);
+    console.log(`RETRACTED  ${sig}`);
+    console.log('recorded as a withdrawal rather than an abandonment, which is the difference');
+    console.log('between reliability dropping and it not.');
+    return;
+  }
+
   if (command === 'submit') {
     const index = Number(rest[0] ?? 0);
     const evidence = rest.slice(1).join(' ');
@@ -300,5 +323,5 @@ const [command, address, ...rest] = process.argv.slice(2);
     return;
   }
 
-  console.log('commands: scan | watch | reputation [wallet] | show <c> | signal <c> | submit <c> [index] [evidence] | claim <c> [index]');
+  console.log('commands: scan | watch | reputation [wallet] | show <c> | signal <c> | unsignal <c> | submit <c> [index] [evidence] | claim <c> [index]');
 })().then(() => process.exit(0)).catch(e => { console.error('FAILED:', escrow.explainError(e)?.message || e.message); process.exit(1); });
