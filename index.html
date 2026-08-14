@@ -81,7 +81,19 @@ svg{fill:currentColor;vertical-align:text-bottom;flex:none}
 .gh-head-in{max-width:1280px;margin:0 auto;padding:0 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .brand{display:flex;align-items:center;gap:10px;color:var(--header-fg);font-weight:600;font-size:15px}
 .brand:hover{text-decoration:none;color:var(--header-muted)}
-.search{
+/* Scoped to the header on purpose. This input is `type=text`, so the generic
+   `input[type=text]` rule further down the sheet is BOTH more specific (0,1,1
+   against 0,1,0) and later, and it silently won: the field took the form
+   colours, `background:var(--canvas)` and `color:var(--fg)`.
+
+   Unfocused that merely looked odd — a white box in a dark bar. On focus
+   `.search:focus` won back the transparent background but never set a colour,
+   so dark text landed on the dark header and the text disappeared as you typed.
+   Only in light mode, because in dark mode `--fg` is light and the wrong colour
+   happened to be readable.
+
+   The header bar is dark in both themes, so it keeps header colours in both. */
+.gh-head .search{
   flex:1;min-width:0;max-width:340px;background:transparent;border:1px solid #ffffff33;border-radius:var(--radius);
   color:var(--header-fg);padding:5px 12px;font:400 14px var(--sans);outline:none;
 }
@@ -92,12 +104,18 @@ svg{fill:currentColor;vertical-align:text-bottom;flex:none}
 @media(max-width:760px){
   .gh-head nav{display:none}
   #themeLabel{display:none}
-  .search{order:3;flex:1 1 100%;max-width:none;margin-top:4px}
+  .gh-head .search{order:3;flex:1 1 100%;max-width:none;margin-top:4px}
   .gh-head .sp{display:none}
   .repo-in,.layout,footer.ft{padding-left:16px;padding-right:16px}
 }
-.search::placeholder{color:var(--header-muted)}
-.search:focus{border-color:#ffffff80;background:#ffffff0d}
+.gh-head .search::placeholder{color:var(--header-muted)}
+/* Restates the colour so the focus ring can never again be the thing that makes
+   the text vanish, and rings in white rather than the form accent, which is
+   invisible against this bar. */
+.gh-head .search:focus{
+  color:var(--header-fg);border-color:#ffffff80;background:#ffffff0d;
+  box-shadow:0 0 0 3px #ffffff1f;
+}
 .gh-head .sp{flex:1}
 .gh-head nav{display:flex;gap:16px}
 .gh-head nav a{color:var(--header-fg);font-size:14px;font-weight:600;opacity:.85}
@@ -150,7 +168,20 @@ svg{fill:currentColor;vertical-align:text-bottom;flex:none}
 .btn-group .btn:not(:first-child){border-top-left-radius:0;border-bottom-left-radius:0}
 
 /* underline nav */
-.unav{display:flex;gap:8px;margin-top:16px;overflow-x:auto}
+/* Horizontal only. The tabs carry `margin-bottom:-1px` so the active underline
+   overlaps the header's bottom border, which leaves their border box exactly
+   1px taller than this flex container's content box — and because setting
+   `overflow-x` makes `overflow-y` compute from `visible` to `auto`, that 1px
+   was enough to raise a full vertical scrollbar.
+
+   The padding takes back that 1px so there is nothing to scroll to and nothing
+   for `overflow-y:hidden` to clip, and the negative margin keeps the bar in the
+   same place it was, so the underline still meets the border below it. */
+.unav{
+  display:flex;gap:8px;margin-top:16px;
+  overflow-x:auto;overflow-y:hidden;
+  padding-bottom:1px;margin-bottom:-1px;
+}
 .unav button{
   background:none;border:0;border-bottom:2px solid transparent;cursor:pointer;
   padding:8px 16px;margin-bottom:-1px;color:var(--fg);font:400 14px var(--sans);
