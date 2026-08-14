@@ -158,6 +158,10 @@ svg{fill:currentColor;vertical-align:text-bottom;flex:none}
 }
 .unav button:hover{background:var(--neutral-muted)}
 .unav button.on{font-weight:600;border-bottom-color:#fd8c73}
+/* Only rendered when the count is non-zero, so its presence is the signal. */
+.unav button.needs-you{margin-left:auto;color:var(--accent-fg);font-weight:600}
+.unav button.needs-you.urgent{color:var(--attention-fg)}
+.unav button.needs-you.urgent .counter{background:var(--attention-fg);color:var(--canvas)}
 html[data-theme="dark"] .unav button.on{border-bottom-color:#f78166}
 .status-glyph{width:16px;height:16px;display:inline-grid;place-items:center;flex:none;color:var(--fg-muted)}
 .status-glyph svg{width:16px;height:16px;display:block;fill:currentColor}
@@ -210,6 +214,18 @@ html[data-theme="dark"] .unav button.on{border-bottom-color:#f78166}
 .lbl.purple{background:var(--done-subtle);color:var(--done-fg);border-color:var(--done-muted)}
 .lbl.yellow{background:var(--attention-subtle);color:var(--attention-fg);border-color:var(--attention-muted)}
 .lbl.gray{background:var(--neutral-muted);color:var(--fg-muted);border-color:transparent}
+
+/* Something is waiting on the wallet that is looking at the page. This is the
+   only badge that describes an obligation rather than a state, so it is allowed
+   to be louder than the status pill beside it. */
+.lbl.attention{font-weight:600}
+.lbl.attention.act{background:var(--attention-subtle);color:var(--attention-fg);border-color:var(--attention-muted)}
+.lbl.attention.soon{background:var(--accent-subtle);color:var(--accent-fg);border-color:var(--accent-muted)}
+.lbl.attention.idle{background:var(--neutral-muted);color:var(--fg-muted);border-color:transparent;font-weight:500}
+@media(prefers-reduced-motion:no-preference){
+  .lbl.attention.act{animation:attention-in .4s ease-out}
+}
+@keyframes attention-in{from{transform:scale(.94);opacity:.4}to{transform:scale(1);opacity:1}}
 .row-meta{color:var(--fg-muted);font-size:12px;margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .row-meta .dot{opacity:.6}
 .row-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:none;width:190px}
@@ -582,7 +598,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 <div class="overlay" id="overlay"><div class="dlg" id="dlg"></div></div>
 <div class="toast" id="toast"></div>
 
-<script src="/app.js?v=20260814-rent-reclaim" defer></script>
+<script src="/app.js?v=20260814-delivery-alerts" defer></script>
 
 </body>
 </html>

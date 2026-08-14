@@ -285,6 +285,92 @@ function reclaimableRent(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
   return { claims, total: claims.reduce((sum, claim) => sum + claim.lamports, 0), nowUnix };
 }
 
+/// What this commission is waiting on `wallet` to do, if anything.
+///
+/// Everything the parties need is already on chain, but it was only visible to
+/// someone who happened to open the right dialog. A creator could be handed
+/// finished work and never find out. This turns that state into something a
+/// list can render and a notification can announce.
+///
+/// Returns null when nothing is owed, or `{ kind, urgency, label, detail,
+/// deadline }` where `urgency` is 'act' (money or a clock depends on it),
+/// 'soon' (a clock is running but not on this wallet), or 'idle' (housekeeping).
+function pendingAttention(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
+  if (!wallet) return null;
+  const isCreator = wallet === c.creator;
+  const isAgent = wallet === c.agent;
+  const matured = reviewExpired(c, nowUnix);
+
+  // The one that started this: work has been delivered and the creator has a
+  // clock running against them. Silence pays the agent, so not noticing is
+  // expensive, which makes this the most important thing the UI can say.
+  if (isCreator && c.submission && !matured) {
+    return {
+      kind: 'review',
+      urgency: 'act',
+      label: `Milestone ${c.submission.milestoneIndex + 1} delivered — awaiting your review`,
+      detail: 'Release it, reject it, or it pays out automatically.',
+      deadline: c.submission.reviewEndsAt,
+    };
+  }
+  // Matured: anyone can now complete the payment, so the agent should be told
+  // they can take it and the creator that they no longer control it.
+  if (c.submission && matured && (isCreator || isAgent)) {
+    return {
+      kind: 'claimable',
+      urgency: 'act',
+      label: isAgent
+        ? `Milestone ${c.submission.milestoneIndex + 1} is yours to claim`
+        : `Milestone ${c.submission.milestoneIndex + 1} review window has passed`,
+      detail: isAgent
+        ? 'The review window lapsed, so anyone can release this to you.'
+        : 'Anyone can now release this to the agent.',
+      deadline: c.submission.reviewEndsAt + CLAIM_GRACE_WINDOW_SECONDS,
+    };
+  }
+  // A contract offered to this wallet, which lapses if ignored.
+  if (wallet === c.pendingAgent && c.status === 'funded') {
+    return {
+      kind: 'accept',
+      urgency: 'act',
+      label: 'You have been offered this contract',
+      detail: 'Accept it to start work. The offer lapses if you do not.',
+      deadline: c.nominationLapsesAt,
+    };
+  }
+  // Funded and idle: the creator has money escrowed and nobody building.
+  if (isCreator && c.status === 'funded' && !c.agent && !c.pendingAgent) {
+    return {
+      kind: 'nominate',
+      urgency: 'soon',
+      label: 'Funded — waiting for you to nominate an agent',
+      detail: 'Nobody can start work until you choose someone.',
+      deadline: c.deliveryDeadline || c.deadline,
+    };
+  }
+  // The agent's own clock, which they lose the contract by missing.
+  if (isAgent && c.status === 'building' && !c.submission) {
+    return {
+      kind: 'deliver',
+      urgency: 'soon',
+      label: 'Your delivery is due',
+      detail: 'Submit before the clock runs out or the escrow returns to backers.',
+      deadline: c.deliveryDeadline,
+    };
+  }
+  // Housekeeping, offered but never urgent.
+  if (reclaimableRent(c, wallet, nowUnix).claims.length) {
+    return {
+      kind: 'rent',
+      urgency: 'idle',
+      label: 'Rent available to reclaim',
+      detail: 'These accounts are finished and their rent can come back.',
+      deadline: null,
+    };
+  }
+  return null;
+}
+
 /// Whether a refund from this commission will be charged the connection fee.
 /// Once an agent has delivered something the protocol has done the part it
 /// controls, so the fee applies however the money leaves escrow.
@@ -587,7 +673,7 @@ module.exports = {
   MIN_REVIEW_WINDOW_SECONDS, MAX_REVIEW_WINDOW_SECONDS, DEFAULT_REVIEW_WINDOW_SECONDS,
   NOMINATION_WINDOW_SECONDS, CLAIM_GRACE_WINDOW_SECONDS,
   PLEDGE_RENT_LAMPORTS, COMMISSION_RENT_LAMPORTS,
-  reviewExpired, claimProtected, refundCarriesFee, reclaimableRent,
+  reviewExpired, claimProtected, refundCarriesFee, reclaimableRent, pendingAttention,
   IX, STATUS, ERRORS, ERROR_HELP,
   commissionPda, vaultPda, pledgePda, decodeCommission, escrowRemaining,
   build, availableActions, explainError, canBuildTransactions,

@@ -330,6 +330,37 @@ function subscribeToCommissions(){
   }catch{/* Without a websocket the app still works; it just needs a reload. */}
 }
 
+/// Tells the user something now needs them, even if the tab is not in front.
+///
+/// A delivery is the case that matters: the review clock starts the moment it
+/// lands, silence pays the agent automatically, and until now the only way to
+/// find out was to open the right dialog and look. A creator could be handed
+/// finished work and never know.
+function announce(project,attention){
+  const title=project.meta?.title||'A commission';
+  showToast(`${title}: ${attention.label}`);
+  // A browser notification reaches a backgrounded tab, which a toast cannot.
+  // Permission is only ever requested after the user has acted on a commission
+  // themselves, never on page load.
+  try{
+    if(typeof Notification!=='undefined'&&Notification.permission==='granted'&&document.hidden){
+      const note=new Notification(title,{body:`${attention.label}\n${attention.detail}`,tag:project.address});
+      note.onclick=()=>{window.focus();openProject(project.address);note.close();};
+    }
+  }catch{/* Notifications are a courtesy, never a dependency. */}
+}
+
+/// Asks for notification permission at the only honest moment: right after the
+/// user has done something that means they will be waiting on a counterparty.
+function offerNotifications(){
+  try{
+    if(typeof Notification==='undefined'||Notification.permission!=='default')return;
+    if(localStorage.getItem('gitstarter.notify.asked'))return;
+    localStorage.setItem('gitstarter.notify.asked','1');
+    Notification.requestPermission().catch(()=>{});
+  }catch{/* Blocked by policy, or unsupported. Neither is an error. */}
+}
+
 let pendingRefresh=null;
 function applyLiveUpdate(address,data){
   let decoded;
@@ -342,7 +373,18 @@ function applyLiveUpdate(address,data){
     pendingRefresh=setTimeout(()=>{refresh().catch(()=>{});},800);
     return;
   }
+  // Compare what this wallet owed before and after, so an update is announced
+  // only when it actually changes what the user has to do. Re-announcing an
+  // unchanged state on every push is how a notification becomes noise.
+  //
+  // The key includes the label, not just the kind: a second delivery on a
+  // different milestone is still `review`, and keying on the category alone
+  // would silently swallow it.
+  const key=attention=>attention?`${attention.kind}:${attention.label}`:'';
+  const before=key(attentionFor(state.projects[index]));
   state.projects[index]={...state.projects[index],...decoded};
+  const after=attentionFor(state.projects[index]);
+  if(after&&after.urgency==='act'&&key(after)!==before)announce(state.projects[index],after);
   render();
   // Redraw an open dialog so it tracks the chain, but never while the user is
   // typing into it — replacing the markup would discard what they are entering.
@@ -356,20 +398,37 @@ function render(){
   $('accountEmpty').style.display=wallet?'none':'block';$('accountCard').classList.toggle('on',!!wallet);
   if(wallet){$('wAlias').textContent=walletAlias(wallet);$('wAddress').textContent=wallet;const auth=$('wAuth');if(state.authStatus==='authenticated'){auth.className='account-state signed';auth.innerHTML='<span>✓ Signed in to GitStarter</span>';}else if(state.authStatus==='signing'){auth.className='account-state';auth.innerHTML='<span>Waiting for signature…</span>';}else{auth.className='account-state';auth.innerHTML='<span>Wallet connected</span><button class="btn primary" id="bFinishAuth" type="button">Finish sign-in</button>';}}
   const labels=[...new Set(state.projects.flatMap(p=>Array.isArray(p.meta?.labels)?p.meta.labels:[]))].sort();
-  let visible=state.projects.filter(p=>(state.filter==='all'||p.status===state.filter)&&(state.label==='all'||p.meta?.labels?.includes(state.label))&&(!($('q').value)||JSON.stringify(p.meta||{}).toLowerCase().includes($('q').value.toLowerCase())));
+  // Anything this wallet is holding up, or being held up by. Computed once and
+  // reused by the filter, the counter and the empty state.
+  const needsYou=state.projects.filter(p=>attentionFor(p));
+  const needsAction=needsYou.filter(p=>attentionFor(p).urgency==='act');
+  let visible=state.projects.filter(p=>(state.filter==='needs-you'?!!attentionFor(p):(state.filter==='all'||p.status===state.filter))&&(state.label==='all'||p.meta?.labels?.includes(state.label))&&(!($('q').value)||JSON.stringify(p.meta||{}).toLowerCase().includes($('q').value.toLowerCase())));
   visible=[...visible].sort((a,b)=>state.sort==='funding'?b.pledged-a.pledged:state.sort==='deadline'?a.deadline-b.deadline:(b.meta?.createdAt||0)-(a.meta?.createdAt||0));
-  $('unav').innerHTML=[['all','Commissions',{label:'Commissions',cls:'',icon:'book'}],...STATUS.map(s=>[s,STATUS_UI[s].label,STATUS_UI[s]])].map(([f,l,ui])=>`<button data-f="${f}" class="${state.filter===f?'on':''}">${ui.icon==='book'?'<span class="status-glyph"><svg viewBox="0 0 16 16"><path d="'+ICON_PATHS.book+'"></path></svg></span>':statusIcon(ui)}${esc(l)} <span class="counter">${f==='all'?state.projects.length:state.projects.filter(p=>p.status===f).length}</span></button>`).join('');
+  $('unav').innerHTML=[['all','Commissions',{label:'Commissions',cls:'',icon:'book'}],...STATUS.map(s=>[s,STATUS_UI[s].label,STATUS_UI[s]])].map(([f,l,ui])=>`<button data-f="${f}" class="${state.filter===f?'on':''}">${ui.icon==='book'?'<span class="status-glyph"><svg viewBox="0 0 16 16"><path d="'+ICON_PATHS.book+'"></path></svg></span>':statusIcon(ui)}${esc(l)} <span class="counter">${f==='all'?state.projects.length:state.projects.filter(p=>p.status===f).length}</span></button>`).join('')
+    // Only shown when there is something to show, so it never becomes furniture
+    // the eye learns to skip.
+    +(needsYou.length?`<button data-f="needs-you" class="needs-you ${state.filter==='needs-you'?'on':''}${needsAction.length?' urgent':''}">Needs you <span class="counter">${needsYou.length}</span></button>`:'');
   const openCount=state.projects.filter(p=>p.status!=='shipped'&&p.status!=='refunded').length,closedCount=state.projects.length-openCount;
   const header=`<div class="Box-header"><div class="list-summary"><span>${statusIcon(STATUS_UI.funding)}<b>${openCount} Open</b></span><span>${statusIcon(STATUS_UI.shipped)}${closedCount} Closed</span></div><div class="list-tools"><label class="hint" for="sortSelect" style="margin:0">Sort</label><select class="tool-select" id="sortSelect"><option value="newest" ${state.sort==='newest'?'selected':''}>Newest</option><option value="funding" ${state.sort==='funding'?'selected':''}>Most funded</option><option value="deadline" ${state.sort==='deadline'?'selected':''}>Deadline</option></select></div></div>`;
   const labelBar=labels.length?`<div class="label-filter"><button class="label-button ${state.label==='all'?'on':''}" data-label="all">All labels</button>${labels.map(label=>`<button class="label-button ${state.label===label?'on':''}" data-label="${esc(label)}">${esc(label)}</button>`).join('')}</div>`:'';
-  $('listBox').innerHTML=header+labelBar+(visible.length?visible.map(row).join(''):'<div class="blank"><h3>No matching commissions</h3><p>Change the active status, label, search, or create the first real commission.</p></div>');
+  $('listBox').innerHTML=header+labelBar+(visible.length?visible.map(row).join(''):state.filter==='needs-you'?'<div class="blank"><h3>Nothing is waiting on you</h3><p>Deliveries, contract offers and expiring clocks appear here the moment they happen.</p></div>':'<div class="blank"><h3>No matching commissions</h3><p>Change the active status, label, search, or create the first real commission.</p></div>');
   const total=state.projects.reduce((s,p)=>s+p.pledged,0), escrow=state.projects.reduce((s,p)=>s+Math.max(0,p.pledged-p.released-p.refunded),0);
   $('sPledged').textContent=fmtBase(total); $('sEsc').textContent=fmtBase(escrow); $('sBurn').textContent=fmtBase(state.projects.reduce((s,p)=>s+p.released,0)); $('sRefund').textContent=fmtBase(state.projects.reduce((s,p)=>s+p.refunded,0)); $('sBackers').textContent=state.projects.reduce((s,p)=>s+p.pledgerCount,0);
   $('wBal').textContent=wallet?'refreshing…':'connect wallet'; $('wProj').textContent=wallet?state.projects.filter(p=>p.creator===wallet).length:'—';
   if(wallet)loadBalance();
 }
 async function loadBalance(){try{const lamports=await state.connection.getBalance(state.wallet);$('wBal').textContent=fmtBase(lamports)+' SOL';}catch{$('wBal').textContent='— SOL';}}
-function row(p){const ui=STATUS_UI[p.status]||STATUS_UI.refunded,m=p.meta||{},percent=p.goal?Math.min(100,p.pledged/p.goal*100):0,labels=Array.isArray(m.labels)?m.labels:[];let cursor=0;const segments=p.milestoneBps.map((bps,index)=>{const start=cursor;cursor+=bps/100;const fill=Math.max(0,Math.min(100,(percent-start)/(bps/100)*100));return `<span class="milestone-segment" style="width:${bps/100}%"><span class="milestone-fill ${ui.cls}" style="display:block;width:${fill}%"></span></span>`;}).join('');return `<div class="Box-row" data-id="${p.address}" style="cursor:pointer"><div class="row-status">${statusIcon(ui)}</div><div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600;font-size:16px">${esc(m.title||'Unindexed commission')}</span><span class="lbl ${ui.cls}">${esc(ui.detail)}</span>${labels.map(label=>`<span class="lbl gray">${esc(label)}</span>`).join('')}</div><div class="row-meta"><span class="mono">${p.address.slice(0,8)}…</span><span>created by ${p.creator.slice(0,6)}…</span><span>·</span><span>${esc(m.license||'metadata pending')}</span><span>·</span><span>${p.milestoneCount} milestones</span></div><div class="milestone-track" aria-label="${percent.toFixed(1)}% funded across ${p.milestoneCount} milestones">${segments}</div></div><div class="row-right"><span class="amt">${fmtBase(p.pledged)} <span class="of">/ ${fmtBase(p.goal)} SOL</span></span><span class="hint">${p.pledgerCount} ${p.pledgerCount===1?'backer':'backers'}</span></div></div>`;}
+/// Formats a deadline as the time left, because "2h left" is actionable and an
+/// absolute timestamp in another timezone is not.
+function timeLeft(unix){
+  const seconds=unix-Math.floor(Date.now()/1000);
+  if(seconds<=0)return'now';
+  if(seconds<3600)return`${Math.ceil(seconds/60)}m left`;
+  if(seconds<86400)return`${Math.floor(seconds/3600)}h left`;
+  return`${Math.floor(seconds/86400)}d left`;
+}
+function attentionFor(p){return escrow.pendingAttention(p,currentWallet());}
+function row(p){const ui=STATUS_UI[p.status]||STATUS_UI.refunded,m=p.meta||{},percent=p.goal?Math.min(100,p.pledged/p.goal*100):0,labels=Array.isArray(m.labels)?m.labels:[];const attention=attentionFor(p);let cursor=0;const segments=p.milestoneBps.map((bps,index)=>{const start=cursor;cursor+=bps/100;const fill=Math.max(0,Math.min(100,(percent-start)/(bps/100)*100));return `<span class="milestone-segment" style="width:${bps/100}%"><span class="milestone-fill ${ui.cls}" style="display:block;width:${fill}%"></span></span>`;}).join('');return `<div class="Box-row" data-id="${p.address}" style="cursor:pointer"><div class="row-status">${statusIcon(ui)}</div><div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600;font-size:16px">${esc(m.title||'Unindexed commission')}</span><span class="lbl ${ui.cls}">${esc(ui.detail)}</span>${attention?`<span class="lbl attention ${attention.urgency}">${esc(attention.label)}${attention.deadline?` \u00b7 ${timeLeft(attention.deadline)}`:''}</span>`:''}${labels.map(label=>`<span class="lbl gray">${esc(label)}</span>`).join('')}</div><div class="row-meta"><span class="mono">${p.address.slice(0,8)}…</span><span>created by ${p.creator.slice(0,6)}…</span><span>·</span><span>${esc(m.license||'metadata pending')}</span><span>·</span><span>${p.milestoneCount} milestones</span></div><div class="milestone-track" aria-label="${percent.toFixed(1)}% funded across ${p.milestoneCount} milestones">${segments}</div></div><div class="row-right"><span class="amt">${fmtBase(p.pledged)} <span class="of">/ ${fmtBase(p.goal)} SOL</span></span><span class="hint">${p.pledgerCount} ${p.pledgerCount===1?'backer':'backers'}</span></div></div>`;}
 function closeDialog(){state.openProject=null;$('overlay').classList.remove('on');$('dlg').className='dlg';$('dlg').innerHTML='';}
 function openProject(address){
   const p=state.projects.find(x=>x.address===address);if(!p)return;
@@ -498,6 +557,9 @@ async function simpleAction(action,address,index){
   await refresh();
   await reconcile(address);
   hideProgress();
+  // Having just nominated, submitted or rejected, this wallet is now waiting on
+  // somebody else. That is the moment a notification is worth something.
+  offerNotifications();
   showToast({
     nominate:'Agent nominated. They need to accept before work starts.',
     revoke:'Nomination withdrawn.',
