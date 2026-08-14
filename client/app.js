@@ -305,10 +305,45 @@ async function reconcile(address){
     await sleep(300);
   }
 }
+/// Best available "when did this appear" for ordering the board.
+///
+/// Commissions indexed here carry a real timestamp. One created directly on
+/// chain carries none — the program stores no creation time — so fall back to
+/// the seed, which every client of ours sets to `Date.now()`. A third party is
+/// free to pick any seed, so this is only trusted when it actually looks like a
+/// recent millisecond timestamp; anything else sorts last rather than pretending
+/// to a position it cannot justify.
+function listedAt(project){
+  if(project.meta?.createdAt)return project.meta.createdAt;
+  const plausible=project.seed>1_577_836_800_000&&project.seed<Date.now()+86_400_000;
+  return plausible?project.seed:0;
+}
+
+/// Turns raw program accounts into the board, newest first.
+///
+/// THE CHAIN IS THE BOARD: every commission that exists on chain is listed,
+/// described or not.
+///
+/// This used to require a metadata row, which meant a funded bounty was
+/// invisible here until its creator's browser had posted a title to our
+/// database. On a job board that is exactly backwards — an agent scanning the
+/// program finds the work regardless, so hiding it only made this page wrong
+/// about what was available. A commission with no description still has real
+/// escrow behind it and can still be delivered.
+function projectCommissions(accounts,metaByAddress){
+  return accounts.map(({pubkey,account})=>{
+    const address=typeof pubkey==='string'?pubkey:pubkey.toBase58();
+    // A layout we cannot read is skipped, never fatal: one stale account from an
+    // earlier version of the program must not blank the whole board.
+    try{return {address,...escrow.decodeCommission(account.data),meta:metaByAddress.get(address)};}
+    catch{return null;}
+  }).filter(Boolean).sort((a,b)=>listedAt(b)-listedAt(a));
+}
+
 async function refresh(){
   state.metadata=await api('/api/commissions'); const meta=new Map(state.metadata.map(m=>[m.address,m]));
-  const accounts=await readCommissionAccounts();
-  state.projects=accounts.map(({pubkey,account})=>({address:pubkey.toBase58(),...escrow.decodeCommission(account.data),meta:meta.get(pubkey.toBase58())})).filter(project=>project.meta).sort((a,b)=>b.meta.createdAt-a.meta.createdAt); render();
+  state.projects=projectCommissions(await readCommissionAccounts(),meta);
+  render();
   subscribeToCommissions();
 }
 
@@ -478,7 +513,7 @@ function deliveryHistory(p,currentHash){
     +past.map(d=>`<div class="evidence past"><div class="evidence-head">Milestone ${d.milestoneIndex+1} \u00b7 ${new Date(d.submittedAt*1000).toLocaleString()}</div><div class="evidence-body">${evidenceHtml(d.evidence)}</div></div>`).join('')
     +'</details>';
 }
-function row(p){const ui=STATUS_UI[p.status]||STATUS_UI.refunded,m=p.meta||{},percent=p.goal?Math.min(100,p.pledged/p.goal*100):0,labels=Array.isArray(m.labels)?m.labels:[];const attention=attentionFor(p);let cursor=0;const segments=p.milestoneBps.map((bps,index)=>{const start=cursor;cursor+=bps/100;const fill=Math.max(0,Math.min(100,(percent-start)/(bps/100)*100));return `<span class="milestone-segment" style="width:${bps/100}%"><span class="milestone-fill ${ui.cls}" style="display:block;width:${fill}%"></span></span>`;}).join('');return `<div class="Box-row" data-id="${p.address}" style="cursor:pointer"><div class="row-status">${statusIcon(ui)}</div><div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600;font-size:16px">${esc(m.title||'Unindexed commission')}</span><span class="lbl ${ui.cls}">${esc(ui.detail)}</span>${attention?`<span class="lbl attention ${attention.urgency}">${esc(attention.label)}${attention.deadline?` \u00b7 ${timeLeft(attention.deadline)}`:''}</span>`:''}${labels.map(label=>`<span class="lbl gray">${esc(label)}</span>`).join('')}</div><div class="row-meta"><span class="mono">${p.address.slice(0,8)}…</span><span>created by ${p.creator.slice(0,6)}…</span><span>·</span><span>${esc(m.license||'metadata pending')}</span><span>·</span><span>${p.milestoneCount} milestones</span></div><div class="milestone-track" aria-label="${percent.toFixed(1)}% funded across ${p.milestoneCount} milestones">${segments}</div></div><div class="row-right"><span class="amt">${fmtBase(p.pledged)} <span class="of">/ ${fmtBase(p.goal)} SOL</span></span><span class="hint">${p.pledgerCount} ${p.pledgerCount===1?'backer':'backers'}</span></div></div>`;}
+function row(p){const ui=STATUS_UI[p.status]||STATUS_UI.refunded,m=p.meta||{},percent=p.goal?Math.min(100,p.pledged/p.goal*100):0,labels=Array.isArray(m.labels)?m.labels:[];const attention=attentionFor(p);let cursor=0;const segments=p.milestoneBps.map((bps,index)=>{const start=cursor;cursor+=bps/100;const fill=Math.max(0,Math.min(100,(percent-start)/(bps/100)*100));return `<span class="milestone-segment" style="width:${bps/100}%"><span class="milestone-fill ${ui.cls}" style="display:block;width:${fill}%"></span></span>`;}).join('');return `<div class="Box-row" data-id="${p.address}" style="cursor:pointer"><div class="row-status">${statusIcon(ui)}</div><div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600;font-size:16px">${esc(m.title||'Untitled bounty')}</span>${m.title?'':'<span class="lbl gray">no description posted</span>'}<span class="lbl ${ui.cls}">${esc(ui.detail)}</span>${attention?`<span class="lbl attention ${attention.urgency}">${esc(attention.label)}${attention.deadline?` \u00b7 ${timeLeft(attention.deadline)}`:''}</span>`:''}${labels.map(label=>`<span class="lbl gray">${esc(label)}</span>`).join('')}</div><div class="row-meta"><span class="mono">${p.address.slice(0,8)}…</span><span>created by ${p.creator.slice(0,6)}…</span><span>·</span><span>${esc(m.license||'created on chain')}</span><span>·</span><span>${p.milestoneCount} milestones</span></div><div class="milestone-track" aria-label="${percent.toFixed(1)}% funded across ${p.milestoneCount} milestones">${segments}</div></div><div class="row-right"><span class="amt">${fmtBase(p.pledged)} <span class="of">/ ${fmtBase(p.goal)} SOL</span></span><span class="hint">${p.pledgerCount} ${p.pledgerCount===1?'backer':'backers'}</span></div></div>`;}
 function closeDialog(){state.openProject=null;$('overlay').classList.remove('on');$('dlg').className='dlg';$('dlg').innerHTML='';}
 function openProject(address){
   const p=state.projects.find(x=>x.address===address);if(!p)return;
@@ -561,7 +596,7 @@ function openProject(address){
   if(!wallet)actions='<p class="hint">Connect a wallet to pledge or manage this commission.</p>';
   else if(!actions)actions='<p class="hint">No action is available to this wallet at the current contract stage.</p>';
   $('dlg').className='dlg';
-  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>${esc(m.title||'Unindexed commission')} <span class="state ${ui.cls}">${esc(ui.label)}</span></h1><div class="sub mono"><a href="${explorerUrl(p.address)}" target="_blank" rel="noopener noreferrer">${p.address} ↗</a></div></div>${closeIcon()}</div></div><div class="project-shell"><main class="project-main"><p class="project-description">${esc(m.description||'This on-chain commission has not been indexed yet.')}</p><h2 class="section-title">Settlement</h2><div class="metric-grid"><div class="metric"><b>${fmtBase(p.pledged)} SOL</b><span>Net pledged</span></div><div class="metric"><b>${fmtBase(p.released)} SOL</b><span>Released</span></div><div class="metric"><b>${fmtBase(p.refunded)} SOL</b><span>Refunded</span></div></div><h2 class="section-title">Actions</h2><div class="action-panel">${actions}</div></main><aside class="project-side"><h2 class="section-title">Contract</h2><ul class="fact-list"><li><span>Network</span><b>${esc(state.config.cluster)}</b></li><li><span>Goal</span><b>${fmtBase(p.goal)} SOL</b></li><li><span>Milestones</span><b>${p.milestoneCount}</b></li><li><span>Protocol fee</span><b>1% once work is delivered · pledges free</b></li><li><span>Escrow program</span><b><a href="${explorerUrl(state.config.programId)}" target="_blank" rel="noopener noreferrer" class="mono">${state.config.programId.slice(0,8)}…${state.config.programId.slice(-4)} ↗</a></b></li><li><span>Deadline</span><b>${new Date(p.deadline*1000).toLocaleString()}</b></li><li><span>Creator</span><b class="mono">${p.creator}</b></li>${safeHttpUrl(m.repositoryUrl)?`<li><span>Repository</span><b><a href="${esc(safeHttpUrl(m.repositoryUrl))}" target="_blank" rel="noopener noreferrer">Open repository ↗</a></b></li>`:''}</ul></aside></div>`;
+  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>${esc(m.title||'Untitled bounty')} <span class="state ${ui.cls}">${esc(ui.label)}</span></h1><div class="sub mono"><a href="${explorerUrl(p.address)}" target="_blank" rel="noopener noreferrer">${p.address} ↗</a></div></div>${closeIcon()}</div></div><div class="project-shell"><main class="project-main"><p class="project-description">${esc(m.description||'This on-chain commission has not been indexed yet.')}</p><h2 class="section-title">Settlement</h2><div class="metric-grid"><div class="metric"><b>${fmtBase(p.pledged)} SOL</b><span>Net pledged</span></div><div class="metric"><b>${fmtBase(p.released)} SOL</b><span>Released</span></div><div class="metric"><b>${fmtBase(p.refunded)} SOL</b><span>Refunded</span></div></div><h2 class="section-title">Actions</h2><div class="action-panel">${actions}</div></main><aside class="project-side"><h2 class="section-title">Contract</h2><ul class="fact-list"><li><span>Network</span><b>${esc(state.config.cluster)}</b></li><li><span>Goal</span><b>${fmtBase(p.goal)} SOL</b></li><li><span>Milestones</span><b>${p.milestoneCount}</b></li><li><span>Protocol fee</span><b>1% once work is delivered · pledges free</b></li><li><span>Escrow program</span><b><a href="${explorerUrl(state.config.programId)}" target="_blank" rel="noopener noreferrer" class="mono">${state.config.programId.slice(0,8)}…${state.config.programId.slice(-4)} ↗</a></b></li><li><span>Deadline</span><b>${new Date(p.deadline*1000).toLocaleString()}</b></li><li><span>Creator</span><b class="mono">${p.creator}</b></li>${safeHttpUrl(m.repositoryUrl)?`<li><span>Repository</span><b><a href="${esc(safeHttpUrl(m.repositoryUrl))}" target="_blank" rel="noopener noreferrer">Open repository ↗</a></b></li>`:''}</ul></aside></div>`;
   $('overlay').classList.add('on');
 }
 async function openCreate(){
