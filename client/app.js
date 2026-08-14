@@ -9,7 +9,11 @@ const { PublicKey, Transaction } = web3;
 const escrow = require('../shared/escrow');
 const $ = id => document.getElementById(id);
 const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL;
-const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light' };
+const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light',
+  // Address of the commission whose dialog is open, so a live update can redraw
+  // it; the websocket subscription id; and the newest slot we have proof of, so
+  // no read can hand back state older than our own confirmed transaction.
+  openProject:null, subscription:null, minContextSlot:0 };
 const WALLETS = [
   {id:'phantom',name:'Phantom',logo:'/wallets/phantom.svg',url:'https://phantom.com/download',provider:()=>window.phantom?.solana},
   {id:'solflare',name:'Solflare',logo:'/wallets/solflare.svg',url:'https://www.solflare.com/download',provider:()=>window.solflare},
@@ -222,7 +226,7 @@ async function restoreSession(){
   render();
 }
 function bs58Encode(bytes){const alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';let digits=[0];for(const byte of bytes){let carry=byte;for(let j=0;j<digits.length;j++){carry+=digits[j]<<8;digits[j]=carry%58;carry=(carry/58)|0;}while(carry){digits.push(carry%58);carry=(carry/58)|0;}}let out='';for(let k=0;k<bytes.length&&bytes[k]===0;k++)out+='1';for(let q=digits.length-1;q>=0;q--)out+=alphabet[digits[q]];return out;}
-async function send(transaction){
+async function send(transaction,onStage=()=>{}){
   const provider=walletProvider(); if(!provider)throw new Error('Connect your wallet first');
   transaction.feePayer=state.wallet;
   transaction.recentBlockhash=(await state.connection.getLatestBlockhash('confirmed')).blockhash;
@@ -242,20 +246,108 @@ async function send(transaction){
 
   // Wallets that sign and send in one step keep their own network scope aligned
   // with the chain we ask for; wallets that only sign leave submission to us.
+  onStage('Approve in your wallet\u2026');
+  let sig;
   if(typeof provider.signAndSendTransaction==='function'){
-    const sig=await provider.signAndSendTransaction(transaction);
-    await state.connection.confirmTransaction(sig,'confirmed');
-    return sig;
+    sig=await provider.signAndSendTransaction(transaction);
+  }else{
+    const signed=await provider.signTransaction(transaction);
+    sig=await state.connection.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});
   }
-  const signed=await provider.signTransaction(transaction);
-  const sig=await state.connection.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});
-  await state.connection.confirmTransaction(sig,'confirmed');
+  onStage('Confirming on Solana\u2026');
+  const confirmation=await state.connection.confirmTransaction(sig,'confirmed');
+
+  // Remember the slot that confirmed us.
+  //
+  // The public RPC endpoint is a pool of nodes. `confirmTransaction` can be
+  // satisfied by one node while the very next read is served by another that has
+  // not caught up, which is why a pledge could confirm and still show as
+  // unfunded until a manual reload. Pinning subsequent reads to this slot makes
+  // a stale node say so instead of quietly answering with old state.
+  const slot=confirmation?.context?.slot;
+  if(slot)state.minContextSlot=Math.max(state.minContextSlot||0,slot);
   return sig;
+}
+
+/// Reads every commission account.
+///
+/// This scan CANNOT be pinned to a slot: `getProgramAccounts` accepts a
+/// `minContextSlot` and silently ignores it, verified against devnet by asking
+/// for a slot a hundred thousand ahead of the tip and being answered anyway.
+/// So the bulk list may lag by a slot or two, and anything we have just changed
+/// ourselves is reconciled separately by `reconcile`, which uses a read that
+/// does honour the pin.
+async function readCommissionAccounts(){
+  return state.connection.getProgramAccounts(new PublicKey(state.config.programId),{
+    commitment:'confirmed',
+    filters:[{dataSize:escrow.COMMISSION_ACCOUNT_BYTES},{memcmp:{offset:0,bytes:'3'}}],
+  });
+}
+
+/// Brings one commission up to date, refusing any node older than the slot our
+/// own transaction confirmed in.
+///
+/// `getAccountInfo` does honour `minContextSlot`, so a node that has not caught
+/// up errors rather than answering with stale state. That is the whole fix for
+/// "I pledged, it confirmed, and the page still said unfunded until I reloaded":
+/// the confirmation and the read were being served by different nodes.
+async function reconcile(address){
+  if(!address||!state.connection)return;
+  const key=new PublicKey(address);
+  const options=state.minContextSlot
+    ?{commitment:'confirmed',minContextSlot:state.minContextSlot}
+    :{commitment:'confirmed'};
+  for(let attempt=0;attempt<12;attempt++){
+    try{
+      const info=await state.connection.getAccountInfo(key,options);
+      if(info?.data){applyLiveUpdate(address,info.data);return;}
+    }catch{/* Behind our slot, or a transient RPC failure. Both mean: ask again. */}
+    await sleep(300);
+  }
 }
 async function refresh(){
   state.metadata=await api('/api/commissions'); const meta=new Map(state.metadata.map(m=>[m.address,m]));
-  const accounts=await state.connection.getProgramAccounts(new PublicKey(state.config.programId),{commitment:'confirmed',filters:[{dataSize:escrow.COMMISSION_ACCOUNT_BYTES},{memcmp:{offset:0,bytes:'3'}}]});
+  const accounts=await readCommissionAccounts();
   state.projects=accounts.map(({pubkey,account})=>({address:pubkey.toBase58(),...escrow.decodeCommission(account.data),meta:meta.get(pubkey.toBase58())})).filter(project=>project.meta).sort((a,b)=>b.meta.createdAt-a.meta.createdAt); render();
+  subscribeToCommissions();
+}
+
+// ── live updates ─────────────────────────────────────────────────────────────
+//
+// One websocket subscription, pushed by the RPC node whenever any commission
+// account changes. It costs nothing per update and needs no polling loop, and it
+// covers other people's activity too: a backer's pledge or an agent's delivery
+// appears without anyone reloading.
+function subscribeToCommissions(){
+  if(state.subscription!=null||!state.connection)return;
+  try{
+    state.subscription=state.connection.onProgramAccountChange(
+      new PublicKey(state.config.programId),
+      ({accountId,accountInfo})=>applyLiveUpdate(accountId.toBase58(),accountInfo.data),
+      'confirmed',
+      [{dataSize:escrow.COMMISSION_ACCOUNT_BYTES},{memcmp:{offset:0,bytes:'3'}}],
+    );
+  }catch{/* Without a websocket the app still works; it just needs a reload. */}
+}
+
+let pendingRefresh=null;
+function applyLiveUpdate(address,data){
+  let decoded;
+  try{decoded=escrow.decodeCommission(data);}catch{return;}
+  const index=state.projects.findIndex(project=>project.address===address);
+  if(index===-1){
+    // A commission we have not seen before. Its title lives on the server, so
+    // this needs a full pass — debounced, in case several arrive together.
+    clearTimeout(pendingRefresh);
+    pendingRefresh=setTimeout(()=>{refresh().catch(()=>{});},800);
+    return;
+  }
+  state.projects[index]={...state.projects[index],...decoded};
+  render();
+  // Redraw an open dialog so it tracks the chain, but never while the user is
+  // typing into it — replacing the markup would discard what they are entering.
+  const editing=/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName||'');
+  if(state.openProject===address&&!editing)openProject(address);
 }
 function currentWallet(){return state.wallet?.toBase58();}
 function render(){
@@ -278,9 +370,10 @@ function render(){
 }
 async function loadBalance(){try{const lamports=await state.connection.getBalance(state.wallet);$('wBal').textContent=fmtBase(lamports)+' SOL';}catch{$('wBal').textContent='— SOL';}}
 function row(p){const ui=STATUS_UI[p.status]||STATUS_UI.refunded,m=p.meta||{},percent=p.goal?Math.min(100,p.pledged/p.goal*100):0,labels=Array.isArray(m.labels)?m.labels:[];let cursor=0;const segments=p.milestoneBps.map((bps,index)=>{const start=cursor;cursor+=bps/100;const fill=Math.max(0,Math.min(100,(percent-start)/(bps/100)*100));return `<span class="milestone-segment" style="width:${bps/100}%"><span class="milestone-fill ${ui.cls}" style="display:block;width:${fill}%"></span></span>`;}).join('');return `<div class="Box-row" data-id="${p.address}" style="cursor:pointer"><div class="row-status">${statusIcon(ui)}</div><div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600;font-size:16px">${esc(m.title||'Unindexed commission')}</span><span class="lbl ${ui.cls}">${esc(ui.detail)}</span>${labels.map(label=>`<span class="lbl gray">${esc(label)}</span>`).join('')}</div><div class="row-meta"><span class="mono">${p.address.slice(0,8)}…</span><span>created by ${p.creator.slice(0,6)}…</span><span>·</span><span>${esc(m.license||'metadata pending')}</span><span>·</span><span>${p.milestoneCount} milestones</span></div><div class="milestone-track" aria-label="${percent.toFixed(1)}% funded across ${p.milestoneCount} milestones">${segments}</div></div><div class="row-right"><span class="amt">${fmtBase(p.pledged)} <span class="of">/ ${fmtBase(p.goal)} SOL</span></span><span class="hint">${p.pledgerCount} ${p.pledgerCount===1?'backer':'backers'}</span></div></div>`;}
-function closeDialog(){$('overlay').classList.remove('on');$('dlg').className='dlg';$('dlg').innerHTML='';}
+function closeDialog(){state.openProject=null;$('overlay').classList.remove('on');$('dlg').className='dlg';$('dlg').innerHTML='';}
 function openProject(address){
   const p=state.projects.find(x=>x.address===address);if(!p)return;
+  state.openProject=address;
   const m=p.meta||{},wallet=currentWallet(),ui=STATUS_UI[p.status]||STATUS_UI.refunded;
   let actions='';
   if(p.status==='funding'&&wallet)actions=`<div class="field"><label for="pledgeAmount">Pledge amount</label><input id="pledgeAmount" type="number" min="0.000001" step="0.000001" placeholder="0.00"><div class="hint">Amount in SOL. Your wallet will confirm the escrow transaction.</div></div><div class="action-row"><button class="btn primary lg" data-action="pledge" data-id="${p.address}">Pledge SOL</button></div>`;
@@ -345,8 +438,31 @@ async function createCommission(){
   if(percentages.length>escrow.MAX_MILESTONES)throw new Error(`Use at most ${escrow.MAX_MILESTONES} milestones.`);
   if(!(deliveryDays>=1&&deliveryDays<=escrow.MAX_DELIVERY_WINDOW_SECONDS/86400))throw new Error(`Delivery window must be between 1 and ${escrow.MAX_DELIVERY_WINDOW_SECONDS/86400} days.`);
   if(!(reviewHours>=1&&reviewHours<=escrow.MAX_REVIEW_WINDOW_SECONDS/3600))throw new Error(`Review window must be between 1 and ${escrow.MAX_REVIEW_WINDOW_SECONDS/3600} hours.`);
-  const {commission,instruction}=escrow.build.createCommission(ESCROW_CTX,{creator:state.wallet,seed,goalLamports:goal,milestoneBasisPoints:percentages.map(x=>x*100),deadlineUnix:deadline,deliveryWindowSeconds:Math.round(deliveryDays*86400),reviewWindowSeconds:Math.round(reviewHours*3600)});const signature=await send(new Transaction().add(instruction));await api('/api/commissions',{method:'POST',body:JSON.stringify({address:commission.toBase58(),txSignature:signature,title,description,repositoryUrl:$('nRepo').value.trim()||null,license:$('nLicense').value.trim()||'MIT',labels:$('nLabels').value.split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).slice(0,8)})});closeDialog();await refresh();}
-async function pledge(address){const amountLamports=Math.round(Number($('pledgeAmount').value)*LAMPORTS_PER_SOL);if(!amountLamports)throw new Error('Enter a pledge amount');const {instruction}=escrow.build.pledge(ESCROW_CTX,{backer:state.wallet,commission:address,amountLamports});await send(new Transaction().add(instruction));closeDialog();await refresh();}
+  const {commission,instruction}=escrow.build.createCommission(ESCROW_CTX,{creator:state.wallet,seed,goalLamports:goal,milestoneBasisPoints:percentages.map(x=>x*100),deadlineUnix:deadline,deliveryWindowSeconds:Math.round(deliveryDays*86400),reviewWindowSeconds:Math.round(reviewHours*3600)});const signature=await send(new Transaction().add(instruction),showProgress);
+  showProgress('Indexing\u2026');
+  await api('/api/commissions',{method:'POST',body:JSON.stringify({address:commission.toBase58(),txSignature:signature,title,description,repositoryUrl:$('nRepo').value.trim()||null,license:$('nLicense').value.trim()||'MIT',labels:$('nLabels').value.split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).slice(0,8)})});
+  closeDialog();
+  await refresh();
+  await reconcile(commission.toBase58());
+  hideProgress();
+  showToast('Commission created. Pledge to it to open funding.');
+}
+async function pledge(address){
+  const amountLamports=Math.round(Number($('pledgeAmount').value)*LAMPORTS_PER_SOL);
+  if(!amountLamports)throw new Error('Enter a pledge amount');
+  const before=state.projects.find(x=>x.address===address)?.status;
+  const {instruction}=escrow.build.pledge(ESCROW_CTX,{backer:state.wallet,commission:address,amountLamports});
+  await send(new Transaction().add(instruction),showProgress);
+  closeDialog();
+  showProgress('Updating\u2026');
+  await refresh();
+  await reconcile(address);
+  hideProgress();
+  const after=state.projects.find(x=>x.address===address);
+  showToast(after&&after.status==='funded'&&before!=='funded'
+    ?`Pledge confirmed \u2014 goal reached, ${fmtBase(after.pledged)} SOL in escrow.`
+    :'Pledge confirmed.');
+}
 async function simpleAction(action,address,index){
   const p=state.projects.find(x=>x.address===address);let built;
   if(action==='nominate')built=escrow.build.selectAgent(ESCROW_CTX,{creator:state.wallet,commission:address,agent:$('agentWallet').value.trim()});
@@ -364,7 +480,23 @@ async function simpleAction(action,address,index){
   }
   else if(action==='reject')built=escrow.build.rejectDelivery(ESCROW_CTX,{creator:state.wallet,commission:address});
   else throw new Error(`Unknown action: ${action}`);
-  await send(new Transaction().add(built.instruction));closeDialog();await refresh();}
+  await send(new Transaction().add(built.instruction),showProgress);
+  closeDialog();
+  showProgress('Updating\u2026');
+  await refresh();
+  await reconcile(address);
+  hideProgress();
+  showToast({
+    nominate:'Agent nominated. They need to accept before work starts.',
+    revoke:'Nomination withdrawn.',
+    accept:'Contract accepted. Your delivery clock is running.',
+    submit:'Delivery submitted. The review clock is running.',
+    reject:'Delivery rejected. The commission is back in the pool.',
+    release:'Milestone released. The agent has been paid.',
+    refund:'Refund complete.',
+    cancel:'Commission cancelled. Backers can withdraw.',
+  }[action]||'Done.');
+}
 // Maps EscrowError discriminants to language a user can act on. Anchoring these
 // to the numbers the program actually returns keeps a rejected transaction from
 // surfacing as an opaque "custom program error: 0x18".
@@ -375,9 +507,23 @@ function friendlyWalletError(error){const message=error?.message||String(error);
   if(error?.code===4001||/user rejected|User rejected/i.test(message))return 'The wallet request was cancelled.';
   if(/insufficient lamports|insufficient funds/i.test(message))return 'That wallet does not hold enough SOL for this transaction plus fees.';
   return message;}
-function showToast(message){const t=$('toast');t.textContent=message;t.classList.add('on');setTimeout(()=>t.classList.remove('on'),6000);}
+let toastTimer=null;
+function showToast(message){
+  const t=$('toast');clearTimeout(toastTimer);
+  t.className='toast on';t.textContent=message;
+  toastTimer=setTimeout(()=>t.classList.remove('on'),6000);
+}
+/// A toast that stays put, for work already underway. Signing and confirming
+/// take seconds and involve leaving the page for a wallet app; without this the
+/// screen looks identical to one where the click did nothing.
+function showProgress(message){
+  const t=$('toast');clearTimeout(toastTimer);
+  t.className='toast on busy';
+  t.innerHTML=`<span class="spin" aria-hidden="true"></span><span>${esc(message)}</span>`;
+}
+function hideProgress(){const t=$('toast');if(t.classList.contains('busy')){t.className='toast';}}
 function showNotice(message){showToast(message);}
-function showError(error){console.error(error);showToast(friendlyWalletError(error));}
+function showError(error){console.error(error);hideProgress();showToast(friendlyWalletError(error));}
 document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]');if(!t)return;if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('overlay').classList.contains('on'))closeDialog();});
 $('q').addEventListener('input',render);

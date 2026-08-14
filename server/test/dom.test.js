@@ -117,3 +117,75 @@ test('the session is restored before the chain is scanned', () => {
   assert.ok(restore !== -1 && refresh !== -1, 'boot sequence not found');
   assert.ok(restore < refresh, 'restoreSession must run before refresh on boot');
 });
+
+test('a confirmed transaction pins every later read to its slot', () => {
+  // The public RPC endpoint is a pool. `confirmTransaction` can be satisfied by
+  // one node while the next read is served by another that has not caught up,
+  // which is why a confirmed pledge could still show as unfunded until a manual
+  // reload. Recording the confirming slot and demanding it back makes a stale
+  // node say so instead of quietly answering with old state.
+  const send = functionBody(CLIENT, 'send');
+  assert.match(send, /confirmation\?\.context\?\.slot/,
+    'send must record the slot its transaction confirmed in');
+  assert.match(send, /state\.minContextSlot\s*=\s*Math\.max/,
+    'the recorded slot must only ever move forward');
+
+  // getProgramAccounts accepts minContextSlot and silently IGNORES it — verified
+  // against devnet by asking for a slot 100,000 ahead of the tip and being
+  // answered anyway. getAccountInfo does honour it, so the account we just
+  // changed must be reconciled with a targeted read rather than trusted from
+  // the bulk scan.
+  const reconcile = functionBody(CLIENT, 'reconcile');
+  assert.match(reconcile, /getAccountInfo/,
+    'reconcile must use the read that honours minContextSlot');
+  assert.match(reconcile, /minContextSlot:state\.minContextSlot/,
+    'reconcile must pin to the slot our transaction confirmed in');
+  // Match the config KEY being passed, not the word appearing — the function's
+  // own comment explains why the scan cannot be pinned, and a bare /minContextSlot/
+  // matches that prose and asserts nothing.
+  assert.equal(/minContextSlot\s*:/.test(functionBody(CLIENT, 'readCommissionAccounts')), false,
+    'the bulk scan must not pretend to be pinned; getProgramAccounts ignores it');
+
+  for (const action of ['pledge', 'createCommission', 'simpleAction']) {
+    assert.match(functionBody(CLIENT, action), /await reconcile\(/,
+      `${action} must reconcile the account it changed against the confirming slot`);
+  }
+});
+
+test('commission updates arrive by push, with no polling loop', () => {
+  // One websocket subscription costs nothing per update and covers other
+  // people\u2019s activity too, so a backer\u2019s pledge or an agent\u2019s delivery appears
+  // without anyone reloading.
+  assert.match(CLIENT, /onProgramAccountChange/,
+    'the client must subscribe to commission account changes');
+  const subscribe = functionBody(CLIENT, 'subscribeToCommissions');
+  assert.match(subscribe, /state\.subscription\s*!=\s*null/,
+    'the subscription must not be opened twice');
+  assert.equal(/setInterval/.test(CLIENT), false,
+    'live updates must be pushed, never polled on a timer');
+
+  const apply = functionBody(CLIENT, 'applyLiveUpdate');
+  assert.match(apply, /decodeCommission/,
+    'a pushed account must be decoded rather than triggering a full rescan');
+  assert.match(apply, /INPUT\|TEXTAREA\|SELECT/,
+    'an open dialog must not be redrawn while the user is typing into it');
+});
+
+test('every signing path reports what it is waiting for', () => {
+  // A click that opens a wallet app and then sits silent is indistinguishable
+  // from a button that did nothing.
+  const send = functionBody(CLIENT, 'send');
+  assert.match(send, /onStage\('Approve in your wallet/, 'send must say it is waiting on the wallet');
+  assert.match(send, /onStage\('Confirming on Solana/, 'send must say it is waiting on the network');
+
+  for (const action of ['pledge', 'createCommission', 'simpleAction']) {
+    assert.match(functionBody(CLIENT, action), /send\([^)]*,\s*showProgress\)|showProgress\)/,
+      `${action} must pass the progress reporter to send`);
+    assert.match(functionBody(CLIENT, action), /hideProgress\(\)/,
+      `${action} must clear the progress indicator when it finishes`);
+  }
+
+  // And a failure must never leave the spinner running forever.
+  assert.match(functionBody(CLIENT, 'showError'), /hideProgress\(\)/,
+    'an error must clear the in-progress indicator');
+});

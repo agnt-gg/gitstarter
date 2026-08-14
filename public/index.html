@@ -401,6 +401,16 @@ table.t tr:last-child td{border-bottom:0}
   display:flex;align-items:center;gap:8px;
 }
 .toast.on{transform:translateX(-50%) translateY(0);opacity:1}
+/* A signature can take many seconds and usually means leaving the page for a
+   wallet app. Without a live indicator that wait is indistinguishable from a
+   button that silently did nothing. */
+.toast .spin{
+  width:14px;height:14px;flex:none;border-radius:50%;
+  border:2px solid rgba(255,255,255,.3);border-top-color:currentColor;
+  animation:toastspin .7s linear infinite;
+}
+@keyframes toastspin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.toast .spin{animation-duration:2.4s}}
 @media(max-width:760px){
   .toast{top:12px;bottom:auto;transform:translateX(-50%) translateY(-80px);max-width:calc(100vw - 24px)}
   .toast.on{transform:translateX(-50%) translateY(0)}
@@ -572,7 +582,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 <div class="overlay" id="overlay"><div class="dlg" id="dlg"></div></div>
 <div class="toast" id="toast"></div>
 
-<script src="/app.js?v=20260814-metamask-chain" defer></script>
+<script src="/app.js?v=20260814-live-updates" defer></script>
 
 </body>
 </html>
