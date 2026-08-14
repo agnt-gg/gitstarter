@@ -92,7 +92,26 @@ async function connectMetaMask(silent=false){
     publicKey:new PublicKey(account.address),
     async connect(){return {publicKey:new PublicKey(account.address)};},
     async signMessage(message){const [result]=await wallet.features['solana:signMessage'].signMessage({account,message});return result.signature;},
-    async signTransaction(transaction){const [result]=await wallet.features['solana:signTransaction'].signTransaction({account,transaction:transaction.serialize({requireAllSignatures:false,verifySignatures:false}),chain});return Transaction.from(result.signedTransaction);}
+
+    // MetaMask must sign AND send, because only that path reads the chain.
+    //
+    // `standard:connect` opens the session on mainnet by default, and
+    // `solana:signTransaction` ignores the `chain` argument entirely — it signs
+    // against whatever scope the session already has. Every transaction we built
+    // for devnet was therefore handed to MetaMask as a mainnet transaction, where
+    // this program does not exist and the blockhash is meaningless, so MetaMask
+    // rejected it during its own simulation before anything reached the network.
+    //
+    // `solana:signAndSendTransaction` derives the scope from `chain` and
+    // re-scopes the session to devnet when needed, which is exactly what we want.
+    async signAndSendTransaction(transaction){
+      const [result]=await wallet.features['solana:signAndSendTransaction'].signAndSendTransaction({
+        account,
+        transaction:transaction.serialize({requireAllSignatures:false,verifySignatures:false}),
+        chain,
+      });
+      return bs58Encode(result.signature);
+    },
   };
 }
 function openWalletModal(){
@@ -204,8 +223,34 @@ async function restoreSession(){
 }
 function bs58Encode(bytes){const alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';let digits=[0];for(const byte of bytes){let carry=byte;for(let j=0;j<digits.length;j++){carry+=digits[j]<<8;digits[j]=carry%58;carry=(carry/58)|0;}while(carry){digits.push(carry%58);carry=(carry/58)|0;}}let out='';for(let k=0;k<bytes.length&&bytes[k]===0;k++)out+='1';for(let q=digits.length-1;q>=0;q--)out+=alphabet[digits[q]];return out;}
 async function send(transaction){
-  const provider=walletProvider(); if(!provider)throw new Error('Connect your wallet first'); transaction.feePayer=state.wallet; transaction.recentBlockhash=(await state.connection.getLatestBlockhash('confirmed')).blockhash;
-  const signed=await provider.signTransaction(transaction); const sig=await state.connection.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3}); await state.connection.confirmTransaction(sig,'confirmed'); return sig;
+  const provider=walletProvider(); if(!provider)throw new Error('Connect your wallet first');
+  transaction.feePayer=state.wallet;
+  transaction.recentBlockhash=(await state.connection.getLatestBlockhash('confirmed')).blockhash;
+
+  // Simulate on our own connection first, so a program rejection is reported in
+  // our words. A transaction that reaches the wallet and fails there comes back
+  // as the wallet's own generic "reverted during simulation", which names
+  // neither the cause nor the fix.
+  let simulation=null;
+  try{simulation=await state.connection.simulateTransaction(transaction);}
+  catch{/* An RPC hiccup is not a verdict; fall through and let the wallet try. */}
+  if(simulation?.value?.err){
+    const code=simulation.value.err?.InstructionError?.[1]?.Custom;
+    const name=code!=null?escrow.ERRORS[code]:null;
+    throw new Error(name?(escrow.ERROR_HELP[name]||`The program rejected this: ${name}.`):`The network rejected this transaction: ${JSON.stringify(simulation.value.err)}`);
+  }
+
+  // Wallets that sign and send in one step keep their own network scope aligned
+  // with the chain we ask for; wallets that only sign leave submission to us.
+  if(typeof provider.signAndSendTransaction==='function'){
+    const sig=await provider.signAndSendTransaction(transaction);
+    await state.connection.confirmTransaction(sig,'confirmed');
+    return sig;
+  }
+  const signed=await provider.signTransaction(transaction);
+  const sig=await state.connection.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});
+  await state.connection.confirmTransaction(sig,'confirmed');
+  return sig;
 }
 async function refresh(){
   state.metadata=await api('/api/commissions'); const meta=new Map(state.metadata.map(m=>[m.address,m]));

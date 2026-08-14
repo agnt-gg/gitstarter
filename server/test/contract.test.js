@@ -114,3 +114,51 @@ test('client-side bounds are sourced from the program, never hardcoded', () => {
     'the deadline hint hardcodes a day count that will silently go stale',
   );
 });
+
+test('MetaMask transactions are signed on the chain we asked for', () => {
+  // `standard:connect` opens the MetaMask session on MAINNET by default, and
+  // `solana:signTransaction` ignores the `chain` argument entirely — it signs
+  // against whatever scope the session already holds. Using it meant every
+  // devnet transaction was presented to MetaMask as a mainnet one, where this
+  // program does not exist, so the wallet rejected it during its own simulation
+  // and nothing ever reached the network.
+  //
+  // `solana:signAndSendTransaction` derives the scope from `chain` and
+  // re-scopes the session. It is the only correct path for this wallet.
+  const adapter = functionBody(CLIENT, 'connectMetaMask');
+  assert.ok(
+    adapter.includes("'solana:signAndSendTransaction'"),
+    'the MetaMask adapter must sign and send through the chain-aware feature',
+  );
+  assert.equal(
+    adapter.includes("'solana:signTransaction'"), false,
+    'solana:signTransaction ignores `chain` and signs on the session scope, which defaults to mainnet',
+  );
+  // The chain has to actually be handed over, not merely computed. Slice the
+  // call by index: a non-greedy regex stops at the first `})`, which here is the
+  // nested `serialize({...})`, and would miss the argument entirely.
+  const callStart = adapter.indexOf('.signAndSendTransaction({');
+  assert.notEqual(callStart, -1, 'could not find the signAndSendTransaction call');
+  const callEnd = adapter.indexOf('bs58Encode', callStart);
+  assert.notEqual(callEnd, -1, 'the signed result must be encoded and returned');
+  assert.match(
+    adapter.slice(callStart, callEnd), /\bchain\b/,
+    'the chain must be passed to signAndSendTransaction, not merely computed',
+  );
+});
+
+test('send prefers a wallet that signs and sends, and simulates first', () => {
+  const send = functionBody(CLIENT, 'send');
+  assert.match(
+    send, /typeof provider\.signAndSendTransaction\s*===\s*.function./,
+    'send must use a wallet-side sign-and-send path when the wallet offers one',
+  );
+  assert.match(
+    send, /simulateTransaction/,
+    'send must simulate on our own connection so a rejection is explained in our words',
+  );
+  assert.match(
+    send, /escrow\.ERRORS\[code\]/,
+    'a simulation failure must be mapped to the program error name, not shown raw',
+  );
+});
