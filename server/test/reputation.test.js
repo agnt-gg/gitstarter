@@ -108,6 +108,50 @@ test('earnings are the milestone slice less the connection fee', () => {
   );
 });
 
+test('history from before the index existed is recovered, in the right order', () => {
+  // The deliveries this ran on had already been swept when the index shipped,
+  // so the chain could no longer be asked. Every one of them was recorded at
+  // submission time by an agent proving their evidence against the on-chain
+  // commitment, which is the same information captured earlier.
+  //
+  // Queue position was never stored and does not need to be: the program
+  // assigns it in order of arrival, so ordering by the timestamp the chain
+  // itself reported reproduces it exactly.
+  const os = require('node:os');
+  const file = path.join(os.tmpdir(), `gitstarter-backfill-${process.pid}.sqlite`);
+  fs.rmSync(file, { force: true });
+  const { openDatabase } = require('../db');
+
+  const seed = openDatabase(file);
+  const insert = seed.prepare(`INSERT INTO deliveries
+    (commission, milestone_index, evidence_hash, evidence, agent, submitted_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  // A rival delivered first and a real implementation second, which is the
+  // shape that decides who was rejected and who was paid.
+  insert.run('C1', 0, 'aa'.repeat(32), 'stub', 'RIVAL', 1_000, 1);
+  insert.run('C1', 0, 'bb'.repeat(32), 'real work', 'ME', 1_010, 2);
+  insert.run('C1', 1, 'cc'.repeat(32), 'second milestone', 'ME', 1_020, 3);
+  seed.close();
+
+  const recovered = openDatabase(file);
+  const rows = recovered.prepare('SELECT * FROM delivery_history ORDER BY milestone_index, sequence').all();
+  assert.deepEqual(
+    rows.map(r => [r.milestone_index, r.sequence, r.agent]),
+    [[0, 0, 'RIVAL'], [0, 1, 'ME'], [1, 0, 'ME']],
+    'arrival order must reproduce the queue the program actually assigned',
+  );
+  assert.ok(rows.every(r => r.last_state === 'pending'),
+    'a recovered row states no verdict; the outcome is reconciled from chain counters');
+  recovered.close();
+
+  // Opening again must not duplicate a single delivery.
+  const reopened = openDatabase(file);
+  assert.equal(reopened.prepare('SELECT COUNT(*) AS n FROM delivery_history').get().n, 3,
+    'the recovery must be idempotent, or every restart inflates an agent\'s record');
+  reopened.close();
+  fs.rmSync(file, { force: true });
+});
+
 test('reputation reads from the durable index, not from live accounts', () => {
   // The regression itself: deriving an agent's history from accounts that
   // settlement deletes is what erased it.

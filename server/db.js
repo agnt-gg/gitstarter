@@ -100,6 +100,26 @@ function openDatabase(filename) {
     );
     CREATE INDEX IF NOT EXISTS intent_history_agent ON intent_history(agent);
   `);
+
+  // Recover the deliveries made before this index existed.
+  //
+  // Their submission accounts have already been swept, so the chain no longer
+  // remembers them — but every one of them was recorded here at submission time
+  // by an agent proving their evidence against the on-chain commitment. That is
+  // the same information, captured earlier.
+  //
+  // Queue position is not stored, and does not need to be: the program assigns
+  // it in order of arrival, so ordering by the timestamp the chain itself
+  // reported reproduces it exactly. Nothing is invented, and the outcome is
+  // still reconciled against the commission's own counters at read time.
+  db.exec(`
+    INSERT OR IGNORE INTO delivery_history
+      (commission, milestone_index, agent, sequence, submitted_at, evidence_hash, last_state, first_seen, last_seen)
+    SELECT commission, milestone_index, agent,
+      ROW_NUMBER() OVER (PARTITION BY commission, milestone_index ORDER BY submitted_at, created_at) - 1,
+      submitted_at, evidence_hash, 'pending', submitted_at, submitted_at
+    FROM deliveries;
+  `);
   return db;
 }
 module.exports = { openDatabase };
