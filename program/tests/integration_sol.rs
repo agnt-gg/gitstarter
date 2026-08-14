@@ -366,9 +366,12 @@ async fn sol_refund_returns_full_unreleased_pledge_with_zero_fee() {
     )
     .await
     .unwrap();
+    // A refund now also closes the pledge account, so the backer receives their
+    // escrow plus the rent that account was holding: (128 + 83) * 6960.
+    const PLEDGE_RENT: u64 = (128 + 83) * 6960;
     assert_eq!(
         balance(&mut ctx, backer.pubkey()).await - backer_before,
-        1_000_000
+        1_000_000 + PLEDGE_RENT
     );
     assert_eq!(balance(&mut ctx, treasury.pubkey()).await, treasury_before);
     let c = commission(&mut ctx, commission_key).await;

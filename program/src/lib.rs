@@ -192,6 +192,7 @@ pub enum EscrowError {
     ReviewWindowOpen = 29,
     BadWindow = 30,
     SubmissionPending = 31,
+    NotSettled = 32,
 }
 
 impl From<EscrowError> for ProgramError {
@@ -492,6 +493,24 @@ pub enum Instruction {
     ///     recording the refusal publicly. The agent may submit again.
     /// Accounts: [creator(s)] [commission(w)]
     RejectDelivery,
+
+    /// 12. Backer reclaims the rent on a pledge account that can never be used
+    ///     again, on the path where refunds never happen.
+    ///
+    /// A refund already closes the pledge it settles. This covers the other
+    /// ending: a commission that shipped, where every lamport was released to
+    /// the agent and no backer will ever call Refund, so the account would
+    /// otherwise sit on chain holding rent forever.
+    /// Accounts: [backer(s,w)] [commission(w)] [pledge(w)]
+    ClosePledge,
+
+    /// 13. Returns the vault's rent reserve to the creator once the escrow is
+    ///     empty and no further movement is possible.
+    ///
+    /// Anyone may call it; the lamports always go to the creator who paid for
+    /// the account, so there is nothing to gain by racing it.
+    /// Accounts: [signer(s)] [commission(w)] [vault(w)] [creator(w)]
+    CloseVault,
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -540,6 +559,26 @@ fn save<T: BorshSerialize>(ai: &AccountInfo, v: &T) -> ProgramResult {
         return Err(ProgramError::AccountDataTooSmall);
     }
     d[..bytes.len()].copy_from_slice(&bytes);
+    Ok(())
+}
+
+/// Drains a program-owned account to `destination` and blanks it, so the runtime
+/// reclaims it when the transaction ends and its rent goes back to whoever paid.
+///
+/// The data is zeroed rather than merely abandoned. Every load in this program
+/// checks a tag byte first, so clearing it means an account closed earlier in a
+/// transaction cannot be read back as a live one later in that same transaction.
+fn close_account(account: &AccountInfo, destination: &AccountInfo) -> ProgramResult {
+    let reclaimed = account.lamports();
+    **account.try_borrow_mut_lamports()? = 0;
+    **destination.try_borrow_mut_lamports()? = destination
+        .lamports()
+        .checked_add(reclaimed)
+        .ok_or(EscrowError::MathOverflow)?;
+    let mut data = account.try_borrow_mut_data()?;
+    for byte in data.iter_mut() {
+        *byte = 0;
+    }
     Ok(())
 }
 
@@ -634,6 +673,8 @@ pub fn process_instruction(
             evidence_hash,
         } => submit_delivery(program_id, accounts, index, evidence_hash),
         Instruction::RejectDelivery => reject_delivery(program_id, accounts),
+        Instruction::ClosePledge => close_pledge(program_id, accounts),
+        Instruction::CloseVault => close_vault(program_id, accounts),
     }
 }
 
@@ -936,6 +977,12 @@ fn pledge(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Program
         let existing = Pledge::try_from_slice(&d).map_err(|_| ProgramError::InvalidAccountData)?;
         if existing.commission != *commission_ai.key || existing.backer != *backer.key {
             return Err(EscrowError::BadPda.into());
+        }
+        // A settled pledge is a closed chapter. Topping one up would let a stale
+        // record from an earlier commission at this address be inflated, so the
+        // only thing to do with it is refuse.
+        if existing.fully_refunded {
+            return Err(EscrowError::NothingToRefund.into());
         }
         existing
     };
@@ -1414,7 +1461,128 @@ fn refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 .ok_or(EscrowError::MathOverflow)?;
         }
     }
-    msg!("refunded {} lamports to backer, fee {}", net, fee);
+    // The pledge account has done its work, so give its rent back rather than
+    // leaving it on chain forever. This is safe precisely because a commission
+    // that can be refunded can never be pledged to again: Pledge requires status
+    // Funding and a deadline still ahead, while Refund requires Cancelled, or an
+    // expired funding deadline, or an expired delivery clock. The two conditions
+    // are mutually exclusive, so no re-pledge can resurrect this account, and a
+    // replayed refund now fails its owner check instead of its settled flag.
+    let reclaimed = pledge_ai.lamports();
+    close_account(pledge_ai, backer)?;
+    msg!(
+        "refunded {} lamports to backer, fee {}, rent {} reclaimed",
+        net,
+        fee,
+        reclaimed
+    );
+    Ok(())
+}
+
+// 12 ── ClosePledge ──────────────────────────────────────────────────────
+//
+// Refund reclaims its own pledge account. This is the other ending: a commission
+// that shipped, where every lamport went to the agent and no backer will ever
+// call Refund, so without this the account holds rent for nothing forever.
+fn close_pledge(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let ai = &mut accounts.iter();
+    let backer = next_account_info(ai)?;
+    let commission_ai = next_account_info(ai)?;
+    let pledge_ai = next_account_info(ai)?;
+    assert_signer(backer)?;
+
+    let mut c = load_commission(commission_ai, program_id)?;
+    assert_pda(
+        &[SEED_PLEDGE, commission_ai.key.as_ref(), backer.key.as_ref()],
+        program_id,
+        pledge_ai,
+    )?;
+    assert_owned_by_program(pledge_ai, program_id)?;
+    let p = {
+        let d = pledge_ai.try_borrow_data()?;
+        if d.is_empty() || d[0] != TAG_PLEDGE {
+            return Err(EscrowError::BadAccountTag.into());
+        }
+        Pledge::try_from_slice(&d).map_err(|_| ProgramError::InvalidAccountData)?
+    };
+    // Only your own pledge, and only ever back to you.
+    if p.backer != *backer.key || p.commission != *commission_ai.key {
+        return Err(EscrowError::Unauthorized.into());
+    }
+
+    // Closable only once this pledge can no longer be part of any settlement.
+    // An already-refunded record qualifies — that covers pledges settled before
+    // this instruction existed, whose accounts were left behind. Otherwise the
+    // escrow must be empty on a shipped commission, where `escrow_remaining` is
+    // zero by construction and a refund could only ever return nothing.
+    let settled = p.fully_refunded || (c.status == Status::Delivered && c.escrow_remaining()? == 0);
+    if !settled {
+        return Err(EscrowError::NotSettled.into());
+    }
+
+    // Count it as settled so the commission knows every pledge account is gone.
+    // On the shipped path there is no escrow left to sweep, so this cannot
+    // disturb the dust-sweep arithmetic that `is_last` drives during refunds.
+    if !p.fully_refunded {
+        c.refunded_pledger_count = c
+            .refunded_pledger_count
+            .checked_add(1)
+            .ok_or(EscrowError::MathOverflow)?;
+        save(commission_ai, &c)?;
+    }
+
+    let reclaimed = pledge_ai.lamports();
+    close_account(pledge_ai, backer)?;
+    msg!("pledge closed, {} lamports of rent reclaimed", reclaimed);
+    Ok(())
+}
+
+// 13 ── CloseVault ───────────────────────────────────────────────────────
+//
+// The vault is a rent-exempt account holding nothing but escrow. Once the escrow
+// is gone that reserve is dead weight, and it belongs to the creator who paid it.
+fn close_vault(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let ai = &mut accounts.iter();
+    let signer = next_account_info(ai)?;
+    let commission_ai = next_account_info(ai)?;
+    let vault_ai = next_account_info(ai)?;
+    let creator = next_account_info(ai)?;
+    assert_signer(signer)?;
+
+    let c = load_commission(commission_ai, program_id)?;
+    assert_pda(
+        &[SEED_VAULT, commission_ai.key.as_ref()],
+        program_id,
+        vault_ai,
+    )?;
+    if vault_ai.owner != program_id {
+        return Err(EscrowError::BadOwner.into());
+    }
+    // The rent goes to whoever paid for the account, never to the caller, so
+    // anyone may run this as a cleanup crank without anything to gain by it.
+    if c.creator != *creator.key {
+        return Err(EscrowError::Unauthorized.into());
+    }
+
+    // Nothing may still be owed.
+    if c.escrow_remaining()? != 0 {
+        return Err(EscrowError::NotSettled.into());
+    }
+    // And nothing may still be owable. A commission still raising or building
+    // can take pledges or pay milestones, both of which need this account.
+    if !matches!(c.status, Status::Delivered | Status::Cancelled) {
+        return Err(EscrowError::BadStatus.into());
+    }
+    // On a cancelled commission a backer who has not settled yet still has to be
+    // able to call Refund, which reads this account. Shipped commissions have no
+    // such caller: every lamport was released.
+    if c.status == Status::Cancelled && c.refunded_pledger_count != c.pledger_count {
+        return Err(EscrowError::NotSettled.into());
+    }
+
+    let reclaimed = vault_ai.lamports();
+    close_account(vault_ai, creator)?;
+    msg!("vault closed, {} lamports of rent reclaimed", reclaimed);
     Ok(())
 }
 
@@ -1442,8 +1610,9 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // in the same slot, and the escrow is gone before the agent can be re-hired
     // or resubmit. The delivery clock is supposed to keep running across a
     // rejection; this is what makes that promise real rather than decorative.
-    let creator_may_cancel =
-        is_creator && matches!(c.status, Status::Funding | Status::Funded) && c.delivery_deadline == 0;
+    let creator_may_cancel = is_creator
+        && matches!(c.status, Status::Funding | Status::Funded)
+        && c.delivery_deadline == 0;
     // The contracted agent may always walk away. Surrendering their own claim
     // cannot harm backers — it only releases the remaining escrow for refund
     // immediately instead of making everyone wait out the deadline.

@@ -56,8 +56,22 @@ const CLAIM_GRACE_WINDOW_SECONDS = 86_400;
 // Pinned by program/src/lib.rs::commission_account_size_is_pinned. If these two
 // ever disagree, every commission silently fails to decode.
 const COMMISSION_ACCOUNT_BYTES = 316;
-/// Rent reserve of the 0-byte vault PDA. It is not escrow and is never payable.
+// Rent-exemption minimums. Solana charges for 128 bytes of account overhead plus
+// the account's own data, at 6960 lamports per byte. These are locked up for as
+// long as the account exists, which on a small bounty is a real percentage of
+// the commission — so accounts that can never be used again give theirs back.
+
+/// Rent reserve of the 0-byte vault PDA. It is not escrow and is never payable
+/// to an agent; it returns to the creator once the escrow is empty.
 const VAULT_RENT_LAMPORTS = 890_880;
+/// Rent held by an 83-byte pledge account, returned to its backer on refund or
+/// once a shipped commission has paid out.
+const PLEDGE_RENT_LAMPORTS = (128 + 83) * 6_960;
+/// Rent held by the 316-byte commission account. This one is NOT reclaimable and
+/// is not meant to be: the account is the permanent public record that
+/// reputation is computed from, and leaving it in place is also what stops its
+/// seed being reused while stale pledge accounts could still exist.
+const COMMISSION_RENT_LAMPORTS = (128 + 316) * 6_960;
 
 const SEED_COMMISSION = Buffer.from('commission');
 const SEED_VAULT = Buffer.from('vault');
@@ -77,6 +91,8 @@ const IX = {
   revokeAgent: 9,
   submitDelivery: 10,
   rejectDelivery: 11,
+  closePledge: 12,
+  closeVault: 13,
 };
 
 const STATUS = ['funding', 'funded', 'building', 'shipped', 'refunded'];
@@ -123,6 +139,7 @@ const ERRORS = {
   29: 'ReviewWindowOpen',
   30: 'BadWindow',
   31: 'SubmissionPending',
+  32: 'NotSettled',
 };
 
 const ERROR_HELP = {
@@ -151,6 +168,7 @@ const ERROR_HELP = {
   ReviewWindowOpen: 'The review window has not finished, so only the creator can act yet.',
   BadWindow: 'Delivery and review windows must be between one hour and their maximums.',
   SubmissionPending: 'A delivery is awaiting review. It must be released or rejected first.',
+  NotSettled: 'This account is still in use. Rent can only be reclaimed once the commission has fully settled.',
 };
 
 function u64(value) { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(value)); return b; }
@@ -245,6 +263,26 @@ function reviewExpired(c, nowUnix = Math.floor(Date.now() / 1000)) {
 /// delivered cannot lose a race to a fast backer.
 function claimProtected(c, nowUnix = Math.floor(Date.now() / 1000)) {
   return !!c.submission && nowUnix < c.submission.reviewEndsAt + CLAIM_GRACE_WINDOW_SECONDS;
+}
+
+/// What rent, if any, `wallet` can currently reclaim from this commission.
+///
+/// A pledge account is closed automatically by a refund, so the only case that
+/// needs asking for is a commission that shipped: every lamport went to the
+/// agent, no refund will ever be called, and the account would otherwise hold
+/// its rent forever. The vault's reserve returns to the creator once the escrow
+/// is empty and nobody can still need it.
+function reclaimableRent(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
+  const claims = [];
+  const settled = c.released + c.refunded >= c.pledged;
+  if (c.status === 'shipped' && settled && wallet && c.pledgerCount > 0) {
+    claims.push({ kind: 'pledge', lamports: PLEDGE_RENT_LAMPORTS, to: wallet });
+  }
+  const everyBackerSettled = c.refundedPledgerCount >= c.pledgerCount;
+  if (settled && (c.status === 'shipped' || (c.status === 'refunded' && everyBackerSettled))) {
+    claims.push({ kind: 'vault', lamports: VAULT_RENT_LAMPORTS, to: c.creator });
+  }
+  return { claims, total: claims.reduce((sum, claim) => sum + claim.lamports, 0), nowUnix };
 }
 
 /// Whether a refund from this commission will be charged the connection fee.
@@ -412,6 +450,43 @@ const build = {
     };
   },
 
+  /// Returns an 83-byte pledge account's rent to its backer, on the shipped path
+  /// where no refund will ever close it.
+  closePledge(ctx, { backer, commission }) {
+    const pledge = pledgePda(ctx.programId, commission, backer);
+    return {
+      commission: key(commission), pledge,
+      instruction: ix({
+        programId: key(ctx.programId),
+        keys: [
+          meta(backer, true, true),
+          meta(commission, false, true),
+          meta(pledge, false, true),
+        ],
+        data: Buffer.from([IX.closePledge]),
+      }),
+    };
+  },
+
+  /// Returns the vault's rent reserve to the creator once the escrow is empty.
+  /// Anyone may send this; the lamports always go to the creator regardless.
+  closeVault(ctx, { signer, commission, creator }) {
+    const vault = vaultPda(ctx.programId, commission);
+    return {
+      commission: key(commission), vault,
+      instruction: ix({
+        programId: key(ctx.programId),
+        keys: [
+          meta(signer, true, false),
+          meta(commission, false, true),
+          meta(vault, false, true),
+          meta(creator, false, true),
+        ],
+        data: Buffer.from([IX.closeVault]),
+      }),
+    };
+  },
+
   cancel(ctx, { signer, commission }) {
     return {
       commission: key(commission),
@@ -484,6 +559,13 @@ function availableActions(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
       || deliveryExpired;
     if (refundable) actions.push('refund');
   }
+
+  // Reclaiming rent is never urgent and never affects escrow, so it is offered
+  // last and only once the account genuinely cannot be needed again.
+  for (const claim of reclaimableRent(c, wallet, nowUnix).claims) {
+    if (claim.kind === 'pledge' && wallet) actions.push('closePledge');
+    if (claim.kind === 'vault') actions.push('closeVault');
+  }
   return [...new Set(actions)];
 }
 
@@ -504,7 +586,8 @@ module.exports = {
   MIN_DELIVERY_WINDOW_SECONDS, MAX_DELIVERY_WINDOW_SECONDS, DEFAULT_DELIVERY_WINDOW_SECONDS,
   MIN_REVIEW_WINDOW_SECONDS, MAX_REVIEW_WINDOW_SECONDS, DEFAULT_REVIEW_WINDOW_SECONDS,
   NOMINATION_WINDOW_SECONDS, CLAIM_GRACE_WINDOW_SECONDS,
-  reviewExpired, claimProtected, refundCarriesFee,
+  PLEDGE_RENT_LAMPORTS, COMMISSION_RENT_LAMPORTS,
+  reviewExpired, claimProtected, refundCarriesFee, reclaimableRent,
   IX, STATUS, ERRORS, ERROR_HELP,
   commissionPda, vaultPda, pledgePda, decodeCommission, escrowRemaining,
   build, availableActions, explainError, canBuildTransactions,

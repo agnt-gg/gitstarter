@@ -294,7 +294,21 @@ test('the docs explain how a silent creator is handled', () => {
 test('the docs disclose the limitations that affect money', () => {
   for (const [name, doc] of Object.entries(DOCS)) {
     assert.ok(/no (independent )?(on-chain )?arbitrat/i.test(doc), `${name} must disclose the lack of arbitration`);
-    assert.ok(/rent is not reclaimable|not reclaimable/i.test(doc), `${name} must disclose unreclaimable rent`);
+    // Most rent now comes back, so the disclosure that matters changed: it is
+    // the commission account specifically that is permanent. Vague wording
+    // would let a future reader assume all of it returns.
+    assert.ok(
+      /commission account/i.test(doc) && /(never|not reclaimable|by design|permanent)/i.test(doc),
+      `${name} must disclose that the commission account's rent is permanent`,
+    );
+    assert.ok(
+      doc.includes('0.0030902'),
+      `${name} must state how much rent stays on chain per commission`,
+    );
+    assert.ok(
+      doc.includes('0.00146856') && doc.includes('0.00089088'),
+      `${name} must state the pledge and vault rent a user can actually reclaim`,
+    );
     assert.ok(/no independent professional audit/i.test(doc), `${name} must disclose the audit status`);
   }
 });

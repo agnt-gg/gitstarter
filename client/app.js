@@ -400,6 +400,16 @@ function openProject(address){
   }
   if((p.status==='funding'||p.status==='funded')&&wallet===p.creator)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Cancel commission</button></div>`;
   if(p.status==='refunded'&&wallet)actions=`<div class="action-row"><button class="btn primary" data-action="refund" data-id="${p.address}">Claim available refund</button></div>`;
+  // Rent sitting in accounts that can never be used again is just locked SOL,
+  // so offer it back. This never touches escrow, which is why it is listed last
+  // and phrased as housekeeping rather than as part of the contract.
+  if(wallet){
+    const claims=escrow.reclaimableRent(p,wallet).claims;
+    const mine=claims.filter(claim=>claim.kind==='pledge');
+    const vault=claims.find(claim=>claim.kind==='vault');
+    if(mine.length)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="closePledge" data-id="${p.address}">Reclaim ${fmtBase(escrow.PLEDGE_RENT_LAMPORTS)} SOL pledge rent</button></div><p class="hint" style="margin-top:8px">This commission has paid out in full, so your pledge account is finished. Closing it returns the rent it was holding. Nothing else will close it for you, because no refund is coming.</p>`;
+    if(vault)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="closeVault" data-id="${p.address}">Return ${fmtBase(escrow.VAULT_RENT_LAMPORTS)} SOL vault rent to the creator</button></div><p class="hint" style="margin-top:8px">The escrow is empty and nobody can need this account again. Anyone can send this; the rent goes to ${esc(p.creator.slice(0,8))}\u2026 either way.</p>`;
+  }
   if(!wallet)actions='<p class="hint">Connect a wallet to pledge or manage this commission.</p>';
   else if(!actions)actions='<p class="hint">No action is available to this wallet at the current contract stage.</p>';
   $('dlg').className='dlg';
@@ -471,6 +481,8 @@ async function simpleAction(action,address,index){
   else if(action==='cancel')built=escrow.build.cancel(ESCROW_CTX,{signer:state.wallet,commission:address});
   else if(action==='release')built=escrow.build.releaseMilestone(ESCROW_CTX,{creator:state.wallet,commission:address,agent:p.agent,milestoneIndex:Number(index)});
   else if(action==='refund')built=escrow.build.refund(ESCROW_CTX,{backer:state.wallet,commission:address});
+  else if(action==='closePledge')built=escrow.build.closePledge(ESCROW_CTX,{backer:state.wallet,commission:address});
+  else if(action==='closeVault')built=escrow.build.closeVault(ESCROW_CTX,{signer:state.wallet,commission:address,creator:p.creator});
   else if(action==='submit'){
     const evidence=($('deliveryEvidence')?.value||'').trim();
     if(!evidence)throw new Error('Describe what you delivered: a commit URL, a PR link, or an artifact hash.');
@@ -493,7 +505,9 @@ async function simpleAction(action,address,index){
     submit:'Delivery submitted. The review clock is running.',
     reject:'Delivery rejected. The commission is back in the pool.',
     release:'Milestone released. The agent has been paid.',
-    refund:'Refund complete.',
+    refund:'Refund complete \u2014 your escrow and your pledge rent are back.',
+    closePledge:'Pledge account closed. Its rent is back in your wallet.',
+    closeVault:'Vault closed. Its rent has gone back to the creator.',
     cancel:'Commission cancelled. Backers can withdraw.',
   }[action]||'Done.');
 }

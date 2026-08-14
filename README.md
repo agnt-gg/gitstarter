@@ -122,6 +122,29 @@ themselves as the paid agent; the program rejects it.
 | Refund, when no delivery was ever submitted | 0% |
 | Create / nominate / accept / revoke / cancel / reject | 0% |
 
+## Rent, and getting it back
+
+Solana requires every account to be rent-exempt, which locks SOL up for as long
+as the account exists. A commission opens up to three kinds:
+
+| Account | Rent | Comes back |
+|---|---|---|
+| Pledge, one per backer | 0.00146856 SOL | Yes — automatically on refund, or via `close-pledge` once shipped |
+| Vault | 0.00089088 SOL | Yes — to the creator via `close-vault` once the escrow is empty |
+| Commission | 0.0030902 SOL | **No, by design** |
+
+The commission account stays open on purpose. It is the permanent public record
+that `/api/v1/reputation/:wallet` is computed from, so closing it would erase
+the history that makes a creator's conduct checkable. It also keeps the account's
+seed occupied: if a commission could be closed, its address could be recreated
+with the same seed while a stale pledge account still pointed at it, and that
+pledge's recorded amount could be inflated against the new commission's escrow.
+
+Closing is only ever permitted once an account provably cannot be used again.
+A refund closes its own pledge account, which is safe because a commission that
+can be refunded can never be pledged to again — Pledge requires a live funding
+phase, Refund requires an ended one, and the two can never overlap.
+
 Solana network fees (~5000 lamports per signature) always apply and go to
 validators, not to GitStarter. The protocol fee is a compile-time constant, not
 a config value: changing it requires shipping a visibly new program, not
@@ -314,6 +337,8 @@ this), `accounts` (each with signer/writable flags), `feePayer`,
 | `submit-delivery` | `agent`, `commission`, `milestoneIndex`, `evidence` or `evidenceHash` | agent |
 | `reject-delivery` | `creator`, `commission` | creator |
 | `refund` | `backer`, `commission` | backer |
+| `close-pledge` | `backer`, `commission` | backer |
+| `close-vault` | `signer`, `commission` | anyone |
 | `cancel` | `signer`, `commission` | creator, agent, or anyone after the deadline |
 
 ```sh
@@ -397,6 +422,8 @@ integers are little-endian.
 | 9 | RevokeAgent | — | signer(s), commission(w) |
 | 10 | SubmitDelivery | `index` u8, `evidence_hash` [u8; 32] | agent(s), commission(w) |
 | 11 | RejectDelivery | — | creator(s), commission(w) |
+| 12 | ClosePledge | — | backer(s,w), commission(w), pledge(w) |
+| 13 | CloseVault | — | signer(s), commission(w), vault(w), creator(w) |
 
 `(s)` = signer, `(w)` = writable. `system` is `11111111111111111111111111111111`.
 
@@ -524,6 +551,7 @@ Returned as `custom program error: 0x<hex>`.
 | 29 | ReviewWindowOpen | The review window has not finished yet |
 | 30 | BadWindow | Delivery or review window outside its allowed range |
 | 31 | SubmissionPending | A delivery is awaiting review and blocks this action |
+| 32 | NotSettled | The account is still in use; rent cannot be reclaimed yet |
 
 ### Reusing the encoder
 
@@ -669,9 +697,14 @@ Read these before committing real money.
   delivery deadline: 30 days funding + 30 days delivery + 14 days review + 1 day
   claim grace. Typical settings are days. The clocks are visible on every
   commission before you pledge.
-- **Account rent is not reclaimable** in this version: ~0.0035 SOL per
-  commission and ~0.0014 SOL per backer stays on chain permanently. On very
-  small commissions that is a real percentage.
+- **Most account rent comes back now.** A refund returns the backer's pledge rent
+  (0.00146856 SOL) along with their escrow, automatically. On a commission that
+  shipped, backers reclaim the same amount with `close-pledge`, and the vault's
+  0.00089088 SOL reserve returns to the creator with `close-vault`. What stays
+  on chain permanently is the commission account itself, 0.0030902 SOL. That is
+  deliberate: it is the public record reputation is computed from, and leaving
+  it in place is also what stops its seed being reused while a stale pledge
+  account could still exist.
 - **No independent professional audit.** The program has had adversarial review,
   a regression test for every fixed defect, and on-chain verification that the
   deployed binary enforces them — but that is not a security firm signing off.

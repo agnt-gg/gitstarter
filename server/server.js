@@ -305,6 +305,24 @@ function presentCommission(address, chain, meta, wallet) {
     // it. A commission that never saw a delivery refunds in full.
     refundFeeApplies: escrow.refundCarriesFee(chain),
     refundFeeBasisPoints: escrow.refundCarriesFee(chain) ? escrow.FEE_BASIS_POINTS : 0,
+
+    // Rent locked in this commission's accounts, and what of it can be handed
+    // back. A refund closes its own pledge account, so the only claims listed
+    // here are the ones that have to be asked for.
+    rent: {
+      vaultLamports: escrow.VAULT_RENT_LAMPORTS,
+      pledgeLamports: escrow.PLEDGE_RENT_LAMPORTS,
+      // Deliberately not reclaimable: this account is the permanent public
+      // record reputation is computed from, and keeping it also prevents its
+      // seed being reused while stale pledge accounts could still exist.
+      commissionLamports: escrow.COMMISSION_RENT_LAMPORTS,
+      reclaimable: escrow.reclaimableRent(chain, wallet).claims.map(claim => ({
+        account: claim.kind,
+        lamports: claim.lamports,
+        sol: claim.lamports / escrow.LAMPORTS_PER_SOL,
+        to: claim.to,
+      })),
+    },
     title: meta?.title ?? null,
     description: meta?.description ?? null,
     repositoryUrl: meta?.repository_url ?? null,
@@ -461,6 +479,20 @@ const TX_BUILDERS = {
   'reject-delivery': async body => {
     const creator = cleanWallet(body.creator), commission = cleanWallet(body.commission);
     return { feePayer: creator, built: escrow.build.rejectDelivery(ctx(), { creator, commission }) };
+  },
+  'close-pledge': async body => {
+    const backer = cleanWallet(body.backer), commission = cleanWallet(body.commission);
+    const built = escrow.build.closePledge(ctx(), { backer, commission });
+    return { feePayer: backer, built, extra: { reclaimsLamports: escrow.PLEDGE_RENT_LAMPORTS } };
+  },
+  'close-vault': async body => {
+    const signer = cleanWallet(body.signer || body.creator), commission = cleanWallet(body.commission);
+    // The creator is read from chain, never from the request, so the rent cannot
+    // be pointed anywhere else by a malformed or hostile call.
+    const chain = (await chainCommissions()).get(commission);
+    if (!chain) throw badRequest('Unknown commission');
+    const built = escrow.build.closeVault(ctx(), { signer, commission, creator: chain.creator });
+    return { feePayer: signer, built, extra: { reclaimsLamports: escrow.VAULT_RENT_LAMPORTS, to: chain.creator } };
   },
   refund: async body => {
     const backer = cleanWallet(body.backer), commission = cleanWallet(body.commission);
