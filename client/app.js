@@ -719,14 +719,25 @@ async function simpleAction(action,address,index,agentArg){
 
   // If this action ends the commission, sweep every finished account's deposit
   // home in the same transaction. The user is signing once either way.
-  const transaction=new Transaction().add(built.instruction);
   const allMilestones=(1<<p.milestoneCount)-1;
   const settlesNow=
     (action==='release'&&(p.milestonesDone|(1<<Number(index)))===allMilestones)
     ||(action==='refund'&&p.refundedPledgerCount+1>=p.pledgerCount);
-  if(settlesNow)for(const instruction of await cleanupInstructions(address,p))transaction.add(instruction);
+  const cleanup=settlesNow?await cleanupInstructions(address,p):[];
 
-  await send(transaction,showProgress);
+  // Bundling means a failed cleanup would take the PAYMENT down with it — an
+  // account closed by somebody else a second earlier is enough to do it. Money
+  // must never be blocked by housekeeping, so a failure retries with the payment
+  // alone and the deposits are picked up by the next transaction instead.
+  const withCleanup=new Transaction().add(built.instruction,...cleanup);
+  if(!cleanup.length)await send(withCleanup,showProgress);
+  else{
+    try{await send(withCleanup,showProgress);}
+    catch(error){
+      console.error('cleanup failed; sending the payment on its own',error);
+      await send(new Transaction().add(built.instruction),showProgress);
+    }
+  }
   // Record what was delivered, now that the commitment it must match is on
   // chain. Without this the creator is asked to approve a payment against a
   // bare hash, which is not something a person can review.

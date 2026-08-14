@@ -189,7 +189,7 @@ const ERROR_HELP = {
   ReviewWindowOpen: 'The review window has not finished, so only the creator can act yet.',
   BadWindow: 'Delivery and review windows must be between one hour and their maximums.',
   SubmissionPending: 'A delivery is awaiting review. It must be released or rejected first.',
-  NotSettled: 'This account is still in use. Rent can only be reclaimed once the commission has fully settled.',
+  NotSettled: 'This account is still in use. It is closed automatically once the commission has fully settled.',
   OutOfTurn: 'An earlier delivery on this milestone has not been judged yet. First delivered, first judged.',
   NotInvited: 'This commission was restricted to one invited agent.',
   TooManySubmissions: 'This milestone has taken as many deliveries as it will accept.',
