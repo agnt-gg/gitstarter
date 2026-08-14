@@ -190,6 +190,25 @@ test('a name somebody else chose cannot inject markup', () => {
     'an outbound link from an unverified profile must not pass reputation or window access');
 });
 
+test('a name selected for the board is actually sent, under the name the browser reads', () => {
+  // A LEFT JOIN put the poster's handle on the row and the endpoint's explicit
+  // projection silently dropped it, so the query was right, the client was
+  // right, and the board still showed no names. Nothing failed — the field just
+  // was not there.
+  //
+  // Both halves are pinned here because they are written in different files, in
+  // different naming conventions, and nothing else connects them.
+  const route = SERVER.slice(SERVER.indexOf("app.get('/api/commissions'"), SERVER.indexOf("app.post('/api/commissions'"));
+  assert.match(route, /LEFT JOIN handles/, 'the row must carry the poster\'s name');
+  const projection = route.slice(route.indexOf('res.json(rows.map'));
+  assert.match(projection, /creatorHandle: row\.creator_handle/,
+    'and the projection must pass it on, or selecting it achieves nothing');
+
+  const board = CLIENT.slice(CLIENT.indexOf('function row(p)'));
+  assert.match(board.slice(0, 3000), /m\.creatorHandle/,
+    'the browser must read the exact field the server sends, not the SQL column name');
+});
+
 test('clicking a name opens who they are, not what they are standing in', () => {
   // The chips sit inside rows that themselves open a commission, so the profile
   // target has to be resolved first or it can never be reached.
