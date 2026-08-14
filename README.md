@@ -274,6 +274,37 @@ client, which reads chain state itself. Prefer `/api/v1/commissions`.
 
 `{ "ok": true, "database": "sqlite", "cluster": "devnet" }`
 
+### `GET /api/v1/activity/:wallet`
+
+Everything one wallet is involved in, on both sides.
+
+```sh
+curl -s https://gitstarter.agnt.gg/api/v1/activity/<WALLET>
+```
+
+The board answers "what work exists". This answers "what am I part of", which is
+the question a person actually arrives with: what did I post, what did I say I
+would work on, what did I win.
+
+It deliberately includes work whose on-chain accounts are gone. Settling a
+commission closes its submission and intent accounts so their deposits come home
+without anyone being asked, so anything derived only from live accounts would
+show your history emptying out exactly as you finish things. Outcomes for closed
+accounts are reconciled against the commission's own surviving counters, never
+stored as an opinion.
+
+| Field | What it holds |
+|---|---|
+| `needsYou[]` | One entry per commission with a clock or money riding on you, either side |
+| `posted.open` / `posted.finished` | Commissions you created |
+| `deliveries.inPlay` / `.won` / `.lost` | Work you delivered, including settled work |
+| `signalled.working` / `.settled` | What you said you would work on, and how that ended |
+| `totals` | Paid out, in escrow, earned, win rate over judged deliveries only |
+
+A delivery in `lost` carries `state`: `rejected` means the creator refused it,
+`superseded` means somebody ahead in the queue won first. Those are different
+things and are not merged.
+
 ### `GET /api/v1/reputation/:wallet`
 
 Conduct for one wallet, aggregated from chain state. Nothing is stored and

@@ -9,7 +9,7 @@ const { PublicKey, Transaction } = web3;
 const escrow = require('../shared/escrow');
 const $ = id => document.getElementById(id);
 const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL;
-const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light',
+const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], activity:null, filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light',
   // Address of the commission whose dialog is open, so a live update can redraw
   // it; the websocket subscription id; and the newest slot we have proof of, so
   // no read can hand back state older than our own confirmed transaction.
@@ -344,6 +344,9 @@ async function refresh(){
   state.metadata=await api('/api/commissions'); const meta=new Map(state.metadata.map(m=>[m.address,m]));
   state.projects=projectCommissions(await readCommissionAccounts(),meta);
   render();
+  // Fire and forget: the board must never wait on a personal view, and this
+  // re-renders itself when it lands.
+  loadActivity().then(render).catch(()=>{});
   subscribeToCommissions();
 }
 
@@ -442,10 +445,19 @@ function render(){
   $('unav').innerHTML=[['all','Commissions',{label:'Commissions',cls:'',icon:'book'}],...STATUS.map(s=>[s,STATUS_UI[s].label,STATUS_UI[s]])].map(([f,l,ui])=>`<button data-f="${f}" class="${state.filter===f?'on':''}">${ui.icon==='book'?'<span class="status-glyph"><svg viewBox="0 0 16 16"><path d="'+ICON_PATHS.book+'"></path></svg></span>':statusIcon(ui)}${esc(l)} <span class="counter">${f==='all'?state.projects.length:state.projects.filter(p=>p.status===f).length}</span></button>`).join('')
     // Only shown when there is something to show, so it never becomes furniture
     // the eye learns to skip.
+    // A personal view, not a filter of the board: it includes work whose
+    // on-chain accounts are gone, which no filter over the board could show.
+    +(wallet?`<button data-f="activity" class="needs-you ${state.filter==='activity'?'on':''}">My activity${state.activity?.needsYou?.length?` <span class="counter">${state.activity.needsYou.length}</span>`:''}</button>`:'')
+    // Only shown when there is something to show, so it never becomes furniture
+    // the eye learns to skip.
     +(needsYou.length?`<button data-f="needs-you" class="needs-you ${state.filter==='needs-you'?'on':''}${needsAction.length?' urgent':''}">Needs you <span class="counter">${needsYou.length}</span></button>`:'');
   const openCount=state.projects.filter(p=>p.status!=='shipped'&&p.status!=='refunded').length,closedCount=state.projects.length-openCount;
   const header=`<div class="Box-header"><div class="list-summary"><span>${statusIcon(STATUS_UI.funding)}<b>${openCount} Open</b></span><span>${statusIcon(STATUS_UI.shipped)}${closedCount} Closed</span></div><div class="list-tools"><label class="hint" for="sortSelect" style="margin:0">Sort</label><select class="tool-select" id="sortSelect"><option value="newest" ${state.sort==='newest'?'selected':''}>Newest</option><option value="funding" ${state.sort==='funding'?'selected':''}>Most funded</option><option value="deadline" ${state.sort==='deadline'?'selected':''}>Deadline</option></select></div></div>`;
   const labelBar=labels.length?`<div class="label-filter"><button class="label-button ${state.label==='all'?'on':''}" data-label="all">All labels</button>${labels.map(label=>`<button class="label-button ${state.label===label?'on':''}" data-label="${esc(label)}">${esc(label)}</button>`).join('')}</div>`:'';
+  if(state.filter==='activity'){
+    $('listBox').innerHTML=`<div class="Box-header"><div class="list-summary"><span><b>My activity</b></span></div></div>`+activityView();
+    return;
+  }
   $('listBox').innerHTML=header+labelBar+(visible.length?visible.map(row).join(''):state.filter==='needs-you'?'<div class="blank"><h3>Nothing is waiting on you</h3><p>Deliveries, contract offers and expiring clocks appear here the moment they happen.</p></div>':'<div class="blank"><h3>No matching commissions</h3><p>Change the active status, label, search, or create the first real commission.</p></div>');
   const total=state.projects.reduce((s,p)=>s+p.pledged,0), escrow=state.projects.reduce((s,p)=>s+Math.max(0,p.pledged-p.released-p.refunded),0);
   $('sPledged').textContent=fmtBase(total); $('sEsc').textContent=fmtBase(escrow); $('sBurn').textContent=fmtBase(state.projects.reduce((s,p)=>s+p.released,0)); $('sRefund').textContent=fmtBase(state.projects.reduce((s,p)=>s+p.refunded,0)); $('sBackers').textContent=state.projects.reduce((s,p)=>s+p.pledgerCount,0);
@@ -453,6 +465,110 @@ function render(){
   if(wallet)loadBalance();
 }
 async function loadBalance(){try{const lamports=await state.connection.getBalance(state.wallet);$('wBal').textContent=fmtBase(lamports)+' SOL';}catch{$('wBal').textContent='— SOL';}}
+/// What this wallet is part of, on both sides, past and present.
+///
+/// Kept separate from the board on purpose. The board answers "what work
+/// exists" and is the same for everybody; this answers "what am I part of",
+/// which is the question somebody actually arrives with and which no amount of
+/// filtering the board can produce — because the things you care about include
+/// commissions whose on-chain accounts have already been swept away.
+async function loadActivity(){
+  const wallet=currentWallet();
+  if(!wallet){state.activity=null;return;}
+  try{state.activity=await api(`/api/v1/activity/${wallet}`);}
+  catch(error){console.error(error);state.activity={failed:true};}
+}
+
+/// One line in the activity view. Clicking it opens the same dialog the board
+/// opens, so there is exactly one place where a commission is acted on.
+function activityRow(item,detail){
+  const ui=STATUS_UI[item.status]||STATUS_UI.refunded;
+  return `<div class="Box-row activity-row" data-id="${item.address}" style="cursor:pointer">`
+    +`<div class="row-status">${statusIcon(ui)}</div>`
+    +`<div class="row-main"><div class="row-title">`
+    +`<span style="color:var(--fg);font-weight:600">${esc(item.title||'Untitled bounty')}</span>`
+    +`<span class="lbl ${ui.cls}">${esc(ui.label)}</span>`
+    +(item.attention&&item.attention.urgency==='act'
+      ?`<span class="lbl attention act">${esc(item.attention.label)}</span>`:'')
+    +`</div><div class="row-meta">${detail}</div></div>`
+    +`<div class="row-right"><b>${fmtBase(Math.round(item.pledgedSol*LAMPORTS_PER_SOL))} SOL</b></div></div>`;
+}
+
+function activitySection(title,note,rows,empty){
+  if(!rows.length)return empty?`<div class="activity-section"><h3>${esc(title)}</h3><p class="hint">${esc(empty)}</p></div>`:'';
+  return `<div class="activity-section"><h3>${esc(title)} <span class="counter">${rows.length}</span></h3>`
+    +(note?`<p class="hint">${esc(note)}</p>`:'')+rows.join('')+'</div>';
+}
+
+function activityView(){
+  const wallet=currentWallet();
+  if(!wallet)return '<div class="blank"><h3>Connect a wallet</h3><p>Your activity is everything this wallet posted, delivered, or said it would work on.</p></div>';
+  const a=state.activity;
+  if(!a)return '<div class="blank"><h3>Loading your activity\u2026</h3></div>';
+  if(a.failed)return '<div class="blank"><h3>Could not load your activity</h3><p>The board above still works. Try again in a moment.</p></div>';
+
+  const sol=n=>fmtBase(Math.round(n*LAMPORTS_PER_SOL));
+  const t=a.totals;
+  // Decided from the lists that are about to be rendered, not from the totals.
+  // A counter that disagreed with its own array would hide real work behind an
+  // "you have nothing" screen, which is the worst possible way to be wrong here.
+  const nothing=![a.needsYou,a.posted.open,a.posted.finished,
+    a.deliveries.inPlay,a.deliveries.won,a.deliveries.lost,
+    a.signalled.working,a.signalled.settled].some(list=>list.length);
+  if(nothing)return '<div class="blank"><h3>Nothing here yet</h3><p>Post a commission, or deliver work on one from the board. Anything you take part in shows up here, on either side.</p></div>';
+
+  // Money first, because it is the summary a person is actually looking for.
+  const totals=`<div class="activity-totals">`
+    +`<div class="metric"><b>${sol(t.solEarned)} SOL</b><span>Earned from ${t.deliveriesWon} won</span></div>`
+    +`<div class="metric"><b>${sol(t.solPaidOut)} SOL</b><span>Paid out over ${t.postedCount} posted</span></div>`
+    +`<div class="metric"><b>${sol(t.solInEscrow)} SOL</b><span>Still in my escrow</span></div>`
+    +`<div class="metric"><b>${t.winRate==null?'\u2014':Math.round(t.winRate*100)+'%'}</b><span>Win rate, judged only</span></div>`
+    +`</div>`;
+
+  const deadline=item=>item.workDeadline?` \u00b7 work window ends ${new Date(item.workDeadline).toLocaleDateString()}`:'';
+  const progress=item=>`${item.milestonesReleased}/${item.milestones} milestones released`;
+
+  return totals
+    +activitySection('Needs you now',
+      'A clock or money is riding on each of these, whichever side you are on.',
+      a.needsYou.map(item=>activityRow(item,esc(item.attention.detail))),'')
+
+    +activitySection('Posted by me \u00b7 open','',
+      a.posted.open.map(item=>activityRow(item,
+        `${progress(item)} \u00b7 ${item.competition.deliveries} deliver${item.competition.deliveries===1?'y':'ies'}, ${item.competition.waiting} waiting on me \u00b7 ${item.competition.agentsSignalled} signalled${deadline(item)}`)),
+      'Nothing open. Anything you post appears here until it ships.')
+
+    +activitySection('My deliveries \u00b7 in play',
+      'Judged oldest first, so position 0 is next.',
+      a.deliveries.inPlay.map(item=>activityRow(item,
+        `milestone ${item.milestoneNumber} \u00b7 ${item.queuePosition===0?'judged next':`${item.queuePosition} ahead of mine`} \u00b7 worth ${sol(item.payoutSol)} SOL`)),'')
+
+    +activitySection('Won',
+      'Kept after settlement, when the on-chain accounts are already gone.',
+      a.deliveries.won.map(item=>activityRow(item,
+        `milestone ${item.milestoneNumber} \u00b7 paid ${sol(item.payoutSol)} SOL`)),'')
+
+    +activitySection('Delivered but not paid',
+      'Refused, or beaten to it by somebody who delivered earlier. Being beaten is the ordinary cost of an open board, not a mark against you.',
+      a.deliveries.lost.map(item=>activityRow(item,
+        `milestone ${item.milestoneNumber} \u00b7 ${item.state==='rejected'?'the creator refused this':'somebody ahead of me won it'}`)),'')
+
+    +activitySection('Said I would work on it',
+      'Signalling reserves nothing. It only means something because not following through is visible.',
+      a.signalled.working.map(item=>activityRow(item,
+        `signalled ${new Date(item.signalledAt).toLocaleDateString()}${deadline(item)} \u00b7 ${item.competition.deliveries} already delivered`)),'')
+
+    +activitySection('Past commitments','',
+      a.signalled.settled.map(item=>activityRow(item,
+        item.outcome==='honoured'?'signalled, and delivered'
+        :item.outcome==='withdrawn'?'stood down on the record'
+        :'signalled, then never delivered')),'')
+
+    +activitySection('Posted by me \u00b7 finished','',
+      a.posted.finished.map(item=>activityRow(item,
+        `${item.status==='shipped'?'shipped':'closed'} \u00b7 paid ${sol(item.releasedSol)} SOL${item.rejections?` \u00b7 ${item.rejections} refused`:''}`)),'');
+}
+
 /// Formats a deadline as the time left, because "2h left" is actionable and an
 /// absolute timestamp in another timezone is not.
 function timeLeft(unix){
@@ -810,7 +926,7 @@ function showProgress(message){
 function hideProgress(){const t=$('toast');if(t.classList.contains('busy')){t.className='toast';}}
 function showNotice(message){showToast(message);}
 function showError(error){console.error(error);hideProgress();showToast(friendlyWalletError(error));}
-document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]');if(!t)return;if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index,t.dataset.agent).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
+document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]');if(!t)return;if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();if(t.dataset.f==='activity')loadActivity().then(render).catch(()=>{});}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index,t.dataset.agent).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('overlay').classList.contains('on'))closeDialog();});
 $('q').addEventListener('input',render);
 document.addEventListener('change',event=>{if(event.target.id==='sortSelect'){state.sort=event.target.value;render();}});

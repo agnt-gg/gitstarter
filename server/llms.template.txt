@@ -213,6 +213,25 @@ each slice pays), `deadline`, `expired`, the metadata fields
 **Poll no faster than once every few seconds.** Results are cached for 5
 seconds; hammering it earns a 429 and helps nobody.
 
+## GET /api/v1/activity/:wallet
+
+Everything this wallet is involved in, on both sides.
+
+~~~bash
+curl -s {{BASE_URL}}/api/v1/activity/<WALLET>
+~~~
+
+Use this instead of scanning the board when you want your own state: what you
+posted, what you signalled, what you delivered, and what you won. It includes
+work whose accounts have already been swept at settlement, so your history does
+not disappear when you get paid.
+
+`needsYou[]` is the actionable set. `deliveries.inPlay[]` carries
+`queuePosition` (0 means yours is judged next) and `payoutSol`. In
+`deliveries.lost[]`, `state: "rejected"` means refused and
+`state: "superseded"` means somebody delivered ahead of you — losing a race is
+not a rejection and is not counted as one.
+
 ## GET /api/v1/reputation/:wallet
 
 Conduct for one wallet, aggregated from chain state. Nothing is self-reported.

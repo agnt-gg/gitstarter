@@ -765,6 +765,142 @@ function requireLamports(body, field) {
   return Math.round(Number(lamports));
 }
 
+/// Everything one wallet is involved in, on both sides, past and present.
+///
+/// The board answers "what work exists". This answers "what am I part of",
+/// which is a different question and the one a person actually opens the site
+/// with: what did I post, what did I say I would do, what did I win.
+///
+/// It has to include work whose accounts are gone. Settling a commission sweeps
+/// its submissions and intents so the deposits come home unasked, so anything
+/// derived only from live accounts would show a wallet's history emptying out
+/// exactly as they finish things. The durable index carries it instead, and the
+/// outcome is reconciled against the commission's own surviving counters.
+app.get('/api/v1/activity/:wallet', async (req, res, next) => {
+  try {
+    let wallet;
+    try { wallet = cleanWallet(req.params.wallet); } catch { return res.status(400).json({ error: 'Invalid wallet' }); }
+    if (!rateLimit(`activity:${req.ip}`, 60, 60_000)) return res.status(429).json({ error: 'Rate limit exceeded' });
+
+    const chain = await chainCommissions();
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const meta = new Map(db.prepare('SELECT * FROM commissions').all().map(row => [row.address, row]));
+
+    /// A commission as it appears in a list of things I am part of: enough to
+    /// decide whether to open it, and nothing more.
+    const summarise = (address, c) => ({
+      address,
+      title: meta.get(address)?.title || null,
+      status: c.status,
+      pledgedSol: toSol(c.pledged),
+      releasedSol: toSol(c.released),
+      escrowRemainingSol: toSol(escrow.escrowRemaining(c)),
+      milestones: c.milestoneCount,
+      milestonesReleased: c.milestoneBps.reduce((n, _, i) => n + ((c.milestonesDone & (1 << i)) ? 1 : 0), 0),
+      openForWork: c.status === 'funded' && !escrow.workClosed(c, nowUnix),
+      workDeadline: c.workDeadline ? new Date(c.workDeadline * 1000).toISOString() : null,
+      competition: { deliveries: c.submissions, waiting: c.unresolvedSubmissions, agentsSignalled: c.intents },
+      attention: escrow.pendingAttention(c, wallet, { nowUnix, submissions: submissionsFor(address) }),
+    });
+
+    // ── what I posted ──────────────────────────────────────────────────────
+    const posted = [];
+    for (const [address, c] of chain) {
+      if (c.creator !== wallet) continue;
+      posted.push({ ...summarise(address, c), rejections: c.rejections, autoReleases: c.autoReleases });
+    }
+
+    // ── what I delivered, including deliveries the sweep has since closed ──
+    const deliveries = [];
+    for (const row of db.prepare('SELECT * FROM delivery_history WHERE agent = ? ORDER BY submitted_at DESC').all(wallet)) {
+      const c = chain.get(row.commission);
+      if (!c) continue; // a commission from a layout this build cannot read
+      const live = submissionsFor(row.commission)
+        .find(s => s.agent === wallet && s.milestoneIndex === row.milestone_index);
+      const state = live ? live.state : settledState(c, row.milestone_index, row.sequence, row.last_state);
+      deliveries.push({
+        ...summarise(row.commission, c),
+        milestoneIndex: row.milestone_index,
+        milestoneNumber: row.milestone_index + 1,
+        queuePosition: Math.max(0, row.sequence - (c.milestoneRejected[row.milestone_index] ?? 0)),
+        state,
+        // What this delivery is worth, or was worth. An agent deciding whether
+        // to keep competing needs the number either way.
+        payoutSol: toSol(milestonePayout(c, row.milestone_index)),
+        submittedAt: new Date(row.submitted_at * 1000).toISOString(),
+        evidence: deliveriesFor(row.commission).find(d => d.evidenceHash === row.evidence_hash)?.evidence ?? null,
+      });
+    }
+
+    // ── what I said I would work on ────────────────────────────────────────
+    //
+    // Signalling binds nothing, so the only thing that makes it mean anything is
+    // that not following through is visible. That distinction is the whole
+    // point, so it is reported rather than flattened into one list.
+    const signalled = [];
+    for (const row of db.prepare('SELECT * FROM intent_history WHERE agent = ? ORDER BY signalled_at DESC').all(wallet)) {
+      const c = chain.get(row.commission);
+      if (!c) continue;
+      const delivered = deliveries.some(d => d.address === row.commission);
+      const over = ['shipped', 'refunded'].includes(c.status) || escrow.workClosed(c, nowUnix);
+      signalled.push({
+        ...summarise(row.commission, c),
+        signalledAt: new Date(row.signalled_at * 1000).toISOString(),
+        // honoured: I delivered. withdrawn: I stood down on the record.
+        // abandoned: I went quiet and the window closed. working: still open.
+        outcome: delivered ? 'honoured' : row.withdrawn ? 'withdrawn' : over ? 'abandoned' : 'working',
+      });
+    }
+
+    const sum = (list, pick) => list.reduce((total, item) => total + pick(item), 0);
+    const won = deliveries.filter(d => d.state === 'released');
+    const finishedPosted = posted.filter(p => ['shipped', 'refunded'].includes(p.status));
+
+    res.json({
+      wallet,
+      cluster: CLUSTER,
+      computedAt: new Date().toISOString(),
+      // Anything with a clock or money riding on it, either side, first.
+      needsYou: [...posted, ...deliveries]
+        .filter(item => item.attention && item.attention.urgency === 'act')
+        // One entry per commission: several deliveries on one job is still one
+        // thing to go and look at.
+        .filter((item, index, list) => list.findIndex(other => other.address === item.address) === index),
+      posted: {
+        open: posted.filter(p => !['shipped', 'refunded'].includes(p.status)),
+        finished: finishedPosted,
+      },
+      deliveries: {
+        inPlay: deliveries.filter(d => d.state === 'pending'),
+        won,
+        // Delivered and not paid. Kept apart from won, and NOT called failed:
+        // on an open board being beaten to a milestone is the ordinary cost of
+        // competing, and it is not the same thing as being refused.
+        lost: deliveries.filter(d => ['rejected', 'superseded'].includes(d.state)),
+      },
+      signalled: {
+        working: signalled.filter(s => s.outcome === 'working'),
+        settled: signalled.filter(s => s.outcome !== 'working'),
+      },
+      totals: {
+        postedCount: posted.length,
+        postedOpen: posted.length - finishedPosted.length,
+        solPaidOut: sum(posted, p => p.releasedSol),
+        solInEscrow: sum(posted, p => p.escrowRemainingSol),
+        deliveriesMade: deliveries.length,
+        deliveriesWon: won.length,
+        solEarned: sum(won, d => d.payoutSol),
+        // Judged deliveries only. Counting work still in the queue as a loss
+        // would punish an agent for having submitted recently.
+        winRate: (() => {
+          const judged = deliveries.filter(d => d.state !== 'pending').length;
+          return judged ? won.length / judged : null;
+        })(),
+      },
+    });
+  } catch (error) { next(error); }
+});
+
 /// Reputation, computed from chain state on demand.
 ///
 /// Nothing here is self-reported and nothing is stored: every number is derived
