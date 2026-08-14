@@ -23,6 +23,16 @@ const RUST = fs.readFileSync(path.join(ROOT, 'program', 'src', 'lib.rs'), 'utf8'
 const CLIENT = fs.readFileSync(path.join(ROOT, 'client', 'app.js'), 'utf8');
 const escrow = require('../../shared/escrow');
 
+/// Returns the parenthesised expression starting at `open`, respecting nesting.
+function balancedFrom(source, open) {
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '(') depth++;
+    else if (source[i] === ')') { depth--; if (depth === 0) return source.slice(open, i + 1); }
+  }
+  return source.slice(open);
+}
+
 function functionBody(source, name) {
   const start = source.indexOf(`function ${name}(`);
   assert.notEqual(start, -1, `could not locate ${name}`);
@@ -161,4 +171,47 @@ test('send prefers a wallet that signs and sends, and simulates first', () => {
     send, /escrow\.ERRORS\[code\]/,
     'a simulation failure must be mapped to the program error name, not shown raw',
   );
+});
+
+test('hand-rolled instruction encodings in scripts match the program', () => {
+  // The devnet probes encode instructions by hand on purpose: their value is
+  // exercising the chain WITHOUT trusting our own encoder. The cost is that a
+  // field added to the program does not reach them, and they fail later with
+  // "invalid instruction data" long after the change that broke them. This
+  // pins the two encodings that have already drifted once.
+  const dir = path.join(ROOT, 'scripts');
+  for (const file of fs.readdirSync(dir).filter(f => f.endsWith('.mjs'))) {
+    const source = fs.readFileSync(path.join(dir, file), 'utf8');
+
+    // devnet-e2e.mjs predates the native-SOL migration: it builds token accounts
+    // and asserts a pledge-time fee the program has not charged since. It is
+    // superseded by devnet-e2e-sol.mjs and cannot be brought up to date, only
+    // removed. Skipped rather than silently "fixed" into something meaningless.
+    if (source.includes('TOKEN_PROGRAM_ID')) continue;
+
+    // CreateCommission: discriminant, seed, goal, bps, deadline, delivery, review.
+    if (source.includes('Buffer.from([1])')) {
+      // Extract the whole Buffer.concat expression by matching brackets.
+      // Delimiter guessing fails three different ways on these files:
+      // `Buffer.from([1]),` contains `]),` itself, spacing varies from formatted
+      // to near-minified, and the call may span several lines.
+      const concat = source.lastIndexOf('Buffer.concat(', source.indexOf('Buffer.from([1])'));
+      assert.notEqual(concat, -1, `${file} builds CreateCommission without Buffer.concat`);
+      const statement = balancedFrom(source, concat + 'Buffer.concat'.length);
+      const clocks = (statement.match(/i64\(/g) || []).length;
+      assert.ok(clocks >= 3,
+        `${file} encodes CreateCommission with ${clocks} i64 fields; the program takes a deadline plus two clocks`);
+    }
+
+    // Refund credits the treasury, so it needs that account even when the fee is zero.
+    if (source.includes('Buffer.from([5])')) {
+      // These files range from formatted to near-minified, so locate the
+      // accounts array by pattern rather than by exact spacing.
+      const refund = source.slice(0, source.indexOf('Buffer.from([5])'));
+      const lastKeys = [...refund.matchAll(/keys:\s*\[/g)].pop();
+      assert.ok(lastKeys, `${file} builds Refund without an accounts array`);
+      assert.match(refund.slice(lastKeys.index), /TREASURY|treasury/,
+        `${file} builds Refund without the treasury account the program now expects`);
+    }
+  }
 });

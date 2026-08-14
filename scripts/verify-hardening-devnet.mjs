@@ -10,6 +10,7 @@ import {
 const RPC = 'https://api.devnet.solana.com';
 const PROGRAM = new PublicKey('6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy');
 const CONFIG = new PublicKey('DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29');
+const TREASURY = new PublicKey('4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY');
 const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.env.DEPLOYER_KEYPAIR, 'utf8'))));
 const connection = new Connection(RPC, 'confirmed');
 
@@ -38,8 +39,13 @@ function createIx(creator, commission, vault, seed, goal, bps, deadline) {
       { pubkey: vault, isSigner: false, isWritable: true },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
+    // CreateCommission carries two clocks after the funding deadline: the
+    // delivery window and the review window. Zero selects the program defaults.
+    // These are encoded by hand here on purpose — the point of this probe is to
+    // exercise the chain without trusting our own encoder.
     data: Buffer.concat([Buffer.from([1]), u64(seed), u64(goal), count,
-      ...bps.map(x => { const b = Buffer.alloc(2); b.writeUInt16LE(x); return b; }), i64(deadline)]),
+      ...bps.map(x => { const b = Buffer.alloc(2); b.writeUInt16LE(x); return b; }),
+      i64(deadline), i64(0), i64(0)]),
   });
 }
 const pledgeIx = (backer, commission, vault, amount) => new TransactionInstruction({
@@ -87,6 +93,8 @@ const cancelIx = (signer, commission) => new TransactionInstruction({
   ],
   data: Buffer.from([6]),
 });
+// Refund credits the treasury when a delivery was ever submitted, so the
+// treasury is part of the account list even on commissions that never saw one.
 const refundIx = (backer, commission, vault) => new TransactionInstruction({
   programId: PROGRAM,
   keys: [
@@ -94,6 +102,7 @@ const refundIx = (backer, commission, vault) => new TransactionInstruction({
     { pubkey: commission, isSigner: false, isWritable: true },
     { pubkey: pledgePda(commission, backer), isSigner: false, isWritable: true },
     { pubkey: vault, isSigner: false, isWritable: true },
+    { pubkey: TREASURY, isSigner: false, isWritable: true },
   ],
   data: Buffer.from([5]),
 });
