@@ -428,6 +428,55 @@ function timeLeft(unix){
   return`${Math.floor(seconds/86400)}d left`;
 }
 function attentionFor(p){return escrow.pendingAttention(p,currentWallet());}
+
+/// Renders a piece of evidence as a link when it is safely one, and as plain
+/// text otherwise.
+///
+/// Only http and https are ever linkified. The text is chosen by a counterparty
+/// and shown to the person judging their work, so a `javascript:` URL here
+/// would be a stored-XSS delivery mechanism aimed squarely at the wallet holder
+/// with the money.
+function evidenceHtml(text){
+  const trimmed=text.trim();
+  if(/^https?:\/\/\S+$/i.test(trimmed)){
+    try{
+      const url=new URL(trimmed);
+      if(url.protocol==='http:'||url.protocol==='https:'){
+        return `<a href="${esc(url.href)}" target="_blank" rel="noopener noreferrer nofollow">${esc(url.href)}</a>`;
+      }
+    }catch{/* Not a URL after all; fall through and show it as text. */}
+  }
+  return esc(trimmed);
+}
+
+/// The delivered work itself.
+///
+/// The chain commits to a SHA-256 of this and stores nothing else, which left a
+/// creator staring at sixteen hex characters and being asked to approve a
+/// payment. The text is recorded off chain and only accepted if it hashes to
+/// that commitment, so showing it here is safe: it is provably the thing the
+/// agent committed to, not something the server made up.
+function deliveryPanel(p,sub){
+  const recorded=(p.meta?.deliveries||[]).find(d=>d.evidenceHash===sub.evidenceHash);
+  if(!recorded){
+    return `<div class="evidence pending"><div class="evidence-head">Nothing submitted to review yet</div>`
+      +`<p class="hint">The agent committed to a delivery on chain but the content has not been supplied, so there is nothing here to judge. Ask them to re-submit it, or paste the text they sent you \u2014 it will only be accepted if it matches this commitment.</p>`
+      +`<div class="evidence-hash mono">${esc(sub.evidenceHash)}</div></div>`;
+  }
+  return `<div class="evidence"><div class="evidence-head">Delivered for milestone ${sub.milestoneIndex+1}</div>`
+    +`<div class="evidence-body">${evidenceHtml(recorded.evidence)}</div>`
+    +`<div class="evidence-proof" title="${esc(sub.evidenceHash)}">\u2713 Matches the commitment recorded on chain</div></div>`;
+}
+
+/// Deliveries already dealt with, so a creator judging milestone three can see
+/// what they accepted for milestone one.
+function deliveryHistory(p,currentHash){
+  const past=(p.meta?.deliveries||[]).filter(d=>d.evidenceHash!==currentHash);
+  if(!past.length)return'';
+  return `<details class="evidence-history"><summary>Earlier deliveries (${past.length})</summary>`
+    +past.map(d=>`<div class="evidence past"><div class="evidence-head">Milestone ${d.milestoneIndex+1} \u00b7 ${new Date(d.submittedAt*1000).toLocaleString()}</div><div class="evidence-body">${evidenceHtml(d.evidence)}</div></div>`).join('')
+    +'</details>';
+}
 function row(p){const ui=STATUS_UI[p.status]||STATUS_UI.refunded,m=p.meta||{},percent=p.goal?Math.min(100,p.pledged/p.goal*100):0,labels=Array.isArray(m.labels)?m.labels:[];const attention=attentionFor(p);let cursor=0;const segments=p.milestoneBps.map((bps,index)=>{const start=cursor;cursor+=bps/100;const fill=Math.max(0,Math.min(100,(percent-start)/(bps/100)*100));return `<span class="milestone-segment" style="width:${bps/100}%"><span class="milestone-fill ${ui.cls}" style="display:block;width:${fill}%"></span></span>`;}).join('');return `<div class="Box-row" data-id="${p.address}" style="cursor:pointer"><div class="row-status">${statusIcon(ui)}</div><div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600;font-size:16px">${esc(m.title||'Unindexed commission')}</span><span class="lbl ${ui.cls}">${esc(ui.detail)}</span>${attention?`<span class="lbl attention ${attention.urgency}">${esc(attention.label)}${attention.deadline?` \u00b7 ${timeLeft(attention.deadline)}`:''}</span>`:''}${labels.map(label=>`<span class="lbl gray">${esc(label)}</span>`).join('')}</div><div class="row-meta"><span class="mono">${p.address.slice(0,8)}…</span><span>created by ${p.creator.slice(0,6)}…</span><span>·</span><span>${esc(m.license||'metadata pending')}</span><span>·</span><span>${p.milestoneCount} milestones</span></div><div class="milestone-track" aria-label="${percent.toFixed(1)}% funded across ${p.milestoneCount} milestones">${segments}</div></div><div class="row-right"><span class="amt">${fmtBase(p.pledged)} <span class="of">/ ${fmtBase(p.goal)} SOL</span></span><span class="hint">${p.pledgerCount} ${p.pledgerCount===1?'backer':'backers'}</span></div></div>`;}
 function closeDialog(){state.openProject=null;$('overlay').classList.remove('on');$('dlg').className='dlg';$('dlg').innerHTML='';}
 function openProject(address){
@@ -441,7 +490,7 @@ function openProject(address){
   if(p.status==='funded'&&p.pendingAgent&&wallet!==p.pendingAgent)actions=`<p class="hint">Waiting for <span class="mono">${esc(p.pendingAgent)}</span> to accept.</p>${wallet===p.creator?`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="revoke" data-id="${p.address}">Withdraw nomination</button></div><p class="hint" style="margin-top:8px">Frees the commission so you can nominate someone else. Only possible while the nomination is unaccepted.</p>`:''}`;
   if(p.status==='building'&&wallet===p.creator){
     const sub=p.submission, matured=escrow.reviewExpired(p);
-    actions=(sub?`<div class="flash-inline" style="margin-bottom:12px"><b>Delivery submitted</b> for milestone ${sub.milestoneIndex+1} on ${new Date(sub.submittedAt*1000).toLocaleString()}.<br><span class="mono" style="font-size:12px">${esc(sub.evidenceHash.slice(0,16))}…</span><br>${matured?'The review window has passed, so this milestone can now be released by anyone.':`Review ends ${new Date(sub.reviewEndsAt*1000).toLocaleString()} — if you do nothing, it releases automatically.`}</div>`:'')
+    actions=(sub?`<div class="flash-inline" style="margin-bottom:12px"><b>Delivery submitted</b> for milestone ${sub.milestoneIndex+1} on ${new Date(sub.submittedAt*1000).toLocaleString()}.<br>${matured?'The review window has passed, so this milestone can now be released by anyone.':`Review ends ${new Date(sub.reviewEndsAt*1000).toLocaleString()} — if you do nothing, it releases automatically.`}</div>`+deliveryPanel(p,sub)+deliveryHistory(p,sub.evidenceHash):deliveryHistory(p,null))
       +`<div class="action-row">${p.milestoneBps.map((bps,i)=>`<button class="btn ${sub&&sub.milestoneIndex===i?'primary':''}" data-action="release" data-index="${i}" data-id="${p.address}" ${p.milestonesDone&(1<<i)?'disabled':''}>${p.milestonesDone&(1<<i)?'Released':'Release'} milestone ${i+1} · ${bps/100}%</button>`).join('')}</div>`
       +(sub&&!matured?`<div class="action-row" style="margin-top:8px"><button class="btn danger" data-action="reject" data-id="${p.address}">Reject this delivery</button></div><p class="hint" style="margin-top:8px">Rejecting is recorded on chain against your address and stops the automatic release. It also ends this agent's contract and returns the commission to the pool, so you can hire someone else \u2014 including the same agent again. The delivery clock keeps running.<br><br>Because work was delivered, the 1% connection fee now applies however this commission settles. Refusing costs you exactly what approving costs, so decide on the work.</p>`:'')
       +`<p class="hint" style="margin-top:12px">Releasing pays the agent immediately and cannot be undone.${p.submissions?' A delivery has been made, so the 1% connection fee applies whether this settles by release or by refund.':''}</p>`;
@@ -450,11 +499,11 @@ function openProject(address){
     const sub=p.submission, matured=escrow.reviewExpired(p), overdue=Math.floor(Date.now()/1000)>=p.deliveryDeadline;
     const unreleased=p.milestoneBps.map((_,i)=>i).filter(i=>!(p.milestonesDone&(1<<i)));
     actions=sub
-      ? `<div class="flash-inline"><b>Delivery submitted</b> for milestone ${sub.milestoneIndex+1}.<br>${matured?'The review window has passed — this milestone can now be released by anyone, including you.':`Awaiting review until ${new Date(sub.reviewEndsAt*1000).toLocaleString()}. If the creator says nothing, it pays out automatically. If they reject, your contract ends and the commission returns to the pool \u2014 you can be nominated again.`}</div>`
+      ? `<div class="flash-inline"><b>Delivery submitted</b> for milestone ${sub.milestoneIndex+1}.<br>${matured?'The review window has passed — this milestone can now be released by anyone, including you.':`Awaiting review until ${new Date(sub.reviewEndsAt*1000).toLocaleString()}. If the creator says nothing, it pays out automatically. If they reject, your contract ends and the commission returns to the pool \u2014 you can be nominated again.`}</div>`+deliveryPanel(p,sub)
         +(matured?`<div class="action-row" style="margin-top:12px"><button class="btn primary lg" data-action="release" data-index="${sub.milestoneIndex}" data-id="${p.address}">Claim milestone ${sub.milestoneIndex+1}</button></div>`:'')
       : overdue
         ? `<p class="hint">Your delivery window closed on ${new Date(p.deliveryDeadline*1000).toLocaleString()}. The escrow is now refundable to backers.</p>`
-        : `<div class="field"><label for="deliveryEvidence">Delivery evidence</label><input id="deliveryEvidence" type="text" placeholder="Commit URL, PR link, or artifact hash"><div class="hint">Only a hash of this is stored on chain, never the text.</div></div><div class="action-row">${unreleased.map(i=>`<button class="btn primary" data-action="submit" data-index="${i}" data-id="${p.address}">Submit milestone ${i+1}</button>`).join('')}</div><p class="hint" style="margin-top:8px">Submitting starts a ${Math.round(p.reviewWindow/3600)}-hour review clock. If the creator neither releases nor rejects before it ends, anyone can release your payment \u2014 including you. Claim within 24 hours of it maturing; after that the escrow reopens to refunds.</p>`;
+        : `<div class="field"><label for="deliveryEvidence">Delivery evidence</label><input id="deliveryEvidence" type="text" placeholder="Commit URL, PR link, or artifact hash"><div class="hint">This is what the creator sees and judges. Only its hash goes on chain; the text itself is recorded alongside and shown to them, and is only accepted if it matches that hash.</div></div><div class="action-row">${unreleased.map(i=>`<button class="btn primary" data-action="submit" data-index="${i}" data-id="${p.address}">Submit milestone ${i+1}</button>`).join('')}</div><p class="hint" style="margin-top:8px">Submitting starts a ${Math.round(p.reviewWindow/3600)}-hour review clock. If the creator neither releases nor rejects before it ends, anyone can release your payment \u2014 including you. Claim within 24 hours of it maturing; after that the escrow reopens to refunds.</p>`;
     actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Return remaining funds and end contract</button></div><p class="hint" style="margin-top:8px">Ends your claim on the ${fmtBase(p.pledged-p.released)} SOL still in escrow. Milestones already released are yours to keep.</p>`;
   }
   if((p.status==='funding'||p.status==='funded')&&wallet===p.creator)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Cancel commission</button></div>`;
@@ -533,7 +582,7 @@ async function pledge(address){
     :'Pledge confirmed.');
 }
 async function simpleAction(action,address,index){
-  const p=state.projects.find(x=>x.address===address);let built;
+  const p=state.projects.find(x=>x.address===address);let built,submitted=null;
   if(action==='nominate')built=escrow.build.selectAgent(ESCROW_CTX,{creator:state.wallet,commission:address,agent:$('agentWallet').value.trim()});
   else if(action==='revoke')built=escrow.build.revokeAgent(ESCROW_CTX,{creator:state.wallet,commission:address});
   else if(action==='accept')built=escrow.build.acceptAgent(ESCROW_CTX,{agent:state.wallet,commission:address});
@@ -543,15 +592,29 @@ async function simpleAction(action,address,index){
   else if(action==='closePledge')built=escrow.build.closePledge(ESCROW_CTX,{backer:state.wallet,commission:address});
   else if(action==='closeVault')built=escrow.build.closeVault(ESCROW_CTX,{signer:state.wallet,commission:address,creator:p.creator});
   else if(action==='submit'){
-    const evidence=($('deliveryEvidence')?.value||'').trim();
-    if(!evidence)throw new Error('Describe what you delivered: a commit URL, a PR link, or an artifact hash.');
+    submitted=($('deliveryEvidence')?.value||'').trim();
+    if(!submitted)throw new Error('Describe what you delivered: a commit URL, a PR link, or an artifact hash.');
     // The chain stores a commitment, never the text itself.
-    const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(evidence));
+    const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(submitted));
     built=escrow.build.submitDelivery(ESCROW_CTX,{agent:state.wallet,commission:address,milestoneIndex:Number(index)||0,evidenceHash:Buffer.from(new Uint8Array(digest))});
   }
   else if(action==='reject')built=escrow.build.rejectDelivery(ESCROW_CTX,{creator:state.wallet,commission:address});
   else throw new Error(`Unknown action: ${action}`);
   await send(new Transaction().add(built.instruction),showProgress);
+  // Record what was delivered, now that the commitment it must match is on
+  // chain. Without this the creator is asked to approve a payment against a
+  // bare hash, which is not something a person can review.
+  if(submitted){
+    showProgress('Recording your delivery\u2026');
+    try{await api('/api/deliveries',{method:'POST',body:JSON.stringify({commission:address,milestoneIndex:Number(index)||0,evidence:submitted})});}
+    catch(error){
+      // The delivery itself is on chain and stands regardless; only the
+      // human-readable copy failed. Say so rather than implying the work was
+      // lost, and leave the text where they can retrieve it.
+      console.error(error);
+      showToast('Delivery submitted on chain, but the description could not be saved. Send it to the creator directly.');
+    }
+  }
   closeDialog();
   showProgress('Updating\u2026');
   await refresh();

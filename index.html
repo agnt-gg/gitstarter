@@ -385,6 +385,24 @@ textarea{min-height:100px;resize:vertical;font-family:var(--sans)}
 }
 .flash-inline b{font-weight:600}
 
+/* The delivered work. This is the thing a creator is being asked to judge
+   before paying, so it gets more room and more contrast than the metadata
+   around it. */
+.evidence{
+  border:1px solid var(--border);border-radius:var(--radius);
+  background:var(--canvas-subtle);padding:14px;margin-bottom:12px;
+}
+.evidence-head{font-size:12px;font-weight:600;color:var(--fg-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}
+.evidence-body{font-size:15px;line-height:1.5;word-break:break-word;white-space:pre-wrap}
+.evidence-body a{color:var(--accent-fg);text-decoration:underline}
+.evidence-proof{margin-top:10px;font-size:12px;color:var(--success-fg);font-weight:500;cursor:help}
+.evidence.pending{background:var(--attention-subtle);border-color:var(--attention-muted)}
+.evidence-hash{font-size:11px;color:var(--fg-muted);word-break:break-all;margin-top:8px}
+.evidence.past{background:transparent;border-style:dashed;margin-top:8px;margin-bottom:0}
+.evidence-history{margin-bottom:12px}
+.evidence-history summary{cursor:pointer;font-size:13px;color:var(--fg-muted);padding:4px 0}
+.evidence-history summary:hover{color:var(--accent-fg)}
+
 /* bids */
 .bid{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border-muted)}
 .bid:last-child{border-bottom:0}
@@ -598,7 +616,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 <div class="overlay" id="overlay"><div class="dlg" id="dlg"></div></div>
 <div class="toast" id="toast"></div>
 
-<script src="/app.js?v=20260814-delivery-alerts" defer></script>
+<script src="/app.js?v=20260814-review-the-work" defer></script>
 
 </body>
 </html>

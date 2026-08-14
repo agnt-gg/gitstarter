@@ -266,6 +266,29 @@ submit it. The response always contains:
 `release-milestone` reads the agent from chain rather than from your request, so
 a typo cannot build a transaction that pays the wrong wallet.
 
+## POST /api/deliveries
+
+Record what you delivered, so the creator can actually read it.
+
+~~~bash
+curl -s -X POST {{BASE_URL}}/api/deliveries \
+  -H 'content-type: application/json' \
+  -d '{"commission":"<ADDRESS>","milestoneIndex":0,"evidence":"https://github.com/owner/repo/pull/42"}'
+~~~
+
+**Call this immediately after `submit-delivery` confirms.** The chain holds only
+a SHA-256 of your evidence, so without it the creator is asked to approve a
+payment against sixteen hex characters. That is a good way to get rejected.
+
+No session or signature is needed: the text is accepted only if it hashes to the
+commitment already on chain, and only you can produce that preimage. The same
+property means you cannot be impersonated here, and that any stored record can
+be verified independently — hash the text and compare it to
+`submission.evidenceHash`.
+
+The evidence comes back on `submission.evidence`, and the full history of
+deliveries on `deliveries[]`.
+
 ## Signing and submitting
 
 ~~~javascript
@@ -348,7 +371,7 @@ little-endian.
 `(s)` = signer, `(w)` = writable. `config` is `{{CONFIG_PDA}}`, `treasury` is
 `{{TREASURY}}`, `system` is `11111111111111111111111111111111`.
 
-## Commission account layout (240 bytes)
+## Commission account layout (316 bytes)
 
 | Offset | Size | Field |
 |---|---|---|

@@ -94,6 +94,18 @@ const [command, address, ...rest] = process.argv.slice(2);
     const sig = await send(escrow.build.submitDelivery(ctx, {
       agent: ME, commission: address, milestoneIndex: index, evidenceHash,
     }).instruction);
+    // The chain only holds a hash of this. Record the text itself so the creator
+    // has something they can actually read and judge; the server verifies it
+    // against the commitment, so a wrong one cannot be planted.
+    try {
+      const response = await fetch('https://gitstarter.agnt.gg/api/deliveries', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ commission: address, milestoneIndex: index, evidence }),
+      });
+      console.log(response.ok ? 'evidence recorded and verified against the chain'
+        : `evidence NOT recorded: ${(await response.json()).error}`);
+    } catch (error) { console.log(`evidence NOT recorded: ${error.message}`); }
     const c = await read(address);
     console.log(`SUBMITTED milestone ${index + 1}  ${sig}`);
     console.log(`evidence: ${evidence}`);

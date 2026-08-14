@@ -158,7 +158,20 @@ app.post('/api/auth/logout', (req, res) => {
 });
 app.get('/api/commissions', (_req, res) => {
   const rows = db.prepare('SELECT * FROM commissions ORDER BY created_at DESC LIMIT 200').all();
-  res.json(rows.map(row => ({ address: row.address, creator: row.creator, txSignature: row.tx_signature, title: row.title, description: row.description, repositoryUrl: row.repository_url, license: row.license, labels: JSON.parse(row.labels_json), createdAt: row.created_at })));
+  // One grouped query rather than one per commission: the browser renders the
+  // review panel straight from this list, so the evidence has to arrive with it.
+  const byCommission = new Map();
+  for (const row of db.prepare('SELECT * FROM deliveries ORDER BY submitted_at DESC').all()) {
+    if (!byCommission.has(row.commission)) byCommission.set(row.commission, []);
+    byCommission.get(row.commission).push({
+      milestoneIndex: row.milestone_index,
+      evidence: row.evidence,
+      evidenceHash: row.evidence_hash,
+      agent: row.agent,
+      submittedAt: row.submitted_at,
+    });
+  }
+  res.json(rows.map(row => ({ address: row.address, creator: row.creator, txSignature: row.tx_signature, title: row.title, description: row.description, repositoryUrl: row.repository_url, license: row.license, labels: JSON.parse(row.labels_json), createdAt: row.created_at, deliveries: byCommission.get(row.address) || [] })));
 });
 app.post('/api/commissions', requireAuth, async (req, res, next) => {
   try {
@@ -190,6 +203,78 @@ app.post('/api/commissions', requireAuth, async (req, res, next) => {
     res.status(201).json(record);
   } catch (error) { next(error); }
 });
+/// Records what an agent actually delivered.
+///
+/// The program commits to a 32-byte SHA-256 of the evidence and stores nothing
+/// else, which is right for the chain and useless for a human: a creator saw a
+/// truncated hash and had no way to know what they were being asked to approve.
+///
+/// **The hash is the authorization.** A row is accepted only if the text hashes
+/// to the commitment already on chain, and only the party who chose that text
+/// can produce a preimage for it. So this needs no session and no signature:
+/// there is no hostile input, because the only thing an attacker can submit is
+/// the correct answer. That also means a headless agent, or a creator who was
+/// sent the text out of band, can supply it.
+app.post('/api/deliveries', async (req, res, next) => {
+  try {
+    if (!rateLimit(`delivery:${req.ip}`, 30, 60_000)) return res.status(429).json({ error: 'Rate limit exceeded' });
+    const commission = cleanWallet(req.body.commission);
+    const evidence = cleanText(req.body.evidence, 4000);
+    const milestoneIndex = Number(req.body.milestoneIndex);
+    if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0 || milestoneIndex >= escrow.MAX_MILESTONES) {
+      return res.status(400).json({ error: 'milestoneIndex out of range' });
+    }
+
+    // Read the account directly rather than from the 5-second cache: an agent
+    // posts evidence immediately after submitting, and a stale read would
+    // reject the very delivery that just landed.
+    const account = (await rpc('getAccountInfo', [commission, { commitment: 'confirmed', encoding: 'base64' }]))?.value;
+    if (!account || account.owner !== PROGRAM_ID) return res.status(404).json({ error: 'Unknown commission' });
+    let chain;
+    try { chain = escrow.decodeCommission(Buffer.from(account.data[0], 'base64')); }
+    catch { return res.status(409).json({ error: 'Address is not a GitStarter commission' }); }
+
+    if (!chain.submission) return res.status(409).json({ error: 'No delivery is awaiting review on this commission' });
+    if (chain.submission.milestoneIndex !== milestoneIndex) {
+      return res.status(409).json({ error: `On-chain submission is for milestone ${chain.submission.milestoneIndex + 1}` });
+    }
+
+    // The whole trust model in three lines. A mismatch means the text is not
+    // what the agent committed to, whoever sent it.
+    const digest = crypto.createHash('sha256').update(evidence, 'utf8').digest();
+    const committed = Buffer.from(chain.submission.evidenceHash, 'hex');
+    if (digest.length !== committed.length || !crypto.timingSafeEqual(digest, committed)) {
+      return res.status(409).json({ error: 'This text does not match the commitment recorded on chain' });
+    }
+
+    const record = {
+      commission, milestoneIndex, evidence,
+      evidenceHash: chain.submission.evidenceHash,
+      agent: chain.agent,
+      submittedAt: chain.submission.submittedAt,
+      createdAt: Date.now(),
+    };
+    // Idempotent: re-posting the same proven text is a no-op, not a conflict.
+    db.prepare(`INSERT INTO deliveries(commission,milestone_index,evidence_hash,evidence,agent,submitted_at,created_at)
+      VALUES(@commission,@milestoneIndex,@evidenceHash,@evidence,@agent,@submittedAt,@createdAt)
+      ON CONFLICT(commission,evidence_hash) DO NOTHING`).run(record);
+    res.status(201).json({ ...record, verified: true });
+  } catch (error) { next(error); }
+});
+
+/// Every delivery ever recorded for a commission, newest first.
+function deliveriesFor(commission) {
+  return db.prepare('SELECT * FROM deliveries WHERE commission = ? ORDER BY submitted_at DESC, created_at DESC LIMIT 32')
+    .all(commission)
+    .map(row => ({
+      milestoneIndex: row.milestone_index,
+      evidence: row.evidence,
+      evidenceHash: row.evidence_hash,
+      agent: row.agent,
+      submittedAt: new Date(row.submitted_at * 1000).toISOString(),
+    }));
+}
+
 // ── agent API ───────────────────────────────────────────────────────────────
 // Everything below is for autonomous, headless callers. Two rules shape it:
 //
@@ -238,6 +323,7 @@ const toSol = lamports => lamports / escrow.LAMPORTS_PER_SOL;
 
 function presentCommission(address, chain, meta, wallet) {
   const remaining = escrow.escrowRemaining(chain);
+  const deliveries = deliveriesFor(address);
   return {
     address,
     explorer: explorerUrl(address),
@@ -292,8 +378,16 @@ function presentCommission(address, chain, meta, wallet) {
         // Until this lapses the claim also blocks cancellation and refunds, so
         // the agent cannot lose a race for work they already delivered.
         blocksExitUntil: new Date((chain.submission.reviewEndsAt + escrow.CLAIM_GRACE_WINDOW_SECONDS) * 1000).toISOString(),
+        // What was actually delivered, if the preimage of the commitment has
+        // been recorded. Null means nobody has supplied it yet, which is a
+        // meaningfully different thing to say than showing a bare hash.
+        evidence: deliveries.find(d => d.evidenceHash === chain.submission.evidenceHash)?.evidence ?? null,
       }
       : null,
+    // Every delivery ever recorded here, including ones already released or
+    // rejected. A creator judging milestone three should be able to see what
+    // they accepted for milestone one.
+    deliveries,
     conduct: {
       submissions: chain.submissions,
       rejections: chain.rejections,

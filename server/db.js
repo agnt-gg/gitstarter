@@ -34,6 +34,31 @@ function openDatabase(filename) {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS commissions_created_at ON commissions(created_at DESC);
+
+    -- What an agent actually delivered.
+    --
+    -- The program stores a 32-byte SHA-256 commitment and never the content, so
+    -- a creator could be handed finished work and have nothing to look at but a
+    -- hash. This table holds the preimage of that commitment.
+    --
+    -- It is an index, never an authority: a row is only accepted if it hashes to
+    -- the commitment already on chain, so the chain still decides what was
+    -- committed and when. A lost or hostile database cannot invent a delivery,
+    -- only fail to show one.
+    --
+    -- Keyed by the hash rather than the milestone, so a rejected delivery and
+    -- the revision that followed it are both kept. Review history is evidence.
+    CREATE TABLE IF NOT EXISTS deliveries (
+      commission TEXT NOT NULL,
+      milestone_index INTEGER NOT NULL CHECK(milestone_index BETWEEN 0 AND 7),
+      evidence_hash TEXT NOT NULL CHECK(length(evidence_hash) = 64),
+      evidence TEXT NOT NULL CHECK(length(evidence) BETWEEN 1 AND 4000),
+      agent TEXT NOT NULL,
+      submitted_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (commission, evidence_hash)
+    );
+    CREATE INDEX IF NOT EXISTS deliveries_commission ON deliveries(commission, submitted_at DESC);
   `);
   return db;
 }
