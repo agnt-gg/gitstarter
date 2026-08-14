@@ -1,9 +1,16 @@
+//! The whole lifecycle, once, in order, with the money checked at every step.
+//!
+//! The adversarial suite proves what cannot happen. This proves what should:
+//! somebody posts a job, strangers fund it, agents nobody chose compete for it,
+//! the best one is paid, and every account settles to the lamport.
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use gitstarter_escrow::{
     process_instruction, Commission, Config, Instruction as EscrowInstruction, Status,
-    SEED_COMMISSION, SEED_CONFIG, SEED_PLEDGE, SEED_VAULT,
+    SEED_COMMISSION, SEED_CONFIG, SEED_PLEDGE, SEED_SUBMISSION, SEED_VAULT,
 };
 use solana_program::{
+    clock::Clock,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     system_program,
@@ -17,6 +24,10 @@ use solana_sdk::{
 
 const PROGRAM_ID: Pubkey = solana_program::pubkey!("6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy");
 const LAMPORTS: u64 = 10_000_000_000;
+const PLEDGE_RENT: u64 = (128 + 83) * 6960;
+const VAULT_RENT: u64 = 128 * 6960;
+const SUBMISSION_RENT: u64 = (128 + 109) * 6960;
+
 fn funded_account() -> Account {
     Account {
         lamports: LAMPORTS,
@@ -26,6 +37,7 @@ fn funded_account() -> Account {
         rent_epoch: 0,
     }
 }
+
 async fn send(
     ctx: &mut ProgramTestContext,
     ixs: &[Instruction],
@@ -43,20 +55,21 @@ async fn send(
         ))
         .await
 }
-/// Deadlines are bounded, so tests take one relative to the validator clock
-/// rather than a fixed timestamp that drifts out of range.
+
 async fn soon(ctx: &mut ProgramTestContext, seconds: i64) -> i64 {
     ctx.banks_client
-        .get_sysvar::<solana_program::clock::Clock>()
+        .get_sysvar::<Clock>()
         .await
         .unwrap()
         .unix_timestamp
         + seconds
 }
+
 async fn balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
     ctx.banks_client.get_balance(key).await.unwrap()
 }
-async fn commission(ctx: &mut ProgramTestContext, key: Pubkey) -> Commission {
+
+async fn commission_state(ctx: &mut ProgramTestContext, key: Pubkey) -> Commission {
     Commission::try_from_slice(
         &ctx.banks_client
             .get_account(key)
@@ -67,6 +80,7 @@ async fn commission(ctx: &mut ProgramTestContext, key: Pubkey) -> Commission {
     )
     .unwrap()
 }
+
 fn ix(accounts: Vec<AccountMeta>, instruction: EscrowInstruction) -> Instruction {
     Instruction {
         program_id: PROGRAM_ID,
@@ -74,30 +88,28 @@ fn ix(accounts: Vec<AccountMeta>, instruction: EscrowInstruction) -> Instruction
         data: instruction.try_to_vec().unwrap(),
     }
 }
-async fn setup() -> (
-    ProgramTestContext,
-    Keypair,
-    Keypair,
-    Keypair,
-    Keypair,
-    Keypair,
-    Pubkey,
-) {
+
+/// A job posted, funded by two strangers, delivered by an agent nobody picked.
+#[tokio::test]
+async fn a_job_is_posted_funded_competed_for_and_paid() {
     let creator = Keypair::new();
-    let b1 = Keypair::new();
-    let b2 = Keypair::new();
-    let agent = Keypair::new();
+    let backer_a = Keypair::new();
+    let backer_b = Keypair::new();
+    let alice = Keypair::new();
+    let bob = Keypair::new();
     let treasury = Keypair::new();
+
     let (config, bump) = Pubkey::find_program_address(&[SEED_CONFIG], &PROGRAM_ID);
-    let config_state = Config {
+    let cfg = Config {
         tag: 1,
         admin: treasury.pubkey(),
         treasury: treasury.pubkey(),
         paused: false,
         bump,
     };
-    let mut config_data = vec![0u8; Config::LEN];
-    config_state.serialize(&mut &mut config_data[..]).unwrap();
+    let mut data = vec![0u8; Config::LEN];
+    cfg.serialize(&mut &mut data[..]).unwrap();
+
     let mut pt = ProgramTest::new(
         "gitstarter_escrow",
         PROGRAM_ID,
@@ -105,9 +117,10 @@ async fn setup() -> (
     );
     for key in [
         creator.pubkey(),
-        b1.pubkey(),
-        b2.pubkey(),
-        agent.pubkey(),
+        backer_a.pubkey(),
+        backer_b.pubkey(),
+        alice.pubkey(),
+        bob.pubkey(),
         treasury.pubkey(),
     ] {
         pt.add_account(key, funded_account());
@@ -116,69 +129,16 @@ async fn setup() -> (
         config,
         Account {
             lamports: LAMPORTS,
-            data: config_data,
+            data,
             owner: PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
         },
     );
-    let ctx = pt.start_with_context().await;
-    (ctx, creator, b1, b2, agent, treasury, config)
-}
-fn create(
-    creator: Pubkey,
-    config: Pubkey,
-    commission: Pubkey,
-    vault: Pubkey,
-    seed: u64,
-    goal: u64,
-    bps: Vec<u16>,
-    deadline: i64,
-) -> Instruction {
-    ix(
-        vec![
-            AccountMeta::new(creator, true),
-            AccountMeta::new_readonly(config, false),
-            AccountMeta::new(commission, false),
-            AccountMeta::new(vault, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        EscrowInstruction::CreateCommission {
-            seed,
-            goal,
-            milestone_bps: bps,
-            deadline,
-            delivery_window: 0,
-            review_window: 0,
-        },
-    )
-}
-fn pledge(
-    backer: Pubkey,
-    config: Pubkey,
-    commission: Pubkey,
-    pledge: Pubkey,
-    vault: Pubkey,
-    amount: u64,
-) -> Instruction {
-    ix(
-        vec![
-            AccountMeta::new(backer, true),
-            AccountMeta::new_readonly(config, false),
-            AccountMeta::new(commission, false),
-            AccountMeta::new(pledge, false),
-            AccountMeta::new(vault, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
-        EscrowInstruction::Pledge { amount },
-    )
-}
-#[tokio::test]
-async fn sol_funding_release_charges_one_percent_only_on_success() {
-    let (mut ctx, creator, backer, _b2, agent, treasury, config) = setup().await;
-    let deadline = soon(&mut ctx, 7 * 86_400).await;
-    let seed = 7u64;
-    let (commission_key, _) = Pubkey::find_program_address(
+    let mut ctx = pt.start_with_context().await;
+
+    let seed = 1u64;
+    let (commission, _) = Pubkey::find_program_address(
         &[
             SEED_COMMISSION,
             creator.pubkey().as_ref(),
@@ -186,194 +146,245 @@ async fn sol_funding_release_charges_one_percent_only_on_success() {
         ],
         &PROGRAM_ID,
     );
-    let (vault, _) =
-        Pubkey::find_program_address(&[SEED_VAULT, commission_key.as_ref()], &PROGRAM_ID);
-    let (pledge_key, _) = Pubkey::find_program_address(
-        &[
-            SEED_PLEDGE,
-            commission_key.as_ref(),
-            backer.pubkey().as_ref(),
-        ],
-        &PROGRAM_ID,
-    );
+    let (vault, _) = Pubkey::find_program_address(&[SEED_VAULT, commission.as_ref()], &PROGRAM_ID);
+    let deadline = soon(&mut ctx, 7 * 86_400).await;
+
+    // ── posted ──────────────────────────────────────────────────────────────
     send(
         &mut ctx,
-        &[create(
-            creator.pubkey(),
-            config,
-            commission_key,
-            vault,
-            seed,
-            1_000_000,
-            vec![5_000, 5_000],
-            deadline,
+        &[ix(
+            vec![
+                AccountMeta::new(creator.pubkey(), true),
+                AccountMeta::new_readonly(config, false),
+                AccountMeta::new(commission, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            EscrowInstruction::CreateCommission {
+                seed,
+                goal: 1_000_000,
+                milestone_bps: vec![6_000, 4_000],
+                deadline,
+                work_window: 7_200,
+                review_window: 3_600,
+            },
         )],
         &[&creator],
     )
     .await
     .unwrap();
-    let before = balance(&mut ctx, vault).await;
-    send(
-        &mut ctx,
-        &[pledge(
-            backer.pubkey(),
-            config,
-            commission_key,
-            pledge_key,
-            vault,
-            1_000_000,
-        )],
-        &[&backer],
-    )
-    .await
-    .unwrap();
-    assert_eq!(balance(&mut ctx, vault).await - before, 1_000_000);
-    assert_eq!(
-        commission(&mut ctx, commission_key).await.status,
-        Status::Funded
+    let c = commission_state(&mut ctx, commission).await;
+    assert_eq!(c.status, Status::Funding);
+    assert_eq!(c.work_deadline, 0, "the work clock waits for the money");
+
+    // ── funded by two strangers ─────────────────────────────────────────────
+    for (backer, amount) in [(&backer_a, 400_000u64), (&backer_b, 600_000)] {
+        let pledge = Pubkey::find_program_address(
+            &[SEED_PLEDGE, commission.as_ref(), backer.pubkey().as_ref()],
+            &PROGRAM_ID,
+        )
+        .0;
+        send(
+            &mut ctx,
+            &[ix(
+                vec![
+                    AccountMeta::new(backer.pubkey(), true),
+                    AccountMeta::new_readonly(config, false),
+                    AccountMeta::new(commission, false),
+                    AccountMeta::new(pledge, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                EscrowInstruction::Pledge { amount },
+            )],
+            &[backer],
+        )
+        .await
+        .unwrap();
+    }
+    let c = commission_state(&mut ctx, commission).await;
+    assert_eq!(c.status, Status::Funded);
+    assert_eq!(c.total_pledged, 1_000_000);
+    assert!(
+        c.work_deadline > 0,
+        "the job goes on the board the instant it is funded, with nobody chosen"
     );
-    send(
-        &mut ctx,
-        &[ix(
-            vec![
-                AccountMeta::new_readonly(creator.pubkey(), true),
-                AccountMeta::new(commission_key, false),
-                AccountMeta::new_readonly(agent.pubkey(), false),
+    assert_eq!(balance(&mut ctx, vault).await, 1_000_000 + VAULT_RENT);
+
+    // ── competed for, by agents nobody selected ─────────────────────────────
+    let submit = |agent: &Keypair, index: u8, tag: u8| {
+        let pda = Pubkey::find_program_address(
+            &[
+                SEED_SUBMISSION,
+                commission.as_ref(),
+                &[index],
+                agent.pubkey().as_ref(),
             ],
-            EscrowInstruction::SelectAgent,
-        )],
-        &[&creator],
-    )
-    .await
-    .unwrap();
-    send(
-        &mut ctx,
-        &[ix(
+            &PROGRAM_ID,
+        )
+        .0;
+        ix(
             vec![
-                AccountMeta::new_readonly(agent.pubkey(), true),
-                AccountMeta::new(commission_key, false),
+                AccountMeta::new(agent.pubkey(), true),
+                AccountMeta::new(commission, false),
+                AccountMeta::new(pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
             ],
-            EscrowInstruction::AcceptAgent,
-        )],
-        &[&agent],
-    )
-    .await
-    .unwrap();
-    let agent_before = balance(&mut ctx, agent.pubkey()).await;
-    let treasury_before = balance(&mut ctx, treasury.pubkey()).await;
-    send(
-        &mut ctx,
-        &[ix(
+            EscrowInstruction::SubmitDelivery {
+                index,
+                evidence_hash: [tag; 32],
+            },
+        )
+    };
+    send(&mut ctx, &[submit(&alice, 0, 1)], &[&alice])
+        .await
+        .unwrap();
+    send(&mut ctx, &[submit(&bob, 0, 2)], &[&bob])
+        .await
+        .unwrap();
+    assert_eq!(commission_state(&mut ctx, commission).await.submissions, 2);
+
+    // ── judged in order, and the winner paid ────────────────────────────────
+    let release = |signer: &Keypair, agent: &Keypair, index: u8| {
+        let pda = Pubkey::find_program_address(
+            &[
+                SEED_SUBMISSION,
+                commission.as_ref(),
+                &[index],
+                agent.pubkey().as_ref(),
+            ],
+            &PROGRAM_ID,
+        )
+        .0;
+        ix(
             vec![
-                AccountMeta::new_readonly(creator.pubkey(), true),
-                AccountMeta::new(commission_key, false),
+                AccountMeta::new_readonly(signer.pubkey(), true),
+                AccountMeta::new(commission, false),
+                AccountMeta::new(pda, false),
                 AccountMeta::new(vault, false),
                 AccountMeta::new(agent.pubkey(), false),
                 AccountMeta::new(treasury.pubkey(), false),
             ],
-            EscrowInstruction::ReleaseMilestone { index: 0 },
-        )],
-        &[&creator],
-    )
-    .await
-    .unwrap();
+            EscrowInstruction::ReleaseMilestone,
+        )
+    };
+    let alice_before = balance(&mut ctx, alice.pubkey()).await;
+    let treasury_before = balance(&mut ctx, treasury.pubkey()).await;
+    send(&mut ctx, &[release(&creator, &alice, 0)], &[&creator])
+        .await
+        .unwrap();
     assert_eq!(
-        balance(&mut ctx, agent.pubkey()).await - agent_before,
-        495_000
+        balance(&mut ctx, alice.pubkey()).await - alice_before,
+        594_000,
+        "the winner takes 99% of a 60% milestone"
     );
     assert_eq!(
         balance(&mut ctx, treasury.pubkey()).await - treasury_before,
-        5_000
+        6_000,
+        "and the protocol takes 1%"
     );
-}
-#[tokio::test]
-async fn sol_refund_returns_full_unreleased_pledge_with_zero_fee() {
-    let (mut ctx, creator, backer, _b2, _agent, treasury, config) = setup().await;
-    let deadline = soon(&mut ctx, 7 * 86_400).await;
-    let seed = 8u64;
-    let (commission_key, _) = Pubkey::find_program_address(
-        &[
-            SEED_COMMISSION,
-            creator.pubkey().as_ref(),
-            &seed.to_le_bytes(),
-        ],
-        &PROGRAM_ID,
-    );
-    let (vault, _) =
-        Pubkey::find_program_address(&[SEED_VAULT, commission_key.as_ref()], &PROGRAM_ID);
-    let (pledge_key, _) = Pubkey::find_program_address(
-        &[
-            SEED_PLEDGE,
-            commission_key.as_ref(),
-            backer.pubkey().as_ref(),
-        ],
-        &PROGRAM_ID,
-    );
-    send(
-        &mut ctx,
-        &[
-            create(
-                creator.pubkey(),
-                config,
-                commission_key,
-                vault,
-                seed,
-                2_000_000,
-                vec![10_000],
-                deadline,
-            ),
-            pledge(
-                backer.pubkey(),
-                config,
-                commission_key,
-                pledge_key,
-                vault,
-                1_000_000,
-            ),
-        ],
-        &[&creator, &backer],
-    )
-    .await
-    .unwrap();
+
+    // Bob lost this milestone but is not locked out of the next one.
+    send(&mut ctx, &[submit(&bob, 1, 3)], &[&bob])
+        .await
+        .unwrap();
+    let bob_before = balance(&mut ctx, bob.pubkey()).await;
+    send(&mut ctx, &[release(&creator, &bob, 1)], &[&creator])
+        .await
+        .unwrap();
+    assert_eq!(balance(&mut ctx, bob.pubkey()).await - bob_before, 396_000);
+
+    let c = commission_state(&mut ctx, commission).await;
+    assert_eq!(c.status, Status::Delivered);
+    assert_eq!(c.released, 1_000_000, "conservation across two winners");
+    assert_eq!(c.escrow_remaining().unwrap(), 0);
+    assert_eq!(balance(&mut ctx, vault).await, VAULT_RENT);
+
+    // ── everything settles to the lamport ───────────────────────────────────
+    for agent in [&alice, &bob] {
+        for index in [0u8, 1] {
+            let pda = Pubkey::find_program_address(
+                &[
+                    SEED_SUBMISSION,
+                    commission.as_ref(),
+                    &[index],
+                    agent.pubkey().as_ref(),
+                ],
+                &PROGRAM_ID,
+            )
+            .0;
+            if ctx.banks_client.get_account(pda).await.unwrap().is_none() {
+                continue;
+            }
+            let before = balance(&mut ctx, agent.pubkey()).await;
+            send(
+                &mut ctx,
+                &[ix(
+                    vec![
+                        AccountMeta::new(agent.pubkey(), true),
+                        AccountMeta::new(commission, false),
+                        AccountMeta::new(pda, false),
+                    ],
+                    EscrowInstruction::CloseSubmission,
+                )],
+                &[agent],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                balance(&mut ctx, agent.pubkey()).await - before,
+                SUBMISSION_RENT,
+                "every agent gets their submission rent back, winner or not"
+            );
+        }
+    }
+
+    for backer in [&backer_a, &backer_b] {
+        let pledge = Pubkey::find_program_address(
+            &[SEED_PLEDGE, commission.as_ref(), backer.pubkey().as_ref()],
+            &PROGRAM_ID,
+        )
+        .0;
+        let before = balance(&mut ctx, backer.pubkey()).await;
+        send(
+            &mut ctx,
+            &[ix(
+                vec![
+                    AccountMeta::new(backer.pubkey(), true),
+                    AccountMeta::new(commission, false),
+                    AccountMeta::new(pledge, false),
+                ],
+                EscrowInstruction::ClosePledge,
+            )],
+            &[backer],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            balance(&mut ctx, backer.pubkey()).await - before,
+            PLEDGE_RENT
+        );
+    }
+
+    let creator_before = balance(&mut ctx, creator.pubkey()).await;
     send(
         &mut ctx,
         &[ix(
             vec![
-                AccountMeta::new_readonly(creator.pubkey(), true),
-                AccountMeta::new(commission_key, false),
-            ],
-            EscrowInstruction::Cancel,
-        )],
-        &[&creator],
-    )
-    .await
-    .unwrap();
-    let backer_before = balance(&mut ctx, backer.pubkey()).await;
-    let treasury_before = balance(&mut ctx, treasury.pubkey()).await;
-    send(
-        &mut ctx,
-        &[ix(
-            vec![
-                AccountMeta::new(backer.pubkey(), true),
-                AccountMeta::new(commission_key, false),
-                AccountMeta::new(pledge_key, false),
+                AccountMeta::new_readonly(alice.pubkey(), true),
+                AccountMeta::new(commission, false),
                 AccountMeta::new(vault, false),
-                AccountMeta::new(treasury.pubkey(), false),
+                AccountMeta::new(creator.pubkey(), false),
             ],
-            EscrowInstruction::Refund,
+            EscrowInstruction::CloseVault,
         )],
-        &[&backer],
+        &[&alice],
     )
     .await
     .unwrap();
-    // A refund now also closes the pledge account, so the backer receives their
-    // escrow plus the rent that account was holding: (128 + 83) * 6960.
-    const PLEDGE_RENT: u64 = (128 + 83) * 6960;
     assert_eq!(
-        balance(&mut ctx, backer.pubkey()).await - backer_before,
-        1_000_000 + PLEDGE_RENT
+        balance(&mut ctx, creator.pubkey()).await - creator_before,
+        VAULT_RENT
     );
-    assert_eq!(balance(&mut ctx, treasury.pubkey()).await, treasury_before);
-    let c = commission(&mut ctx, commission_key).await;
-    assert_eq!(c.total_pledged, c.released + c.refunded);
+    assert_eq!(balance(&mut ctx, vault).await, 0, "nothing left behind");
 }

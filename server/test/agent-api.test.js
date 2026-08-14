@@ -38,7 +38,7 @@ test('instruction encoding matches the program', () => {
   const create = escrow.build.createCommission(ctx, {
     creator, seed: 7, goalLamports: 1_000_000,
     milestoneBasisPoints: [5000, 5000], deadlineUnix: 1_900_000_000,
-    deliveryWindowSeconds: 7_200, reviewWindowSeconds: 3_600,
+    workWindowSeconds: 7_200, reviewWindowSeconds: 3_600,
   });
   const d = create.instruction.data;
   assert.equal(d[0], 1);
@@ -49,7 +49,7 @@ test('instruction encoding matches the program', () => {
   assert.equal(d.readUInt16LE(23), 5000);
   assert.equal(Number(d.readBigInt64LE(25)), 1_900_000_000);
   // The two clocks are appended after the funding deadline.
-  assert.equal(Number(d.readBigInt64LE(33)), 7_200, 'delivery window');
+  assert.equal(Number(d.readBigInt64LE(33)), 7_200, 'work window');
   assert.equal(Number(d.readBigInt64LE(41)), 3_600, 'review window');
   assert.equal(d.length, 49);
   assert.deepEqual(create.instruction.keys.map(k => k.pubkey.toBase58()),
@@ -62,11 +62,13 @@ test('instruction encoding matches the program', () => {
   assert.equal(Number(pledge.instruction.data.readBigUInt64LE(1)), 50_000_000);
   assert.equal(pledge.vault.toBase58(), LIVE_VAULT);
 
-  assert.deepEqual([...escrow.build.selectAgent(ctx, { creator, commission: LIVE_COMMISSION, agent }).instruction.data], [3]);
+  assert.deepEqual([...escrow.build.inviteAgent(ctx, { creator, commission: LIVE_COMMISSION, agent }).instruction.data], [3]);
   assert.deepEqual([...escrow.build.refund(ctx, { backer: creator, commission: LIVE_COMMISSION }).instruction.data], [5]);
   assert.deepEqual([...escrow.build.cancel(ctx, { signer: creator, commission: LIVE_COMMISSION }).instruction.data], [6]);
-  assert.deepEqual([...escrow.build.acceptAgent(ctx, { agent, commission: LIVE_COMMISSION }).instruction.data], [8]);
-  assert.deepEqual([...escrow.build.revokeAgent(ctx, { creator, commission: LIVE_COMMISSION }).instruction.data], [9]);
+  assert.deepEqual([...escrow.build.signalIntent(ctx, { agent, commission: LIVE_COMMISSION }).instruction.data], [8]);
+  assert.deepEqual([...escrow.build.withdrawIntent(ctx, { agent, commission: LIVE_COMMISSION }).instruction.data], [9]);
+  assert.deepEqual([...escrow.build.closeSubmission(ctx, { agent, commission: LIVE_COMMISSION, milestoneIndex: 0 }).instruction.data], [14]);
+  assert.deepEqual([...escrow.build.closeIntent(ctx, { agent, commission: LIVE_COMMISSION }).instruction.data], [15]);
 
   // Delivery submission carries the milestone index and a 32-byte commitment.
   const submit = escrow.build.submitDelivery(ctx, {
@@ -75,19 +77,25 @@ test('instruction encoding matches the program', () => {
   assert.equal(submit.instruction.data[0], 10);
   assert.equal(submit.instruction.data[1], 1);
   assert.equal(submit.instruction.data.length, 34, 'discriminant + index + 32-byte hash');
-  assert.deepEqual(submit.instruction.keys.map(k => k.pubkey.toBase58()), [agent, LIVE_COMMISSION]);
+  // The submission has its own account, so several agents can compete on one
+  // milestone without overwriting each other.
+  assert.deepEqual(submit.instruction.keys.map(k => k.pubkey.toBase58()),
+    [agent, LIVE_COMMISSION, submit.submission.toBase58(), SYSTEM]);
   assert.throws(() => escrow.build.submitDelivery(ctx, {
     agent, commission: LIVE_COMMISSION, milestoneIndex: 0, evidenceHash: 'abcd',
   }), /exactly 32 bytes/, 'a short commitment must be refused, not silently padded');
 
-  assert.deepEqual([...escrow.build.rejectDelivery(ctx, { creator, commission: LIVE_COMMISSION }).instruction.data], [11]);
+  assert.deepEqual([...escrow.build.rejectDelivery(ctx, { creator, commission: LIVE_COMMISSION, agent, milestoneIndex: 1 }).instruction.data], [11]);
 
   const release = escrow.build.releaseMilestone(ctx, { creator, commission: LIVE_COMMISSION, agent, milestoneIndex: 1 });
-  assert.deepEqual([...release.instruction.data], [4, 1]);
+  // The milestone is no longer an argument: it is read off the submission being
+  // paid, which is what stops a caller redirecting the money.
+  assert.deepEqual([...release.instruction.data], [4]);
   // The treasury must be the account the fee is actually paid to.
   assert.deepEqual(release.instruction.keys.map(k => k.pubkey.toBase58()),
-    [creator, LIVE_COMMISSION, LIVE_VAULT, agent, TREASURY]);
-  assert.deepEqual(release.instruction.keys.map(k => k.isWritable), [false, true, true, true, true]);
+    [creator, LIVE_COMMISSION, release.submission.toBase58(), LIVE_VAULT, agent, TREASURY]);
+  // signer, commission, submission, vault, agent, treasury
+  assert.deepEqual(release.instruction.keys.map(k => k.isWritable), [false, true, true, true, true, true]);
 });
 
 test('commission decoding reads every field at the right offset', () => {
@@ -102,60 +110,145 @@ test('commission decoding reads every field at the right offset', () => {
   b.writeBigUInt64LE(100n, 129);                    // refunded
   b.writeUInt32LE(3, 137);                          // pledger_count
   b.writeUInt32LE(1, 141);                          // refunded_pledger_count
-  b[210] = 1;                                        // has_agent
-  new PublicKey(TREASURY).toBuffer().copy(b, 145);  // agent
-  b[211] = 2;                                        // status = building
-  b[212] = 2;                                        // milestone_count
-  b.writeUInt16LE(3000, 213);
-  b.writeUInt16LE(7000, 215);
-  b[229] = 0b01;                                     // first milestone released
-  b.writeBigInt64LE(1_900_000_000n, 230);
+  new PublicKey(TREASURY).toBuffer().copy(b, 145);  // invited_agent
+  b[177] = 0;                                       // has_invite: OPEN by default
+  b[178] = 1;                                       // status = funded
+  b[179] = 2;                                       // milestone_count
+  b.writeUInt16LE(3000, 180);
+  b.writeUInt16LE(7000, 182);
+  b[196] = 0b01;                                    // first milestone released
+  b.writeBigInt64LE(1_900_000_000n, 197);           // deadline
+  b.writeBigInt64LE(7_200n, 207);                   // work_window
+  b.writeBigInt64LE(1_800_007_200n, 215);           // work_deadline
+  b.writeBigInt64LE(3_600n, 223);                   // review_window
+  b[231] = 3;                                       // 3 submitted on milestone 0
+  b[239] = 1;                                       // 1 of them rejected
+  b.writeUInt32LE(2, 247);                          // unresolved
+  b.writeBigInt64LE(1_800_000_500n, 251);           // latest_submitted_at
+  b.writeUInt32LE(3, 259);                          // submissions
+  b.writeUInt32LE(1, 263);                          // rejections
+  b.writeUInt32LE(0, 267);                          // auto_releases
+  b.writeUInt32LE(5, 271);                          // intents
 
   const c = escrow.decodeCommission(b);
-  assert.equal(c.status, 'building');
+  assert.equal(c.status, 'funded');
   assert.equal(c.goal, 1000);
   assert.equal(c.pledged, 900);
   assert.equal(c.released, 400);
   assert.equal(c.refunded, 100);
   assert.equal(c.pledgerCount, 3);
   assert.equal(c.refundedPledgerCount, 1);
-  assert.equal(c.agent, TREASURY);
-  assert.equal(c.pendingAgent, null, 'an unset pending agent must read as null, not the zero address');
+  // Open by default is the whole product, so an unset invitation must read as
+  // absent rather than as the zero address.
+  assert.equal(c.invitedAgent, null);
+  assert.equal(c.isOpen, true);
   assert.deepEqual(c.milestoneBps, [3000, 7000]);
   assert.equal(c.milestonesDone, 1);
   assert.equal(c.deadline, 1_900_000_000);
+  assert.equal(c.workWindow, 7_200);
+  assert.equal(c.workDeadline, 1_800_007_200);
+  assert.equal(c.reviewWindow, 3_600);
+  assert.deepEqual(c.milestoneSubmitted, [3, 0]);
+  assert.deepEqual(c.milestoneRejected, [1, 0]);
+  assert.equal(c.unresolvedSubmissions, 2);
+  assert.equal(c.latestSubmittedAt, 1_800_000_500);
+  assert.equal(c.submissions, 3);
+  assert.equal(c.rejections, 1);
+  assert.equal(c.intents, 5);
   assert.equal(escrow.escrowRemaining(c), 400);
+
+  // An invitation, when a creator deliberately sets one.
+  b[177] = 1;
+  assert.equal(escrow.decodeCommission(b).invitedAgent, TREASURY);
+  assert.equal(escrow.decodeCommission(b).isOpen, false);
+
   assert.throws(() => escrow.decodeCommission(Buffer.alloc(100)), /Not a commission/);
+});
+
+test('submission decoding carries the queue position and state', () => {
+  const b = Buffer.alloc(escrow.SUBMISSION_ACCOUNT_BYTES);
+  b[0] = 4;
+  new PublicKey(LIVE_COMMISSION).toBuffer().copy(b, 1);
+  new PublicKey(TREASURY).toBuffer().copy(b, 33);
+  b[65] = 1;                                        // milestone_index
+  b[66] = 2;                                        // sequence
+  b.writeBigInt64LE(1_800_000_000n, 67);
+  Buffer.alloc(32, 0xab).copy(b, 75);               // evidence_hash
+  b[107] = 0;                                       // pending
+
+  const s = escrow.decodeSubmission(b);
+  assert.equal(s.commission, LIVE_COMMISSION);
+  assert.equal(s.agent, TREASURY);
+  assert.equal(s.milestoneIndex, 1);
+  assert.equal(s.sequence, 2);
+  assert.equal(s.state, 'pending');
+  assert.equal(s.evidenceHash, 'ab'.repeat(32));
+  assert.equal(escrow.reviewEndsAt(s, 3_600), 1_800_003_600);
+
+  b[107] = 2;
+  assert.equal(escrow.decodeSubmission(b).state, 'rejected');
+  assert.equal(
+    escrow.reviewExpired(escrow.decodeSubmission(b), 3_600, 2_000_000_000), false,
+    'a judged submission can never mature into a second payment');
 });
 
 test('availableActions answers what a wallet may actually do', () => {
   const creator = 'Cre1111111111111111111111111111111111111111';
-  const agent = 'Agn1111111111111111111111111111111111111111';
-  const stranger = 'Str1111111111111111111111111111111111111111';
-  const future = Math.floor(Date.now() / 1000) + 1000;
-  const past = Math.floor(Date.now() / 1000) - 1000;
-  const base = { creator, agent: null, pendingAgent: null, milestoneCount: 1, milestonesDone: 0, deadline: future };
+  const alice = 'Agn1111111111111111111111111111111111111111';
+  const bob = 'Bgn1111111111111111111111111111111111111111';
+  const now = Math.floor(Date.now() / 1000);
+  const future = now + 1000;
+  const past = now - 1000;
+  const base = {
+    creator, invitedAgent: null, isOpen: true, milestoneCount: 1, milestoneBps: [10000],
+    milestonesDone: 0, deadline: future, workWindow: 7200, workDeadline: future,
+    reviewWindow: 3600, milestoneSubmitted: [0], milestoneRejected: [0],
+    unresolvedSubmissions: 0, latestSubmittedAt: 0, pledged: 0, released: 0, refunded: 0,
+    pledgerCount: 0, refundedPledgerCount: 0, submissions: 0, rejections: 0,
+    autoReleases: 0, intents: 0,
+  };
+  const sub = (agent, sequence, submittedAt, state = 'pending') =>
+    ({ agent, milestoneIndex: 0, sequence, submittedAt, state, evidenceHash: 'ab'.repeat(32) });
 
-  assert.deepEqual(escrow.availableActions({ ...base, status: 'funding' }, stranger), ['pledge']);
-  assert.ok(escrow.availableActions({ ...base, status: 'funded' }, creator).includes('selectAgent'));
-  assert.ok(!escrow.availableActions({ ...base, status: 'funded' }, stranger).includes('selectAgent'));
-  assert.ok(escrow.availableActions({ ...base, status: 'funded', pendingAgent: agent }, agent).includes('acceptAgent'));
-  assert.ok(escrow.availableActions({ ...base, status: 'funded', pendingAgent: agent }, creator).includes('revokeAgent'));
-  assert.ok(escrow.availableActions({ ...base, status: 'building', agent }, creator).includes('releaseMilestone'));
+  assert.deepEqual(escrow.availableActions({ ...base, status: 'funding' }, bob, { nowUnix: now }), ['pledge']);
 
-  // Mid-build only the contracted agent may cancel.
-  const building = { ...base, status: 'building', agent };
-  assert.ok(escrow.availableActions(building, agent).includes('cancel'));
-  assert.ok(!escrow.availableActions(building, creator).includes('cancel'));
-  assert.ok(!escrow.availableActions(building, stranger).includes('cancel'));
+  // THE POINT: a funded commission is workable by anyone, with no permission.
+  const funded = { ...base, status: 'funded' };
+  assert.ok(escrow.availableActions(funded, alice, { nowUnix: now }).includes('submitDelivery'));
+  assert.ok(escrow.availableActions(funded, bob, { nowUnix: now }).includes('submitDelivery'));
+  assert.ok(escrow.availableActions(funded, alice, { nowUnix: now }).includes('signalIntent'));
+  assert.ok(
+    !escrow.availableActions(funded, creator, { nowUnix: now }).includes('submitDelivery'),
+    'a creator who could also be paid is a one-signature path to draining backers');
+  assert.ok(
+    escrow.availableActions(funded, creator, { nowUnix: now }).includes('inviteAgent'),
+    'narrowing the board stays available, it is just not the default');
 
-  // Past the deadline anyone may cancel, and refunds open.
-  const expired = { ...base, status: 'funded', deadline: past };
-  assert.ok(escrow.availableActions(expired, stranger, Math.floor(Date.now() / 1000)).includes('cancel'));
-  assert.ok(escrow.availableActions(expired, stranger, Math.floor(Date.now() / 1000)).includes('refund'));
-  assert.ok(!escrow.availableActions(expired, stranger, Math.floor(Date.now() / 1000)).includes('pledge'));
+  // An invitation closes it to everyone else.
+  const invited = { ...base, status: 'funded', invitedAgent: alice, isOpen: false };
+  assert.ok(escrow.availableActions(invited, alice, { nowUnix: now }).includes('submitDelivery'));
+  assert.ok(!escrow.availableActions(invited, bob, { nowUnix: now }).includes('submitDelivery'));
+
+  // Two competing deliveries: only the front of the queue is judgeable.
+  const queued = {
+    ...base, status: 'funded', milestoneSubmitted: [2], unresolvedSubmissions: 2,
+    latestSubmittedAt: now, submissions: 2,
+  };
+  const submissions = [sub(alice, 0, now), sub(bob, 1, now)];
+  assert.ok(escrow.availableActions(queued, creator, { nowUnix: now, submissions }).includes('rejectDelivery'));
+  assert.ok(escrow.availableActions(queued, creator, { nowUnix: now, submissions }).includes('releaseMilestone'));
+  assert.equal(escrow.frontOfQueue(queued, submissions, 0).agent, alice);
+
+  // Once the front has matured, anyone may complete the payment.
+  assert.ok(
+    escrow.availableActions(queued, bob, { nowUnix: now + 3600, submissions }).includes('releaseMilestone'),
+    'silence has to resolve to payment or stiffing an agent is free again');
+
+  // Past every deadline, refunds open.
+  const expired = { ...base, status: 'funded', deadline: past, workDeadline: past };
+  assert.ok(escrow.availableActions(expired, bob, { nowUnix: now }).includes('refund'));
+  assert.ok(!escrow.availableActions(expired, bob, { nowUnix: now }).includes('submitDelivery'));
 });
-
 test('program errors are translated into something an agent can act on', () => {
   assert.equal(escrow.explainError(new Error('custom program error: 0x18')).name, 'SelfDealing');
   assert.equal(escrow.explainError(new Error('custom program error: 0x19')).name, 'DeadlineTooFar');
@@ -182,9 +275,10 @@ test('transaction endpoints validate before touching the network', async () => {
 
   assert.equal((await post('not-a-real-action', {})).status, 404);
 
-  const selfDeal = await post('select-agent', { creator: TREASURY, commission: LIVE_COMMISSION, agent: TREASURY });
-  assert.equal(selfDeal.status, 400);
-  assert.match((await selfDeal.json()).error, /cannot nominate themselves/);
+  // Nomination is gone entirely. Nothing stands between a funded commission and
+  // an agent who wants to work on it.
+  assert.equal((await post('select-agent', {})).status, 404, 'nomination must not still be reachable');
+  assert.equal((await post('accept-agent', {})).status, 404);
 
   const badMilestones = await post('create-commission', { creator: TREASURY, goalSol: 1, milestoneBasisPoints: [5000, 4000] });
   assert.equal(badMilestones.status, 400);
@@ -194,10 +288,10 @@ test('transaction endpoints validate before touching the network', async () => {
   assert.equal(tooFar.status, 400);
   assert.match((await tooFar.json()).error, /30 days/);
 
-  // The delivery and review clocks are bounded on both sides.
-  const shortDelivery = await post('create-commission', { creator: TREASURY, goalSol: 1, deliveryWindowSeconds: 60 });
-  assert.equal(shortDelivery.status, 400);
-  assert.match((await shortDelivery.json()).error, /Delivery window/);
+  // The work and review clocks are bounded on both sides.
+  const shortWork = await post('create-commission', { creator: TREASURY, goalSol: 1, workWindowSeconds: 60 });
+  assert.equal(shortWork.status, 400);
+  assert.match((await shortWork.json()).error, /Work window/);
 
   const longReview = await post('create-commission', { creator: TREASURY, goalSol: 1, reviewHours: 24 * 30 });
   assert.equal(longReview.status, 400);

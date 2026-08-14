@@ -50,7 +50,7 @@ const STATUS = escrow.STATUS;
 // hostile /api/config cannot influence a single byte of what gets signed.
 const ESCROW_CTX = { programId:PINNED.programId, configPda:PINNED.configPda, treasury:PINNED.treasuryWallet };
 const STATUS_UI = {
-  funding:{label:'Open',detail:'Open for pledges',cls:'blue',icon:'circle'}, funded:{label:'Funded',detail:'Funded — accepting agent',cls:'yellow',icon:'clock'}, building:{label:'In progress',detail:'In progress',cls:'purple',icon:'play'}, shipped:{label:'Delivered',detail:'Delivered',cls:'green',icon:'check'}, refunded:{label:'Closed',detail:'Closed — refundable',cls:'gray',icon:'x'}
+  funding:{label:'Raising',detail:'Open for pledges',cls:'blue',icon:'circle'}, funded:{label:'Open for work',detail:'Funded — any agent may deliver',cls:'green',icon:'play'}, shipped:{label:'Delivered',detail:'Delivered and paid',cls:'purple',icon:'check'}, refunded:{label:'Closed',detail:'Closed — refundable',cls:'gray',icon:'x'}
 };
 const ICON_PATHS={circle:'M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Z',clock:'M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0Zm0 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM7.25 4a.75.75 0 0 1 1.5 0v3.69l2.03 2.03a.75.75 0 1 1-1.06 1.06l-2.25-2.25A.75.75 0 0 1 7.25 8V4Z',play:'M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16ZM6.5 4.9a.5.5 0 0 1 .76-.43l5 3.1a.5.5 0 0 1 0 .86l-5 3.1A.5.5 0 0 1 6.5 11.1V4.9Z',check:'M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16Zm3.78-9.72-4.25 4.25a.75.75 0 0 1-1.06 0l-2.25-2.25a.75.75 0 0 1 1.06-1.06L7 8.94l3.72-3.72a.75.75 0 1 1 1.06 1.06Z',x:'M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16Zm2.78-10.78a.75.75 0 0 1 0 1.06L9.06 8l1.72 1.72a.75.75 0 1 1-1.06 1.06L8 9.06l-1.72 1.72a.75.75 0 0 1-1.06-1.06L6.94 8 5.22 6.28a.75.75 0 0 1 1.06-1.06L8 6.94l1.72-1.72a.75.75 0 0 1 1.06 0Z',book:'M0 1.75A1.75 1.75 0 0 1 1.75 0h4.5C7.216 0 8 .784 8 1.75v12.5A1.75 1.75 0 0 0 6.25 12.5h-4.5c-.09 0-.18.007-.267.02A2.99 2.99 0 0 1 3 12.126V1.75A.25.25 0 0 0 2.75 1.5h-1a.25.25 0 0 0-.25.25v9.378A3 3 0 0 0 0 13.728V1.75Zm16 0v11.978a3 3 0 0 0-1.5-2.6V1.75a.25.25 0 0 0-.25-.25h-1a.25.25 0 0 0-.25.25v10.376a2.99 2.99 0 0 1 1.517.394 1.75 1.75 0 0 0-.267-.02h-4.5A1.75 1.75 0 0 0 8 14.25V1.75C8 .784 8.784 0 9.75 0h4.5C15.216 0 16 .784 16 1.75Z'};
 // Solscan omits the query only on mainnet, so the cluster has to be carried
@@ -427,7 +427,8 @@ function timeLeft(unix){
   if(seconds<86400)return`${Math.floor(seconds/3600)}h left`;
   return`${Math.floor(seconds/86400)}d left`;
 }
-function attentionFor(p){return escrow.pendingAttention(p,currentWallet());}
+function submissionsOf(p){return p.meta?.submissions||[];}
+function attentionFor(p){return escrow.pendingAttention(p,currentWallet(),{submissions:submissionsOf(p)});}
 
 /// Renders a piece of evidence as a link when it is safely one, and as plain
 /// text otherwise.
@@ -485,28 +486,67 @@ function openProject(address){
   const m=p.meta||{},wallet=currentWallet(),ui=STATUS_UI[p.status]||STATUS_UI.refunded;
   let actions='';
   if(p.status==='funding'&&wallet)actions=`<div class="field"><label for="pledgeAmount">Pledge amount</label><input id="pledgeAmount" type="number" min="0.000001" step="0.000001" placeholder="0.00"><div class="hint">Amount in SOL. Your wallet will confirm the escrow transaction.</div></div><div class="action-row"><button class="btn primary lg" data-action="pledge" data-id="${p.address}">Pledge SOL</button></div>`;
-  if(p.status==='funded'&&wallet===p.creator&&!p.pendingAgent)actions=`<div class="field"><label for="agentWallet">Agent wallet address</label><input id="agentWallet" type="text" placeholder="Solana address"><div class="hint">The nominated wallet must separately accept the contract.</div></div><div class="action-row"><button class="btn primary" data-action="nominate" data-id="${p.address}">Nominate agent</button></div>`;
-  if(p.status==='funded'&&p.pendingAgent&&wallet===p.pendingAgent)actions=`<div class="action-row"><button class="btn primary lg" data-action="accept" data-id="${p.address}">Accept contract</button></div>`;
-  if(p.status==='funded'&&p.pendingAgent&&wallet!==p.pendingAgent)actions=`<p class="hint">Waiting for <span class="mono">${esc(p.pendingAgent)}</span> to accept.</p>${wallet===p.creator?`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="revoke" data-id="${p.address}">Withdraw nomination</button></div><p class="hint" style="margin-top:8px">Frees the commission so you can nominate someone else. Only possible while the nomination is unaccepted.</p>`:''}`;
-  if(p.status==='building'&&wallet===p.creator){
-    const sub=p.submission, matured=escrow.reviewExpired(p);
-    actions=(sub?`<div class="flash-inline" style="margin-bottom:12px"><b>Delivery submitted</b> for milestone ${sub.milestoneIndex+1} on ${new Date(sub.submittedAt*1000).toLocaleString()}.<br>${matured?'The review window has passed, so this milestone can now be released by anyone.':`Review ends ${new Date(sub.reviewEndsAt*1000).toLocaleString()} — if you do nothing, it releases automatically.`}</div>`+deliveryPanel(p,sub)+deliveryHistory(p,sub.evidenceHash):deliveryHistory(p,null))
-      +`<div class="action-row">${p.milestoneBps.map((bps,i)=>`<button class="btn ${sub&&sub.milestoneIndex===i?'primary':''}" data-action="release" data-index="${i}" data-id="${p.address}" ${p.milestonesDone&(1<<i)?'disabled':''}>${p.milestonesDone&(1<<i)?'Released':'Release'} milestone ${i+1} · ${bps/100}%</button>`).join('')}</div>`
-      +(sub&&!matured?`<div class="action-row" style="margin-top:8px"><button class="btn danger" data-action="reject" data-id="${p.address}">Reject this delivery</button></div><p class="hint" style="margin-top:8px">Rejecting is recorded on chain against your address and stops the automatic release. It also ends this agent's contract and returns the commission to the pool, so you can hire someone else \u2014 including the same agent again. The delivery clock keeps running.<br><br>Because work was delivered, the 1% connection fee now applies however this commission settles. Refusing costs you exactly what approving costs, so decide on the work.</p>`:'')
-      +`<p class="hint" style="margin-top:12px">Releasing pays the agent immediately and cannot be undone.${p.submissions?' A delivery has been made, so the 1% connection fee applies whether this settles by release or by refund.':''}</p>`;
+  // ── the board ─────────────────────────────────────────────────────────
+  //
+  // A funded commission is workable by anyone. There is no nomination step, no
+  // acceptance, and nothing for a creator to decide before work can start.
+  const subs=p.meta?.submissions||[];
+  const queue=i=>subs.filter(s=>s.milestoneIndex===i&&s.state==='pending').sort((a,b)=>a.sequence-b.sequence);
+  const front=i=>escrow.frontOfQueue(p,subs,i);
+  const unreleased=p.milestoneBps.map((_,i)=>i).filter(i=>!(p.milestonesDone&(1<<i)));
+
+  if(p.status==='funded'&&escrow.canWork(p,wallet)){
+    const mySubs=subs.filter(s=>s.agent===wallet&&s.state==='pending');
+    const competition=subs.filter(s=>s.state==='pending').length;
+    actions=`<div class="flash-inline" style="margin-bottom:12px"><b>Open for work.</b> Nobody has been assigned and nobody can be. Deliver it and, if the creator judges it good, the escrow is yours.${competition?` <b>${competition}</b> ${competition===1?'delivery is':'deliveries are'} already in the queue ahead of anything you submit now.`:' You would be first in the queue.'}${p.intents?` ${p.intents} ${p.intents===1?'agent has':'agents have'} said they are working on it.`:''}</div>`
+      +`<div class="field"><label for="deliveryEvidence">Delivery evidence</label><input id="deliveryEvidence" type="text" placeholder="Commit URL, PR link, or artifact hash"><div class="hint">This is what the creator sees and judges. Only its hash goes on chain; the text itself is recorded alongside and shown to them, and is only accepted if it matches that hash.</div></div>`
+      +`<div class="action-row">${unreleased.map(i=>`<button class="btn primary" data-action="submit" data-index="${i}" data-id="${p.address}">Deliver milestone ${i+1} \u00b7 ${p.milestoneBps[i]/100}%</button>`).join('')}</div>`
+      +`<p class="hint" style="margin-top:8px">Deliveries are judged oldest first. Submitting starts a ${Math.round(p.reviewWindow/3600)}-hour review clock on yours once it reaches the front; if the creator neither releases nor rejects it, anyone can release your payment \u2014 including you.</p>`
+      +(mySubs.length?'':`<div class="action-row" style="margin-top:12px"><button class="btn" data-action="signalIntent" data-id="${p.address}">Signal that you are working on this</button></div><p class="hint" style="margin-top:8px">Non-binding, and it reserves nothing. It tells other agents how crowded this job is, and going quiet afterwards is visible on your record.</p>`);
   }
-  if(p.status==='building'&&wallet===p.agent){
-    const sub=p.submission, matured=escrow.reviewExpired(p), overdue=Math.floor(Date.now()/1000)>=p.deliveryDeadline;
-    const unreleased=p.milestoneBps.map((_,i)=>i).filter(i=>!(p.milestonesDone&(1<<i)));
-    actions=sub
-      ? `<div class="flash-inline"><b>Delivery submitted</b> for milestone ${sub.milestoneIndex+1}.<br>${matured?'The review window has passed — this milestone can now be released by anyone, including you.':`Awaiting review until ${new Date(sub.reviewEndsAt*1000).toLocaleString()}. If the creator says nothing, it pays out automatically. If they reject, your contract ends and the commission returns to the pool \u2014 you can be nominated again.`}</div>`+deliveryPanel(p,sub)
-        +(matured?`<div class="action-row" style="margin-top:12px"><button class="btn primary lg" data-action="release" data-index="${sub.milestoneIndex}" data-id="${p.address}">Claim milestone ${sub.milestoneIndex+1}</button></div>`:'')
-      : overdue
-        ? `<p class="hint">Your delivery window closed on ${new Date(p.deliveryDeadline*1000).toLocaleString()}. The escrow is now refundable to backers.</p>`
-        : `<div class="field"><label for="deliveryEvidence">Delivery evidence</label><input id="deliveryEvidence" type="text" placeholder="Commit URL, PR link, or artifact hash"><div class="hint">This is what the creator sees and judges. Only its hash goes on chain; the text itself is recorded alongside and shown to them, and is only accepted if it matches that hash.</div></div><div class="action-row">${unreleased.map(i=>`<button class="btn primary" data-action="submit" data-index="${i}" data-id="${p.address}">Submit milestone ${i+1}</button>`).join('')}</div><p class="hint" style="margin-top:8px">Submitting starts a ${Math.round(p.reviewWindow/3600)}-hour review clock. If the creator neither releases nor rejects before it ends, anyone can release your payment \u2014 including you. Claim within 24 hours of it maturing; after that the escrow reopens to refunds.</p>`;
-    actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Return remaining funds and end contract</button></div><p class="hint" style="margin-top:8px">Ends your claim on the ${fmtBase(p.pledged-p.released)} SOL still in escrow. Milestones already released are yours to keep.</p>`;
+
+  // The creator's queue, judged strictly oldest first.
+  if(wallet===p.creator&&subs.some(s=>s.state==='pending')){
+    const panels=unreleased.map(i=>{
+      const waiting=queue(i);
+      if(!waiting.length)return'';
+      const head=waiting[0];
+      const matured=escrow.reviewExpired(head,p.reviewWindow);
+      return `<div class="queue"><div class="queue-head">Milestone ${i+1} \u00b7 ${p.milestoneBps[i]/100}% \u00b7 ${waiting.length} ${waiting.length===1?'delivery':'deliveries'} waiting</div>`
+        +deliveryPanel(p,head)
+        +`<div class="action-row"><button class="btn primary" data-action="release" data-index="${i}" data-agent="${head.agent}" data-id="${p.address}">Accept and pay ${fmtBase(Math.floor(p.pledged*p.milestoneBps[i]/10000*0.99))} SOL</button>`
+        +(matured?'':`<button class="btn danger" data-action="reject" data-index="${i}" data-agent="${head.agent}" data-id="${p.address}">Reject and see the next</button>`)
+        +`</div>`
+        +`<p class="hint" style="margin-top:8px">${matured
+          ?'The review window has passed, so anyone can now release this to the agent.'
+          :`Review ends ${new Date(escrow.reviewEndsAt(head,p.reviewWindow)*1000).toLocaleString()}. Say nothing and it pays out automatically.`}
+          ${waiting.length>1?`Rejecting brings the next of ${waiting.length} forward; you cannot skip past this one.`:''}</p>`
+        +(waiting.length>1?`<details class="evidence-history"><summary>The ${waiting.length-1} behind it</summary>${waiting.slice(1).map(s=>`<div class="evidence past"><div class="evidence-head">${esc(s.agent.slice(0,8))}\u2026 \u00b7 ${new Date(s.submittedAt*1000).toLocaleString()}</div><div class="evidence-body">${evidenceHtml((p.meta?.deliveries||[]).find(d=>d.evidenceHash===s.evidenceHash)?.evidence||'(evidence not recorded)')}</div></div>`).join('')}</details>`:'')
+        +`</div>`;
+    }).join('');
+    actions=panels+`<p class="hint" style="margin-top:12px">Accepting pays that agent immediately and cannot be undone. Because work was delivered, the 1% connection fee applies however this settles \u2014 refusing costs exactly what accepting costs, so decide on the work.</p>`;
   }
-  if((p.status==='funding'||p.status==='funded')&&wallet===p.creator)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Cancel commission</button></div>`;
+
+  // An agent whose delivery has matured can take it themselves.
+  if(wallet&&wallet!==p.creator){
+    const mine=subs.filter(s=>s.agent===wallet);
+    for(const s of mine){
+      if(s.state!=='pending')continue;
+      const isFront=front(s.milestoneIndex)?.agent===wallet;
+      const matured=isFront&&escrow.reviewExpired(s,p.reviewWindow);
+      const ahead=s.sequence-(p.milestoneRejected[s.milestoneIndex]||0);
+      actions+=`<div class="flash-inline" style="margin-top:12px"><b>Your delivery for milestone ${s.milestoneIndex+1}.</b> ${matured
+        ?'The review window has passed \u2014 claim it.'
+        :isFront?`Awaiting the creator until ${new Date(escrow.reviewEndsAt(s,p.reviewWindow)*1000).toLocaleString()}. Silence pays you.`
+        :`${ahead} ${ahead===1?'delivery is':'deliveries are'} ahead of yours. Yours is judged only if those are rejected.`}</div>`
+        +(matured?`<div class="action-row"><button class="btn primary lg" data-action="release" data-index="${s.milestoneIndex}" data-agent="${wallet}" data-id="${p.address}">Claim milestone ${s.milestoneIndex+1}</button></div>`:'');
+    }
+  }
+
+  if(wallet===p.creator&&['funding','funded'].includes(p.status)){
+    actions+=`<div class="field" style="margin-top:16px"><label for="agentWallet">Restrict to one agent <span class="hint">optional</span></label><input id="agentWallet" type="text" placeholder="Solana address, or your own to reopen"><div class="hint">Commissions are open to every agent by default, which is the point. Use this only if you already know who you want.</div></div><div class="action-row"><button class="btn" data-action="invite" data-id="${p.address}">${p.invitedAgent?'Change or clear the invitation':'Restrict this commission'}</button></div>`;
+  }
+  if(p.status==='funding'&&wallet===p.creator)actions+=`<div class="action-row" style="margin-top:12px"><button class="btn danger" data-action="cancel" data-id="${p.address}">Cancel commission</button></div><p class="hint" style="margin-top:8px">Only while it is still raising. Once funded, agents may already be working on it and the bounty stands.</p>`;
   if(p.status==='refunded'&&wallet)actions=`<div class="action-row"><button class="btn primary" data-action="refund" data-id="${p.address}">Claim available refund</button></div>`;
   // Rent sitting in accounts that can never be used again is just locked SOL,
   // so offer it back. This never touches escrow, which is why it is listed last
@@ -537,7 +577,7 @@ async function openCreate(){
   const deadlineMin=asLocalInput(new Date(nowMs+3600000));
   const deadlineMax=asLocalInput(new Date(nowMs+escrow.MAX_FUNDING_DURATION_SECONDS*1000));
   $('dlg').className='dlg dlg-create';
-  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>Create a commission</h1><div class="sub">Define the work, funding target, and release schedule on Solana ${esc(state.config.cluster)}.</div></div>${closeIcon()}</div></div><div class="form-section"><h2>Commission details</h2><p>Give backers a precise description of what will be delivered.</p><div class="field"><label for="nTitle">Title</label><input id="nTitle" type="text" maxlength="120" placeholder="A concise outcome"></div><div class="field"><label for="nDescription">Description</label><textarea id="nDescription" placeholder="Scope, acceptance criteria, and expected deliverables"></textarea></div><div class="grid2"><div class="field"><label for="nRepo">Repository URL <span class="hint">optional</span></label><input id="nRepo" type="text" placeholder="https://github.com/owner/repo"></div><div class="field"><label for="nLicense">License</label><input id="nLicense" type="text" value="MIT"></div></div><div class="field"><label for="nLabels">Labels <span class="hint">optional</span></label><input id="nLabels" type="text" placeholder="cli, media, typescript"><div class="hint">Comma-separated. Labels become live filters on the commission list.</div></div></div><div class="form-section"><h2>Funding and delivery</h2><p>Funds remain in program-controlled escrow until milestones are released or refunded.</p><div class="grid2"><div class="field"><label for="nGoal">Funding goal (SOL)</label><input id="nGoal" type="number" min="0.000001" step="0.000001" placeholder="1000"></div><div class="field"><label for="nDeadline">Funding deadline</label><input id="nDeadline" type="datetime-local" value="${deadlineDefault}" min="${deadlineMin}" max="${deadlineMax}"><div class="hint">Funding must close within ${escrow.MAX_FUNDING_DURATION_SECONDS/86400} days. Defaults to 14 days from now.</div></div></div><div class="grid2"><div class="field"><label for="nDelivery">Delivery window (days)</label><input id="nDelivery" type="number" min="1" max="30" step="1" value="3"><div class="hint">How long the agent has once they accept. The clock starts at acceptance, not now.</div></div><div class="field"><label for="nReview">Review window (hours)</label><input id="nReview" type="number" min="1" max="336" step="1" value="48"><div class="hint">After a delivery is submitted you have this long to release or reject it. Say nothing and it pays out automatically.</div></div></div><div class="field"><label for="nMilestones">Milestone percentages</label><input id="nMilestones" type="text" value="25,40,20,15"><div class="hint">Comma-separated percentages. They must total 100.</div></div></div><div class="dlg-footer"><span class="hint">Your wallet will confirm the on-chain creation transaction.</span><button class="btn" type="button" id="bX">Cancel</button><button class="btn primary lg" id="doCreate">Create and sign</button></div>`;
+  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>Create a commission</h1><div class="sub">Define the work, funding target, and release schedule on Solana ${esc(state.config.cluster)}.</div></div>${closeIcon()}</div></div><div class="form-section"><h2>Commission details</h2><p>Give backers a precise description of what will be delivered.</p><div class="field"><label for="nTitle">Title</label><input id="nTitle" type="text" maxlength="120" placeholder="A concise outcome"></div><div class="field"><label for="nDescription">Description</label><textarea id="nDescription" placeholder="Scope, acceptance criteria, and expected deliverables"></textarea></div><div class="grid2"><div class="field"><label for="nRepo">Repository URL <span class="hint">optional</span></label><input id="nRepo" type="text" placeholder="https://github.com/owner/repo"></div><div class="field"><label for="nLicense">License</label><input id="nLicense" type="text" value="MIT"></div></div><div class="field"><label for="nLabels">Labels <span class="hint">optional</span></label><input id="nLabels" type="text" placeholder="cli, media, typescript"><div class="hint">Comma-separated. Labels become live filters on the commission list.</div></div></div><div class="form-section"><h2>Funding and delivery</h2><p>Funds remain in program-controlled escrow until milestones are released or refunded.</p><div class="grid2"><div class="field"><label for="nGoal">Funding goal (SOL)</label><input id="nGoal" type="number" min="0.000001" step="0.000001" placeholder="1000"></div><div class="field"><label for="nDeadline">Funding deadline</label><input id="nDeadline" type="datetime-local" value="${deadlineDefault}" min="${deadlineMin}" max="${deadlineMax}"><div class="hint">Funding must close within ${escrow.MAX_FUNDING_DURATION_SECONDS/86400} days. Defaults to 14 days from now.</div></div></div><div class="grid2"><div class="field"><label for="nDelivery">Work window (days)</label><input id="nDelivery" type="number" min="1" max="30" step="1" value="3"><div class="hint">How long the job stays open for work once it is funded. Any agent may deliver in that time; nobody has to be chosen.</div></div><div class="field"><label for="nReview">Review window (hours)</label><input id="nReview" type="number" min="1" max="336" step="1" value="48"><div class="hint">After a delivery is submitted you have this long to release or reject it. Say nothing and it pays out automatically.</div></div></div><div class="field"><label for="nMilestones">Milestone percentages</label><input id="nMilestones" type="text" value="25,40,20,15"><div class="hint">Comma-separated percentages. They must total 100.</div></div></div><div class="dlg-footer"><span class="hint">Your wallet will confirm the on-chain creation transaction.</span><button class="btn" type="button" id="bX">Cancel</button><button class="btn primary lg" id="doCreate">Create and sign</button></div>`;
   $('overlay').classList.add('on');
 }
 async function createCommission(){
@@ -554,9 +594,9 @@ async function createCommission(){
   if(deadline>nowUnix+escrow.MAX_FUNDING_DURATION_SECONDS)throw new Error(`Funding must close within ${maxFundingDays} days. Choose an earlier deadline.`);
   if(goal<escrow.BPS_DENOMINATOR)throw new Error(`The funding goal must be at least ${escrow.BPS_DENOMINATOR/LAMPORTS_PER_SOL} SOL.`);
   if(percentages.length>escrow.MAX_MILESTONES)throw new Error(`Use at most ${escrow.MAX_MILESTONES} milestones.`);
-  if(!(deliveryDays>=1&&deliveryDays<=escrow.MAX_DELIVERY_WINDOW_SECONDS/86400))throw new Error(`Delivery window must be between 1 and ${escrow.MAX_DELIVERY_WINDOW_SECONDS/86400} days.`);
+  if(!(deliveryDays>=1&&deliveryDays<=escrow.MAX_WORK_WINDOW_SECONDS/86400))throw new Error(`Work window must be between 1 and ${escrow.MAX_WORK_WINDOW_SECONDS/86400} days.`);
   if(!(reviewHours>=1&&reviewHours<=escrow.MAX_REVIEW_WINDOW_SECONDS/3600))throw new Error(`Review window must be between 1 and ${escrow.MAX_REVIEW_WINDOW_SECONDS/3600} hours.`);
-  const {commission,instruction}=escrow.build.createCommission(ESCROW_CTX,{creator:state.wallet,seed,goalLamports:goal,milestoneBasisPoints:percentages.map(x=>x*100),deadlineUnix:deadline,deliveryWindowSeconds:Math.round(deliveryDays*86400),reviewWindowSeconds:Math.round(reviewHours*3600)});const signature=await send(new Transaction().add(instruction),showProgress);
+  const {commission,instruction}=escrow.build.createCommission(ESCROW_CTX,{creator:state.wallet,seed,goalLamports:goal,milestoneBasisPoints:percentages.map(x=>x*100),deadlineUnix:deadline,workWindowSeconds:Math.round(deliveryDays*86400),reviewWindowSeconds:Math.round(reviewHours*3600)});const signature=await send(new Transaction().add(instruction),showProgress);
   showProgress('Indexing\u2026');
   await api('/api/commissions',{method:'POST',body:JSON.stringify({address:commission.toBase58(),txSignature:signature,title,description,repositoryUrl:$('nRepo').value.trim()||null,license:$('nLicense').value.trim()||'MIT',labels:$('nLabels').value.split(',').map(value=>value.trim().toLowerCase()).filter(Boolean).slice(0,8)})});
   closeDialog();
@@ -581,15 +621,18 @@ async function pledge(address){
     ?`Pledge confirmed \u2014 goal reached, ${fmtBase(after.pledged)} SOL in escrow.`
     :'Pledge confirmed.');
 }
-async function simpleAction(action,address,index){
+async function simpleAction(action,address,index,agentArg){
   const p=state.projects.find(x=>x.address===address);let built,submitted=null;
-  if(action==='nominate')built=escrow.build.selectAgent(ESCROW_CTX,{creator:state.wallet,commission:address,agent:$('agentWallet').value.trim()});
-  else if(action==='revoke')built=escrow.build.revokeAgent(ESCROW_CTX,{creator:state.wallet,commission:address});
-  else if(action==='accept')built=escrow.build.acceptAgent(ESCROW_CTX,{agent:state.wallet,commission:address});
+  if(action==='invite')built=escrow.build.inviteAgent(ESCROW_CTX,{creator:state.wallet,commission:address,agent:$('agentWallet').value.trim()||state.wallet});
+  else if(action==='signalIntent')built=escrow.build.signalIntent(ESCROW_CTX,{agent:state.wallet,commission:address});
+  else if(action==='withdrawIntent')built=escrow.build.withdrawIntent(ESCROW_CTX,{agent:state.wallet,commission:address});
   else if(action==='cancel')built=escrow.build.cancel(ESCROW_CTX,{signer:state.wallet,commission:address});
-  else if(action==='release')built=escrow.build.releaseMilestone(ESCROW_CTX,{creator:state.wallet,commission:address,agent:p.agent,milestoneIndex:Number(index)});
+  // The agent being paid is named on the button, because several may have
+  // delivered and only the one at the front of the queue can be released.
+  else if(action==='release')built=escrow.build.releaseMilestone(ESCROW_CTX,{signer:state.wallet,commission:address,agent:agentArg,milestoneIndex:Number(index)});
   else if(action==='refund')built=escrow.build.refund(ESCROW_CTX,{backer:state.wallet,commission:address});
   else if(action==='closePledge')built=escrow.build.closePledge(ESCROW_CTX,{backer:state.wallet,commission:address});
+  else if(action==='closeSubmission')built=escrow.build.closeSubmission(ESCROW_CTX,{agent:state.wallet,commission:address,milestoneIndex:Number(index)});
   else if(action==='closeVault')built=escrow.build.closeVault(ESCROW_CTX,{signer:state.wallet,commission:address,creator:p.creator});
   else if(action==='submit'){
     submitted=($('deliveryEvidence')?.value||'').trim();
@@ -598,7 +641,7 @@ async function simpleAction(action,address,index){
     const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(submitted));
     built=escrow.build.submitDelivery(ESCROW_CTX,{agent:state.wallet,commission:address,milestoneIndex:Number(index)||0,evidenceHash:Buffer.from(new Uint8Array(digest))});
   }
-  else if(action==='reject')built=escrow.build.rejectDelivery(ESCROW_CTX,{creator:state.wallet,commission:address});
+  else if(action==='reject')built=escrow.build.rejectDelivery(ESCROW_CTX,{creator:state.wallet,commission:address,agent:agentArg,milestoneIndex:Number(index)});
   else throw new Error(`Unknown action: ${action}`);
   await send(new Transaction().add(built.instruction),showProgress);
   // Record what was delivered, now that the commitment it must match is on
@@ -624,12 +667,13 @@ async function simpleAction(action,address,index){
   // somebody else. That is the moment a notification is worth something.
   offerNotifications();
   showToast({
-    nominate:'Agent nominated. They need to accept before work starts.',
-    revoke:'Nomination withdrawn.',
-    accept:'Contract accepted. Your delivery clock is running.',
-    submit:'Delivery submitted. The review clock is running.',
-    reject:'Delivery rejected. The commission is back in the pool.',
-    release:'Milestone released. The agent has been paid.',
+    invite:'Commission restricted to one agent. Name yourself to reopen it.',
+    signalIntent:'Signalled. This reserves nothing \u2014 deliver to actually compete.',
+    withdrawIntent:'Intent withdrawn.',
+    submit:'Delivered. It is judged in the order it arrived.',
+    reject:'Delivery rejected. The next in the queue is now judgeable.',
+    release:'Paid. That agent won the milestone.',
+    closeSubmission:'Submission closed. Its rent is back in your wallet.',
     refund:'Refund complete \u2014 your escrow and your pledge rent are back.',
     closePledge:'Pledge account closed. Its rent is back in your wallet.',
     closeVault:'Vault closed. Its rent has gone back to the creator.',
@@ -663,7 +707,7 @@ function showProgress(message){
 function hideProgress(){const t=$('toast');if(t.classList.contains('busy')){t.className='toast';}}
 function showNotice(message){showToast(message);}
 function showError(error){console.error(error);hideProgress();showToast(friendlyWalletError(error));}
-document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]');if(!t)return;if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
+document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]');if(!t)return;if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index,t.dataset.agent).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('overlay').classList.contains('on'))closeDialog();});
 $('q').addEventListener('input',render);
 document.addEventListener('change',event=>{if(event.target.id==='sortSelect'){state.sort=event.target.value;render();}});

@@ -95,16 +95,17 @@ test('the server verifies evidence against the chain, not the caller', () => {
   const handler = SERVER.slice(SERVER.indexOf("app.post('/api/deliveries'"), SERVER.indexOf('function deliveriesFor'));
   assert.match(handler, /createHash\('sha256'\)/, 'the submitted text must be hashed');
   assert.match(handler, /timingSafeEqual/, 'the comparison must not leak by timing');
-  // Assert the COMPARED value is bound from the chain. `chain.submission.
-  // evidenceHash` also appears further down when building the stored record, so
-  // a bare presence check survives the comparison being repointed at req.body.
-  assert.match(handler, /const committed = Buffer\.from\(chain\.submission\.evidenceHash, 'hex'\)/,
-    'the compared commitment must be bound from chain, never from the request');
+  // Several agents may be competing on one milestone, so the text is matched
+  // against every submission account committed for it — all read from chain.
+  assert.match(handler, /decodeSubmission\(Buffer\.from\(entry\.account\.data\[0\], 'base64'\)\)/,
+    'candidate commitments must be decoded from real accounts');
+  assert.match(handler, /Buffer\.from\(candidate\.evidenceHash, 'hex'\)/,
+    'the compared commitment must be bound from a chain account, never from the request');
   assert.equal(/Buffer\.from\(req\.body\.\w*[Hh]ash/.test(handler), false,
     'a caller-supplied hash must never be trusted as the commitment');
-  assert.match(handler, /getAccountInfo/,
-    'the commitment must be read live; a cached one would reject a delivery that just landed');
-  assert.match(handler, /chain\.submission\.milestoneIndex !== milestoneIndex/,
+  assert.match(handler, /getProgramAccounts/,
+    'the commitments must be read live; a cached one would reject a delivery that just landed');
+  assert.match(handler, /candidate\.milestoneIndex !== milestoneIndex/,
     'evidence must be tied to the milestone it was submitted for');
 });
 
@@ -119,12 +120,12 @@ test('a delivery record can never outrank the chain', () => {
 
 test('the creator is shown the work, not a hash', () => {
   assert.match(CLIENT, /function deliveryPanel\(/, 'there must be a panel for the delivered work');
-  // The creator's branch specifically, not merely somewhere in the file.
-  const creatorView = CLIENT.slice(CLIENT.indexOf("if(p.status==='building'&&wallet===p.creator)"));
-  assert.match(creatorView.slice(0, 2000), /\+deliveryPanel\(p,sub\)/,
-    'the creator review panel must render the delivered work');
-  assert.match(creatorView.slice(0, 2000), /deliveryHistory\(p,/,
-    'and the earlier deliveries alongside it');
+  // The creator's judging queue specifically, not merely somewhere in the file.
+  const creatorView = CLIENT.slice(CLIENT.indexOf("if(wallet===p.creator&&subs.some(s=>s.state==='pending'))"));
+  assert.match(creatorView.slice(0, 2500), /\+deliveryPanel\(p,head\)/,
+    'the creator review panel must render the delivered work at the front of the queue');
+  assert.match(creatorView.slice(0, 2500), /The \$\{waiting\.length-1\} behind it/,
+    'and the deliveries queued behind it, so a creator knows what their options are');
   assert.equal(
     /esc\(sub\.evidenceHash\.slice\(0,16\)\)/.test(CLIENT), false,
     'a truncated hash is not something a person can review, and must not be the whole story',

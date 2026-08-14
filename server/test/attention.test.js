@@ -19,37 +19,53 @@ const CLIENT = fs.readFileSync(path.join(ROOT, 'client', 'app.js'), 'utf8');
 const HTML = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
 
 const CREATOR = 'Cre1111111111111111111111111111111111111111';
-const AGENT = 'Agn1111111111111111111111111111111111111111';
+const ALICE = 'Agn1111111111111111111111111111111111111111';
+const BOB = 'Bgn1111111111111111111111111111111111111111';
+const CAROL = 'Cgn1111111111111111111111111111111111111111';
 const STRANGER = 'Str1111111111111111111111111111111111111111';
 const NOW = 1_800_000_000;
 
-/// A funded commission with nobody working on it yet.
+/// A funded commission with nobody working on it — which is now the normal
+/// state of a live job, not a stalled one.
 function commission(overrides = {}) {
   return {
-    creator: CREATOR, agent: null, pendingAgent: null, status: 'funded',
+    creator: CREATOR, invitedAgent: null, isOpen: true, status: 'funded',
     pledged: 10_000_000, released: 0, refunded: 0,
     pledgerCount: 1, refundedPledgerCount: 0,
-    milestoneCount: 4, milestonesDone: 0,
-    deadline: NOW + 86_400, deliveryDeadline: 0, reviewWindow: 172_800,
-    submission: null, nominatedAt: null, nominationLapsesAt: null,
+    milestoneCount: 4, milestoneBps: [2500, 2500, 2500, 2500], milestonesDone: 0,
+    deadline: NOW + 86_400, workWindow: 7_200, workDeadline: NOW + 7_200,
+    reviewWindow: 172_800,
+    milestoneSubmitted: [0, 0, 0, 0], milestoneRejected: [0, 0, 0, 0],
+    unresolvedSubmissions: 0, latestSubmittedAt: 0,
+    submissions: 0, rejections: 0, autoReleases: 0, intents: 0,
     ...overrides,
   };
 }
-function withDelivery(milestoneIndex, submittedAt, overrides = {}) {
+
+function delivery(agent, milestoneIndex, sequence, submittedAt, state = 'pending') {
+  return { agent, milestoneIndex, sequence, submittedAt, state, evidenceHash: 'ab'.repeat(32) };
+}
+
+/// A commission with `count` agents queued on milestone `index`.
+function contested(index, agents, submittedAt = NOW - 60, overrides = {}) {
+  const submitted = [0, 0, 0, 0];
+  submitted[index] = agents.length;
   const c = commission({
-    status: 'building', agent: AGENT, deliveryDeadline: NOW + 3_600, ...overrides,
+    milestoneSubmitted: submitted,
+    unresolvedSubmissions: agents.length,
+    latestSubmittedAt: submittedAt,
+    submissions: agents.length,
+    ...overrides,
   });
-  c.submission = {
-    milestoneIndex, submittedAt, evidenceHash: 'ab'.repeat(32),
-    reviewEndsAt: submittedAt + c.reviewWindow,
-  };
-  return c;
+  const submissions = agents.map((agent, i) => delivery(agent, index, i, submittedAt));
+  return { c, submissions };
 }
 
 test('a creator is told when work has been delivered to them', () => {
   // The case that prompted this: without it, the only way to discover a
   // delivery was to open the dialog and look.
-  const attention = escrow.pendingAttention(withDelivery(1, NOW - 60), CREATOR, NOW);
+  const { c, submissions } = contested(1, [ALICE]);
+  const attention = escrow.pendingAttention(c, CREATOR, { nowUnix: NOW, submissions });
   assert.ok(attention, 'a pending delivery must raise the creator\'s attention');
   assert.equal(attention.kind, 'review');
   assert.equal(attention.urgency, 'act', 'a running review clock is not a background detail');
@@ -57,15 +73,33 @@ test('a creator is told when work has been delivered to them', () => {
   assert.equal(attention.deadline, NOW - 60 + 172_800, 'the deadline must be the review clock');
 });
 
-test('the agent who delivered is not nagged about their own submission', () => {
-  // Nothing is owed by them: the clock is running against the creator.
-  assert.equal(escrow.pendingAttention(withDelivery(1, NOW - 60), AGENT, NOW), null);
+test('a creator is told how many agents are waiting on them', () => {
+  // Open competition means a queue, and a creator who does not know there are
+  // three deliveries waiting will judge the first one as if it were the only
+  // option they have.
+  const { c, submissions } = contested(0, [ALICE, BOB, CAROL]);
+  const attention = escrow.pendingAttention(c, CREATOR, { nowUnix: NOW, submissions });
+  assert.match(attention.label, /3 deliveries/);
+  assert.match(attention.detail, /oldest first/);
+});
+
+test('an agent behind somebody else in the queue is told so', () => {
+  // Knowing you are second matters: it is the difference between waiting and
+  // spending more compute on a job you have probably already lost.
+  const { c, submissions } = contested(0, [ALICE, BOB]);
+  assert.equal(
+    escrow.pendingAttention(c, ALICE, { nowUnix: NOW, submissions }), null,
+    'the agent at the front is waiting on the creator, not on themselves');
+  const behind = escrow.pendingAttention(c, BOB, { nowUnix: NOW, submissions });
+  assert.equal(behind.kind, 'queued');
+  assert.equal(behind.urgency, 'soon');
+  assert.match(behind.label, /queue/);
 });
 
 test('a matured claim is announced to both sides, in their own terms', () => {
-  const matured = withDelivery(0, NOW - 200_000);
-  const toAgent = escrow.pendingAttention(matured, AGENT, NOW);
-  const toCreator = escrow.pendingAttention(matured, CREATOR, NOW);
+  const { c, submissions } = contested(0, [ALICE], NOW - 200_000);
+  const toAgent = escrow.pendingAttention(c, ALICE, { nowUnix: NOW, submissions });
+  const toCreator = escrow.pendingAttention(c, CREATOR, { nowUnix: NOW, submissions });
 
   assert.equal(toAgent.kind, 'claimable');
   assert.match(toAgent.label, /yours to claim/, 'the agent is told they can take it');
@@ -74,40 +108,35 @@ test('a matured claim is announced to both sides, in their own terms', () => {
   assert.equal(toAgent.urgency, 'act');
 });
 
-test('a nominee is told a contract is waiting, with its lapse time', () => {
-  const offered = commission({ pendingAgent: AGENT, nominatedAt: NOW, nominationLapsesAt: NOW + 259_200 });
-  const attention = escrow.pendingAttention(offered, AGENT, NOW);
-  assert.equal(attention.kind, 'accept');
-  assert.equal(attention.deadline, NOW + 259_200, 'the offer expires and the deadline must say when');
-  assert.equal(escrow.pendingAttention(offered, CREATOR, NOW), null,
-    'the creator is not the one holding this up');
-});
+test('an open commission is advertised to agents and to its creator', () => {
+  // The board only works if agents can tell that a job is live and unworked.
+  const c = commission();
+  const toAgent = escrow.pendingAttention(c, ALICE, { nowUnix: NOW });
+  assert.equal(toAgent.kind, 'open');
+  assert.match(toAgent.detail, /Funded and unclaimed/);
 
-test('an idle funded commission nudges its creator, and an idle agent their clock', () => {
-  const funded = escrow.pendingAttention(commission(), CREATOR, NOW);
-  assert.equal(funded.kind, 'nominate');
-  assert.equal(funded.urgency, 'soon', 'money is escrowed but no clock is against the creator yet');
-
-  const building = commission({ status: 'building', agent: AGENT, deliveryDeadline: NOW + 7_200 });
-  const due = escrow.pendingAttention(building, AGENT, NOW);
-  assert.equal(due.kind, 'deliver');
-  assert.equal(due.deadline, NOW + 7_200);
+  const toCreator = escrow.pendingAttention(c, CREATOR, { nowUnix: NOW });
+  assert.equal(toCreator.kind, 'awaiting-work');
+  assert.match(
+    toCreator.detail, /do not need to choose/,
+    'a creator must not be left waiting for a decision the product no longer asks of them');
 });
 
 test('it stays silent for people with nothing to do', () => {
   // A badge on every row is a badge on no row.
-  assert.equal(escrow.pendingAttention(commission(), STRANGER, NOW), null);
-  assert.equal(escrow.pendingAttention(commission(), null, NOW), null, 'no wallet, no obligations');
-  assert.equal(
-    escrow.pendingAttention(commission({ status: 'building', agent: AGENT, deliveryDeadline: NOW + 7_200 }), CREATOR, NOW),
-    null,
-    'a creator waiting on an agent is not being asked for anything',
-  );
+  const c = commission({ status: 'funding', workDeadline: 0 });
+  assert.equal(escrow.pendingAttention(c, STRANGER, { nowUnix: NOW }), null);
+  assert.equal(escrow.pendingAttention(c, null, { nowUnix: NOW }), null, 'no wallet, no obligations');
+
+  // A creator whose commission has deliveries waiting on somebody else’s
+  // judgement is not being asked for anything.
+  const { c: contested_, submissions } = contested(0, [ALICE]);
+  assert.equal(escrow.pendingAttention(contested_, STRANGER, { nowUnix: NOW, submissions }), null);
 });
 
 test('rent is offered as housekeeping, never as something urgent', () => {
   const shipped = commission({ status: 'shipped', released: 10_000_000, milestonesDone: 0b1111 });
-  const attention = escrow.pendingAttention(shipped, CREATOR, NOW);
+  const attention = escrow.pendingAttention(shipped, CREATOR, { nowUnix: NOW });
   assert.equal(attention.kind, 'rent');
   assert.equal(attention.urgency, 'idle', 'reclaiming rent must never compete with a running clock');
 });
@@ -115,10 +144,9 @@ test('rent is offered as housekeeping, never as something urgent', () => {
 test('an obligation with a clock outranks one without', () => {
   // A commission can satisfy several branches at once. The one with money or a
   // deadline riding on it has to win, or the badge shows the wrong thing.
-  const both = withDelivery(2, NOW - 60, { status: 'building' });
-  assert.equal(escrow.pendingAttention(both, CREATOR, NOW).kind, 'review');
+  const { c, submissions } = contested(2, [ALICE]);
+  assert.equal(escrow.pendingAttention(c, CREATOR, { nowUnix: NOW, submissions }).kind, 'review');
 });
-
 test('the list surfaces attention without anyone opening a dialog', () => {
   assert.match(CLIENT, /escrow\.pendingAttention/, 'the client must ask what is owed');
   // Assert the badge is CONDITIONAL on there being an obligation. Matching the

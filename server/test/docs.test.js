@@ -152,11 +152,11 @@ test('documented constants match the program', () => {
     for (const [, value] of stated) {
       assert.equal(Number(value), days, `${name} states a ${value}-day ceiling; the program enforces ${days}`);
     }
-    // The delivery and review bounds are what an agent reads before committing
-    // their time, so a stale number here is a broken promise rather than a typo.
+    // The work and review bounds are what an agent reads before spending
+    // anything, so a stale number here is a broken promise rather than a typo.
     assert.ok(
-      new RegExp(`1 hour to ${escrow.MAX_DELIVERY_WINDOW_SECONDS / 86_400} days`).test(doc),
-      `${name} must state the real delivery window bounds`,
+      new RegExp(`1 hour to ${escrow.MAX_WORK_WINDOW_SECONDS / 86_400} days`).test(doc),
+      `${name} must state the real work window bounds`,
     );
     assert.ok(
       new RegExp(`1 hour to ${escrow.MAX_REVIEW_WINDOW_SECONDS / 86_400} days`).test(doc),
@@ -172,8 +172,10 @@ test('documented constants match the program', () => {
   assert.equal(escrow.MAX_MILESTONES, 8);
   // Pinned by program/src/lib.rs::commission_account_size_is_pinned. A drift
   // here makes every commission silently undecodable.
-  assert.equal(escrow.COMMISSION_ACCOUNT_BYTES, 316);
-  assert.equal(escrow.MIN_DELIVERY_WINDOW_SECONDS, 3_600);
+  assert.equal(escrow.COMMISSION_ACCOUNT_BYTES, 275);
+  assert.equal(escrow.SUBMISSION_ACCOUNT_BYTES, 109);
+  assert.equal(escrow.INTENT_ACCOUNT_BYTES, 75);
+  assert.equal(escrow.MIN_WORK_WINDOW_SECONDS, 3_600);
   assert.equal(escrow.MIN_REVIEW_WINDOW_SECONDS, 3_600);
 });
 
@@ -201,16 +203,22 @@ test('the documented account layout matches the decoder', () => {
   b.writeBigUInt64LE(1234n, 105);  // goal
   b.writeBigUInt64LE(999n, 113);   // total_pledged
   b.writeUInt32LE(7, 137);         // pledger_count
-  b[211] = 3;                      // status -> shipped
-  b[212] = 1;                      // milestone_count
-  b.writeUInt16LE(10_000, 213);
-  b.writeBigInt64LE(1_900_000_000n, 230);
+  b[178] = 2;                      // status -> shipped
+  b[179] = 1;                      // milestone_count
+  b.writeUInt16LE(10_000, 180);
+  b.writeBigInt64LE(1_900_000_000n, 197);  // deadline
+  b.writeBigInt64LE(1_800_000_000n, 215);  // work_deadline
+  b[231] = 3;                      // milestone_submitted[0]
+  b.writeUInt32LE(9, 271);         // intents
   const decoded = escrow.decodeCommission(b);
   assert.equal(decoded.goal, 1234, 'goal must live at the documented offset 105');
   assert.equal(decoded.pledged, 999, 'total_pledged must live at the documented offset 113');
   assert.equal(decoded.pledgerCount, 7, 'pledger_count must live at the documented offset 137');
-  assert.equal(decoded.status, 'shipped', 'status must live at the documented offset 211');
-  assert.equal(decoded.deadline, 1_900_000_000, 'deadline must live at the documented offset 230');
+  assert.equal(decoded.status, 'shipped', 'status must live at the documented offset 178');
+  assert.equal(decoded.deadline, 1_900_000_000, 'deadline must live at the documented offset 197');
+  assert.equal(decoded.workDeadline, 1_800_000_000, 'work_deadline must live at the documented offset 215');
+  assert.deepEqual(decoded.milestoneSubmitted, [3], 'milestone_submitted must live at the documented offset 231');
+  assert.equal(decoded.intents, 9, 'intents must live at the documented offset 271');
 });
 
 test('documented PDA seeds match the derivation', () => {

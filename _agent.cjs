@@ -2,8 +2,9 @@
 // this drives the contracted agent from the terminal, using a real second
 // wallet, so the cross-wallet path is exercised exactly as a stranger would.
 //
-//   node _agent.cjs watch                 poll for anything addressed to me
-//   node _agent.cjs accept <commission>   accept a nomination
+//   node _agent.cjs scan                  find work I could take right now
+//   node _agent.cjs watch                 poll for anything that needs me
+//   node _agent.cjs signal <commission>   say I am working on it (non-binding)
 //   node _agent.cjs submit <commission> [index] [evidence]
 //   node _agent.cjs claim  <commission> [index]   release a matured delivery
 //   node _agent.cjs show   <commission>
@@ -41,8 +42,9 @@ function describe(c, now = Math.floor(Date.now() / 1000)) {
     `${(c.pledged / 1e9).toFixed(4)} SOL`,
     `by ${c.creator.slice(0, 6)}`,
   ];
-  if (c.pendingAgent === ME) parts.push('>>> NOMINATED TO ME');
-  if (c.agent === ME) parts.push('>>> I AM THE AGENT');
+  if (c.status === 'funded' && !escrow.workClosed(c, now)) {
+    parts.push('>>> OPEN FOR WORK' + (c.submissions ? ' (' + c.submissions + ' already delivered)' : ''));
+  }
   if (c.submission) {
     parts.push(escrow.reviewExpired(c, now)
       ? `submission MATURED (claimable by anyone)`
@@ -79,14 +81,30 @@ const [command, address, ...rest] = process.argv.slice(2);
 
   if (command === 'show') { console.log(JSON.stringify(await read(address), null, 2)); return; }
 
-  if (command === 'accept') {
-    const sig = await send(escrow.build.acceptAgent(ctx, { agent: ME, commission: address }).instruction);
-    const c = await read(address);
-    console.log(`ACCEPTED  ${sig}`);
-    console.log(`status ${c.status}, deliver within ${mins(c.deliveryDeadline - Math.floor(Date.now() / 1000))}`);
+  // An agent's real loop: find funded work, decide, deliver. There is nothing
+  // to wait for and nobody to ask.
+  if (command === 'scan') {
+    const now = Math.floor(Date.now() / 1000);
+    const open = (await all()).filter(c => escrow.canWork(c, ME, now));
+    if (!open.length) { console.log('nothing open for work right now'); return; }
+    console.log(open.length + ' commission(s) I could deliver right now, with no permission:\n');
+    for (const c of open) console.log(describe(c, now));
     return;
   }
 
+  if (command === 'signal') {
+    const sig = await send(escrow.build.signalIntent(ctx, { agent: ME, commission: address }).instruction);
+    const c = await read(address);
+    console.log('SIGNALLED  ' + sig);
+    console.log(c.intents + ' agent(s) have now signalled. This reserves nothing and blocks nobody.');
+    return;
+  }
+
+  if (command === 'accept') {
+    console.log('There is no acceptance step any more: a funded commission is');
+    console.log('workable immediately. Just submit.');
+    return;
+  }
   if (command === 'submit') {
     const index = Number(rest[0] ?? 0);
     const evidence = rest.slice(1).join(' ') || 'https://github.com/agnt-gg/gitstarter/pull/1';
@@ -126,5 +144,5 @@ const [command, address, ...rest] = process.argv.slice(2);
     return;
   }
 
-  console.log('commands: watch | show <c> | accept <c> | submit <c> [index] [evidence] | claim <c> [index]');
+  console.log('commands: scan | watch | show <c> | signal <c> | submit <c> [index] [evidence] | claim <c> [index]');
 })().then(() => process.exit(0)).catch(e => { console.error('FAILED:', escrow.explainError(e)?.message || e.message); process.exit(1); });

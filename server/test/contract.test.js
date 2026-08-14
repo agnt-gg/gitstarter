@@ -86,7 +86,7 @@ test('the create form validates every bound the program enforces', () => {
     'a deadline already in the past': /deadline\s*<=\s*nowUnix/,
     'the goal floor': /goal\s*<\s*escrow\.BPS_DENOMINATOR/,
     'the milestone count': /percentages\.length\s*>\s*escrow\.MAX_MILESTONES/,
-    'the delivery window': /deliveryDays\s*<=\s*escrow\.MAX_DELIVERY_WINDOW_SECONDS/,
+    'the work window': /deliveryDays\s*<=\s*escrow\.MAX_WORK_WINDOW_SECONDS/,
     'the review window': /reviewHours\s*<=\s*escrow\.MAX_REVIEW_WINDOW_SECONDS/,
   };
   for (const [bound, pattern] of Object.entries(required)) {

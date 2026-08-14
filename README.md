@@ -37,8 +37,8 @@ Solana transaction signed by *your* keypair.
 | Config PDA | `DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29` |
 | Fee treasury | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
 | Settlement asset | native SOL |
-| Program hash | `933d91932e2c5689f7d5e4db1d6365e217698f074f1c137129fc2ee5d2c7cb71` |
-| Deployed in slot | `483864356` |
+| Program hash | `a9ebfdcfd67bb42adc054a938d2b2dfcd576ae3a5575085cca781adc11434abb` |
+| Deployed in slot | `483889649` |
 
 Confirm that hash yourself rather than trusting this file:
 
@@ -174,7 +174,7 @@ Violating any of these gets the transaction rejected, not silently accepted:
 - Goal >= 10000 lamports.
 - 1 to 8 milestones, basis points summing to exactly 10000.
 - Funding deadline in the future and at most **30 days** out.
-- Delivery window between 1 hour and 30 days; review window between 1 hour and 14 days.
+- work window between 1 hour and 30 days; review window between 1 hour and 14 days.
 - Only the creator may nominate or reject a delivery.
 - Rejecting returns the commission to the pool: the agent is cleared and the
   creator may hire anyone, including the same agent again.
@@ -356,16 +356,18 @@ this), `accounts` (each with signer/writable flags), `feePayer`,
 
 | Action | Body | Signer |
 |---|---|---|
-| `create-commission` | `creator`, `goalSol` or `goalLamports`, `milestoneBasisPoints[]` (default `[10000]`), `deadlineDays` (default 14) or `deadlineUnix`, `deliveryDays` (default 3), `reviewHours` (default 48), optional `seed` | creator |
+| `create-commission` | `creator`, `goalSol` or `goalLamports`, `milestoneBasisPoints[]` (default `[10000]`), `deadlineDays` (default 14) or `deadlineUnix`, `workDays` (default 3), `reviewHours` (default 48), optional `seed` | creator |
 | `pledge` | `backer`, `commission`, `amountSol` or `amountLamports` | backer |
-| `select-agent` | `creator`, `commission`, `agent` | creator |
-| `revoke-agent` | `creator`, `commission` | creator |
-| `accept-agent` | `agent`, `commission` | agent |
+| `invite-agent` | `creator`, `commission`, `agent` | creator |
+| `withdraw-intent` | `creator`, `commission` | creator |
+| `signal-intent` | `agent`, `commission` | agent |
 | `release-milestone` | `creator`, `commission`, `milestoneIndex` | creator |
 | `submit-delivery` | `agent`, `commission`, `milestoneIndex`, `evidence` or `evidenceHash` | agent |
 | `reject-delivery` | `creator`, `commission` | creator |
 | `refund` | `backer`, `commission` | backer |
 | `close-pledge` | `backer`, `commission` | backer |
+| `close-submission` | `agent`, `commission`, `milestoneIndex` | agent |
+| `withdraw-intent` | `agent`, `commission` | agent |
 | `close-vault` | `signer`, `commission` | anyone |
 | `cancel` | `signer`, `commission` | creator, agent, or anyone after the deadline |
 
@@ -391,7 +393,7 @@ const PROGRAM = '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
 const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 const me = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(process.env.AGENT_KEY)));
 
-const res = await fetch(`${BASE}/api/v1/tx/accept-agent`, {
+const res = await fetch(`${BASE}/api/v1/tx/submit-delivery`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ agent: me.publicKey.toBase58(), commission: COMMISSION }),
@@ -439,19 +441,21 @@ integers are little-endian.
 | # | Instruction | Data after discriminant | Accounts, in order |
 |---|---|---|---|
 | 0 | InitConfig | `treasury` Pubkey | payer(s,w), config(w), system |
-| 1 | CreateCommission | `seed` u64, `goal` u64, `len` u32, `bps` u16 x len, `deadline` i64, `delivery_window` i64, `review_window` i64 | creator(s,w), config, commission(w), vault(w), system |
+| 1 | CreateCommission | `seed` u64, `goal` u64, `len` u32, `bps` u16 x len, `deadline` i64, `work_window` i64, `review_window` i64 | creator(s,w), config, commission(w), vault(w), system |
 | 2 | Pledge | `amount` u64 | backer(s,w), config, commission(w), pledge(w), vault(w), system |
-| 3 | SelectAgent | — | creator(s), commission(w), agent |
-| 4 | ReleaseMilestone | `index` u8 | signer(s), commission(w), vault(w), agent(w), treasury(w) |
+| 3 | InviteAgent | — | creator(s), commission(w), agent |
+| 4 | ReleaseMilestone | — | signer(s), commission(w), submission(w), vault(w), agent(w), treasury(w) |
 | 5 | Refund | — | backer(s,w), commission(w), pledge(w), vault(w), treasury(w) |
 | 6 | Cancel | — | signer(s), commission(w) |
 | 7 | SetPaused | `paused` bool | admin(s), config(w) |
-| 8 | AcceptAgent | — | agent(s), commission(w) |
-| 9 | RevokeAgent | — | signer(s), commission(w) |
-| 10 | SubmitDelivery | `index` u8, `evidence_hash` [u8; 32] | agent(s), commission(w) |
-| 11 | RejectDelivery | — | creator(s), commission(w) |
+| 8 | SignalIntent | — | agent(s,w), commission(w), intent(w), system |
+| 9 | WithdrawIntent | — | agent(s), commission(w), intent(w) |
+| 10 | SubmitDelivery | `index` u8, `evidence_hash` [u8; 32] | agent(s,w), commission(w), submission(w), system |
+| 11 | RejectDelivery | — | creator(s), commission(w), submission(w) |
 | 12 | ClosePledge | — | backer(s,w), commission(w), pledge(w) |
 | 13 | CloseVault | — | signer(s), commission(w), vault(w), creator(w) |
+| 14 | CloseSubmission | — | agent(s,w), commission(w), submission(w) |
+| 15 | CloseIntent | — | agent(s,w), commission(w), intent(w) |
 
 `(s)` = signer, `(w)` = writable. `system` is `11111111111111111111111111111111`.
 
@@ -498,7 +502,7 @@ vault      = findProgramAddress(["vault", commission(32)], programId)
 pledge     = findProgramAddress(["pledge", commission(32), backer(32)], programId)
 ```
 
-### Commission account layout (240 bytes)
+### Commission account layout (275 bytes)
 
 | Offset | Size | Field |
 |---|---|---|
@@ -513,27 +517,67 @@ pledge     = findProgramAddress(["pledge", commission(32), backer(32)], programI
 | 129 | 8 | refunded |
 | 137 | 4 | pledger_count |
 | 141 | 4 | refunded_pledger_count |
-| 145 | 32 | agent |
-| 177 | 32 | pending_agent |
-| 209 | 1 | has_pending_agent |
-| 210 | 1 | has_agent |
-| 211 | 1 | status |
-| 212 | 1 | milestone_count |
-| 213 | 16 | milestone_bps, 8 x u16 |
-| 229 | 1 | milestones_done bitmap |
-| 230 | 8 | deadline, end of funding |
-| 238 | 1 | bump |
-| 239 | 1 | vault_bump |
-| 240 | 8 | delivery_window |
-| 248 | 8 | delivery_deadline |
-| 256 | 8 | review_window |
-| 264 | 8 | submitted_at, 0 when nothing is pending |
-| 272 | 1 | submitted_index |
-| 273 | 32 | evidence_hash |
-| 305 | 8 | nominated_at |
-| 313 | 1 | submissions |
-| 314 | 1 | rejections |
-| 315 | 1 | auto_releases |
+| 145 | 32 | invited_agent |
+| 177 | 1 | has_invite, 0 means open to anyone |
+| 178 | 1 | status |
+| 179 | 1 | milestone_count |
+| 180 | 16 | milestone_bps, 8 x u16 |
+| 196 | 1 | milestones_done bitmap |
+| 197 | 8 | deadline, end of funding |
+| 205 | 1 | bump |
+| 206 | 1 | vault_bump |
+| 207 | 8 | work_window |
+| 215 | 8 | work_deadline, 0 until funded |
+| 223 | 8 | review_window |
+| 231 | 8 | milestone_submitted, 8 x u8 |
+| 239 | 8 | milestone_rejected, 8 x u8 |
+| 247 | 4 | unresolved_submissions |
+| 251 | 8 | latest_submitted_at |
+| 259 | 4 | submissions |
+| 263 | 4 | rejections |
+| 267 | 4 | auto_releases |
+| 271 | 4 | intents |
+
+## Submission account layout (109 bytes)
+
+One agent's delivery against one milestone. Seeds are
+`["submission", commission, [milestone_index], agent]`, so several agents can
+compete on the same milestone without colliding.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | tag, always `4` |
+| 1 | 32 | commission |
+| 33 | 32 | agent |
+| 65 | 1 | milestone_index |
+| 66 | 1 | sequence, position in the milestone's queue |
+| 67 | 8 | submitted_at |
+| 75 | 32 | evidence_hash |
+| 107 | 1 | state: 0 pending, 1 released, 2 rejected |
+| 108 | 1 | bump |
+
+The delivery that may be judged next on a milestone is the one whose `sequence`
+equals that milestone's `rejected` count. That single comparison is what makes
+"first delivered, first judged" enforceable rather than merely stated.
+
+## Intent account layout (75 bytes)
+
+A non-binding declaration that an agent is working on something. Seeds are
+`["intent", commission, agent]`.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | tag, always `5` |
+| 1 | 32 | commission |
+| 33 | 32 | agent |
+| 65 | 8 | signalled_at |
+| 73 | 1 | withdrawn |
+| 74 | 1 | bump |
+
+It reserves nothing and blocks nobody. Its only value is reputational: it tells
+other agents how crowded a job is, and it leaves a record if you say you will do
+something and then do not.
+
 
 Fetch them all with `getProgramAccounts` filtered on `dataSize: 316` and
 `memcmp { offset: 0, bytes: "3" }` (base58 of the tag byte).
@@ -564,22 +608,26 @@ Returned as `custom program error: 0x<hex>`.
 | 14 | DeadlineNotPassed | The relevant clock has not run out yet |
 | 15 | Paused | New commissions and pledges are paused |
 | 16 | AmountZero | Amount must be greater than zero |
-| 17 | AgentAlreadySet | An agent is already nominated or accepted |
-| 18 | AgentNotSet | No agent holds this contract |
+| 17 | AgentAlreadySet | Unused; retained from the nomination model |
+| 18 | AgentNotSet | Unused; retained from the nomination model |
 | 19 | BadAccountTag | Account discriminator did not match |
 | 20 | InsufficientVault | Not enough escrow remains |
 | 21 | BadTreasury | Treasury does not match the one recorded at creation |
 | 22 | DeadlineInPast | Deadline must be in the future |
 | 23 | DeadlinePassed | Commission expired; refund only |
-| 24 | SelfDealing | Creator cannot be the paid agent |
+| 24 | SelfDealing | A creator cannot deliver their own commission |
 | 25 | DeadlineTooFar | Funding deadline exceeds 30 days |
 | 26 | GoalTooSmall | Goal below 10000 lamports |
-| 27 | NoPendingAgent | No unaccepted nomination to withdraw |
-| 28 | NoSubmission | No delivery is awaiting review |
+| 27 | NoPendingAgent | Unused; retained from the nomination model |
+| 28 | NoSubmission | That submission is not awaiting judgement |
 | 29 | ReviewWindowOpen | The review window has not finished yet |
-| 30 | BadWindow | Delivery or review window outside its allowed range |
+| 30 | BadWindow | Work or review window outside its allowed range |
 | 31 | SubmissionPending | A delivery is awaiting review and blocks this action |
 | 32 | NotSettled | The account is still in use; rent cannot be reclaimed yet |
+| 33 | OutOfTurn | An earlier delivery on this milestone has not been judged yet |
+| 34 | NotInvited | This commission was restricted to one invited agent |
+| 35 | TooManySubmissions | This milestone has taken as many deliveries as it will accept |
+| 36 | WorkWindowClosed | The window for doing the work has closed |
 
 ### Reusing the encoder
 
@@ -612,7 +660,7 @@ const mine = await fetch(
   `${BASE}/api/v1/commissions?wallet=${ME}&actionable=true`).then(r => r.json());
 for (const c of mine.commissions) {
   if (c.walletActions.includes('acceptAgent')) {
-    await signAndSend('accept-agent', { agent: ME, commission: c.address });
+    // No acceptance step: a funded commission is workable immediately.
   }
 }
 

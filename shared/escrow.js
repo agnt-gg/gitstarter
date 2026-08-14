@@ -40,9 +40,12 @@ const MAX_MILESTONES = 8;
 // expiring to the outcome that is fair at that point. Review is the one that
 // expires to *payment* rather than refund.
 const MAX_FUNDING_DURATION_SECONDS = 30 * 86_400;
-const MIN_DELIVERY_WINDOW_SECONDS = 3_600;
-const MAX_DELIVERY_WINDOW_SECONDS = 30 * 86_400;
-const DEFAULT_DELIVERY_WINDOW_SECONDS = 3 * 86_400;
+/// Ceiling on deliveries per milestone. Generous on purpose — competition is
+/// the point; this only bounds a counter and a creator’s worst-case queue.
+const MAX_SUBMISSIONS_PER_MILESTONE = 32;
+const MIN_WORK_WINDOW_SECONDS = 3_600;
+const MAX_WORK_WINDOW_SECONDS = 30 * 86_400;
+const DEFAULT_WORK_WINDOW_SECONDS = 3 * 86_400;
 const MIN_REVIEW_WINDOW_SECONDS = 3_600;
 const MAX_REVIEW_WINDOW_SECONDS = 14 * 86_400;
 const DEFAULT_REVIEW_WINDOW_SECONDS = 2 * 86_400;
@@ -55,7 +58,9 @@ const CLAIM_GRACE_WINDOW_SECONDS = 86_400;
 
 // Pinned by program/src/lib.rs::commission_account_size_is_pinned. If these two
 // ever disagree, every commission silently fails to decode.
-const COMMISSION_ACCOUNT_BYTES = 316;
+const COMMISSION_ACCOUNT_BYTES = 275;
+const SUBMISSION_ACCOUNT_BYTES = 109;
+const INTENT_ACCOUNT_BYTES = 75;
 // Rent-exemption minimums. Solana charges for 128 bytes of account overhead plus
 // the account's own data, at 6960 lamports per byte. These are locked up for as
 // long as the account exists, which on a small bounty is a real percentage of
@@ -71,31 +76,42 @@ const PLEDGE_RENT_LAMPORTS = (128 + 83) * 6_960;
 /// is not meant to be: the account is the permanent public record that
 /// reputation is computed from, and leaving it in place is also what stops its
 /// seed being reused while stale pledge accounts could still exist.
-const COMMISSION_RENT_LAMPORTS = (128 + 316) * 6_960;
+const COMMISSION_RENT_LAMPORTS = (128 + COMMISSION_ACCOUNT_BYTES) * 6_960;
+/// Rent an agent puts up to deliver, returned in full when their submission
+/// settles. Losing a race has to be cheap or nobody competes.
+const SUBMISSION_RENT_LAMPORTS = (128 + SUBMISSION_ACCOUNT_BYTES) * 6_960;
+const INTENT_RENT_LAMPORTS = (128 + INTENT_ACCOUNT_BYTES) * 6_960;
 
 const SEED_COMMISSION = Buffer.from('commission');
 const SEED_VAULT = Buffer.from('vault');
 const SEED_PLEDGE = Buffer.from('pledge');
+const SEED_SUBMISSION = Buffer.from('submission');
+const SEED_INTENT = Buffer.from('intent');
 
 /// Borsh enum discriminants, in declaration order.
 const IX = {
   initConfig: 0,
   createCommission: 1,
   pledge: 2,
-  selectAgent: 3,
+  inviteAgent: 3,
   releaseMilestone: 4,
   refund: 5,
   cancel: 6,
   setPaused: 7,
-  acceptAgent: 8,
-  revokeAgent: 9,
+  signalIntent: 8,
+  withdrawIntent: 9,
   submitDelivery: 10,
   rejectDelivery: 11,
   closePledge: 12,
   closeVault: 13,
+  closeSubmission: 14,
+  closeIntent: 15,
 };
 
-const STATUS = ['funding', 'funded', 'building', 'shipped', 'refunded'];
+// There is deliberately no "assigned" state between funded and shipped: funded
+// means the work is on the board and anyone may start.
+const STATUS = ['funding', 'funded', 'shipped', 'refunded'];
+const SUBMISSION_STATE = ['pending', 'released', 'rejected'];
 
 /// EscrowError discriminants, so a rejected transaction can be explained rather
 /// than surfaced as "custom program error: 0x18".
@@ -140,6 +156,10 @@ const ERRORS = {
   30: 'BadWindow',
   31: 'SubmissionPending',
   32: 'NotSettled',
+  33: 'OutOfTurn',
+  34: 'NotInvited',
+  35: 'TooManySubmissions',
+  36: 'WorkWindowClosed',
 };
 
 const ERROR_HELP = {
@@ -169,6 +189,10 @@ const ERROR_HELP = {
   BadWindow: 'Delivery and review windows must be between one hour and their maximums.',
   SubmissionPending: 'A delivery is awaiting review. It must be released or rejected first.',
   NotSettled: 'This account is still in use. Rent can only be reclaimed once the commission has fully settled.',
+  OutOfTurn: 'An earlier delivery on this milestone has not been judged yet. First delivered, first judged.',
+  NotInvited: 'This commission was restricted to one invited agent.',
+  TooManySubmissions: 'This milestone has taken as many deliveries as it will accept.',
+  WorkWindowClosed: 'The window for working on this commission has closed.',
 };
 
 function u64(value) { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(value)); return b; }
@@ -189,80 +213,164 @@ function vaultPda(programId, commission) {
   return w3().PublicKey.findProgramAddressSync(
     [SEED_VAULT, key(commission).toBuffer()], key(programId))[0];
 }
+/// One agent's delivery against one milestone. Keyed by all three so several
+/// agents can compete on the same milestone without colliding.
+function submissionPda(programId, commission, milestoneIndex, agent) {
+  return w3().PublicKey.findProgramAddressSync(
+    [SEED_SUBMISSION, key(commission).toBuffer(), Buffer.from([milestoneIndex]), key(agent).toBuffer()],
+    key(programId))[0];
+}
+
+function intentPda(programId, commission, agent) {
+  return w3().PublicKey.findProgramAddressSync(
+    [SEED_INTENT, key(commission).toBuffer(), key(agent).toBuffer()], key(programId))[0];
+}
+
 function pledgePda(programId, commission, backer) {
   return w3().PublicKey.findProgramAddressSync(
     [SEED_PLEDGE, key(commission).toBuffer(), key(backer).toBuffer()], key(programId))[0];
 }
 
-/// Decodes a Commission account. Layout is fixed at 315 bytes; see lib.rs.
+/// Decodes a Commission account. Layout is pinned by lib.rs; see the size test.
 function decodeCommission(data) {
   const b = Buffer.from(data);
   if (b.length !== COMMISSION_ACCOUNT_BYTES) throw new Error('Not a commission account');
   let o = 1;
   const pk = () => { const v = bs58.encode(b.subarray(o, o + 32)); o += 32; return v; };
   const num = () => { const v = Number(b.readBigUInt64LE(o)); o += 8; return v; };
+  const i64 = () => { const v = Number(b.readBigInt64LE(o)); o += 8; return v; };
   const creator = pk();
   o += 32; // reserved, retained for layout compatibility
   const treasury = pk();
   const seed = num(), goal = num(), pledged = num(), released = num(), refunded = num();
   const pledgerCount = b.readUInt32LE(o); o += 4;
   const refundedPledgerCount = b.readUInt32LE(o); o += 4;
-  const agent = pk(), pendingAgent = pk();
-  const hasPendingAgent = !!b[o++], hasAgent = !!b[o++];
+  const invitedAgent = pk();
+  const hasInvite = !!b[o++];
   const status = STATUS[b[o++]] || 'unknown';
   const milestoneCount = b[o++];
   const milestoneBps = [];
   for (let i = 0; i < MAX_MILESTONES; i++) { milestoneBps.push(b.readUInt16LE(o)); o += 2; }
   const milestonesDone = b[o++];
-  const i64 = () => { const v = Number(b.readBigInt64LE(o)); o += 8; return v; };
   const deadline = i64();
   o += 2; // bump, vault_bump
-  const deliveryWindow = i64();
-  const deliveryDeadline = i64();
+  const workWindow = i64();
+  const workDeadline = i64();
   const reviewWindow = i64();
-  const submittedAt = i64();
-  const submittedIndex = b[o++];
-  const evidenceHash = Buffer.from(b.subarray(o, o + 32)).toString('hex'); o += 32;
-  const nominatedAt = i64();
-  const submissions = b[o++], rejections = b[o++], autoReleases = b[o++];
+  const milestoneSubmitted = [], milestoneRejected = [];
+  for (let i = 0; i < MAX_MILESTONES; i++) milestoneSubmitted.push(b[o++]);
+  for (let i = 0; i < MAX_MILESTONES; i++) milestoneRejected.push(b[o++]);
+  const unresolvedSubmissions = b.readUInt32LE(o); o += 4;
+  const latestSubmittedAt = i64();
+  const submissions = b.readUInt32LE(o); o += 4;
+  const rejections = b.readUInt32LE(o); o += 4;
+  const autoReleases = b.readUInt32LE(o); o += 4;
+  const intents = b.readUInt32LE(o); o += 4;
 
-  const hasPendingSubmission = submittedAt > 0;
   return {
     creator, treasury, seed, goal, pledged, released, refunded,
     pledgerCount, refundedPledgerCount,
-    agent: hasAgent ? agent : null,
-    pendingAgent: hasPendingAgent ? pendingAgent : null,
+    // Open by default. An invitation is a deliberate narrowing, so it is
+    // reported as absent rather than as a zeroed key.
+    invitedAgent: hasInvite ? invitedAgent : null,
+    isOpen: !hasInvite,
     status, milestoneCount,
     milestoneBps: milestoneBps.slice(0, milestoneCount),
     milestonesDone, deadline,
-    deliveryWindow, deliveryDeadline, reviewWindow,
-    // A zeroed hash means "no submission", so it is reported as absent rather
-    // than as 64 characters of misleading zeroes.
-    submission: hasPendingSubmission
-      ? {
-        milestoneIndex: submittedIndex,
-        submittedAt,
-        evidenceHash,
-        reviewEndsAt: submittedAt + reviewWindow,
-      }
-      : null,
-    nominatedAt: nominatedAt || null,
-    nominationLapsesAt: nominatedAt ? nominatedAt + NOMINATION_WINDOW_SECONDS : null,
-    submissions, rejections, autoReleases,
+    workWindow, workDeadline, reviewWindow,
+    // Per-milestone competition. `submitted - rejected` is how many deliveries
+    // are still in the queue, and the one at the front has sequence `rejected`.
+    milestoneSubmitted: milestoneSubmitted.slice(0, milestoneCount),
+    milestoneRejected: milestoneRejected.slice(0, milestoneCount),
+    unresolvedSubmissions, latestSubmittedAt,
+    submissions, rejections, autoReleases, intents,
   };
 }
 
-/// True once a submitted delivery may be released by anyone, not just the
-/// creator. This is the mechanism that turns creator silence into payment.
-function reviewExpired(c, nowUnix = Math.floor(Date.now() / 1000)) {
-  return !!c.submission && nowUnix >= c.submission.reviewEndsAt;
+/// Decodes a Submission account — one agent's delivery against one milestone.
+function decodeSubmission(data) {
+  const b = Buffer.from(data);
+  if (b.length !== SUBMISSION_ACCOUNT_BYTES) throw new Error('Not a submission account');
+  let o = 1;
+  const pk = () => { const v = bs58.encode(b.subarray(o, o + 32)); o += 32; return v; };
+  const commission = pk(), agent = pk();
+  const milestoneIndex = b[o++];
+  const sequence = b[o++];
+  const submittedAt = Number(b.readBigInt64LE(o)); o += 8;
+  const evidenceHash = Buffer.from(b.subarray(o, o + 32)).toString('hex'); o += 32;
+  const state = SUBMISSION_STATE[b[o++]] || 'unknown';
+  return { commission, agent, milestoneIndex, sequence, submittedAt, evidenceHash, state };
 }
 
-/// True while a delivery still blocks cancellation and refunds — through the
-/// review window and for a grace period afterwards, so an agent who genuinely
-/// delivered cannot lose a race to a fast backer.
+/// Decodes an Intent account — a non-binding "I am working on this".
+function decodeIntent(data) {
+  const b = Buffer.from(data);
+  if (b.length !== INTENT_ACCOUNT_BYTES) throw new Error('Not an intent account');
+  let o = 1;
+  const pk = () => { const v = bs58.encode(b.subarray(o, o + 32)); o += 32; return v; };
+  const commission = pk(), agent = pk();
+  const signalledAt = Number(b.readBigInt64LE(o)); o += 8;
+  const withdrawn = !!b[o++];
+  return { commission, agent, signalledAt, withdrawn };
+}
+
+/// When a submission's own review window runs out. Every competitor gets the
+/// same window on their own delivery rather than inheriting somebody else's.
+function reviewEndsAt(submission, reviewWindow) {
+  return submission.submittedAt + reviewWindow;
+}
+
+/// True once this delivery may be released by anyone, not just the creator.
+/// This is the mechanism that turns creator silence into payment.
+function reviewExpired(submission, reviewWindow, nowUnix = Math.floor(Date.now() / 1000)) {
+  return !!submission
+    && submission.state === 'pending'
+    && nowUnix >= reviewEndsAt(submission, reviewWindow);
+}
+
+/// The delivery that may be judged next on a milestone.
+///
+/// It is the one whose sequence equals the milestone's rejected count, which is
+/// what makes "first delivered, first judged" a rule rather than a slogan. A
+/// creator cannot walk past an earlier delivery to reach a favourite.
+function frontOfQueue(c, submissions, milestoneIndex) {
+  const wanted = c.milestoneRejected?.[milestoneIndex] ?? 0;
+  return (submissions || []).find(s =>
+    s.milestoneIndex === milestoneIndex && s.state === 'pending' && s.sequence === wanted) || null;
+}
+
+/// Deliveries still queued on a milestone, oldest first.
+function queueFor(submissions, milestoneIndex) {
+  return (submissions || [])
+    .filter(s => s.milestoneIndex === milestoneIndex && s.state === 'pending')
+    .sort((a, b) => a.sequence - b.sequence);
+}
+
+/// True while delivered work still blocks cancellation and refunds.
+///
+/// Mirrors the program: bounded by the newest submission's own window plus a
+/// grace period, so unjudged work can delay an exit but never prevent one.
 function claimProtected(c, nowUnix = Math.floor(Date.now() / 1000)) {
-  return !!c.submission && nowUnix < c.submission.reviewEndsAt + CLAIM_GRACE_WINDOW_SECONDS;
+  return c.unresolvedSubmissions > 0
+    && nowUnix < c.latestSubmittedAt + c.reviewWindow + CLAIM_GRACE_WINDOW_SECONDS;
+}
+
+/// True once the window for doing the work has closed.
+function workClosed(c, nowUnix = Math.floor(Date.now() / 1000)) {
+  return c.workDeadline > 0 && nowUnix >= c.workDeadline;
+}
+
+/// Whether `wallet` may deliver work on this commission right now.
+///
+/// Deliberately short, because the answer is meant to be short: if the money is
+/// there and the clock is running, anyone may work. No claim, no assignment, no
+/// permission — that is the whole product.
+function canWork(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
+  if (!wallet) return false;
+  if (c.status !== 'funded') return false;
+  if (workClosed(c, nowUnix)) return false;
+  if (wallet === c.creator) return false;
+  return !c.invitedAgent || c.invitedAgent === wallet;
 }
 
 /// What rent, if any, `wallet` can currently reclaim from this commission.
@@ -294,70 +402,96 @@ function reclaimableRent(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
 ///
 /// Returns null when nothing is owed, or `{ kind, urgency, label, detail,
 /// deadline }` where `urgency` is 'act' (money or a clock depends on it),
-/// 'soon' (a clock is running but not on this wallet), or 'idle' (housekeeping).
-function pendingAttention(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
+/// 'soon' (worth knowing, no clock against this wallet), or 'idle'.
+function pendingAttention(c, wallet, options = {}) {
   if (!wallet) return null;
+  const nowUnix = typeof options === 'number'
+    ? options
+    : (options.nowUnix ?? Math.floor(Date.now() / 1000));
+  const submissions = (typeof options === 'object' && options.submissions) || [];
   const isCreator = wallet === c.creator;
-  const isAgent = wallet === c.agent;
-  const matured = reviewExpired(c, nowUnix);
 
-  // The one that started this: work has been delivered and the creator has a
-  // clock running against them. Silence pays the agent, so not noticing is
-  // expensive, which makes this the most important thing the UI can say.
-  if (isCreator && c.submission && !matured) {
-    return {
-      kind: 'review',
-      urgency: 'act',
-      label: `Milestone ${c.submission.milestoneIndex + 1} delivered — awaiting your review`,
-      detail: 'Release it, reject it, or it pays out automatically.',
-      deadline: c.submission.reviewEndsAt,
-    };
+  // The case that started this: work has been delivered and a clock is running
+  // against the creator. Silence pays the agent, so not noticing is expensive.
+  if (isCreator) {
+    for (let i = 0; i < c.milestoneCount; i++) {
+      if (c.milestonesDone & (1 << i)) continue;
+      const front = frontOfQueue(c, submissions, i);
+      if (!front || reviewExpired(front, c.reviewWindow, nowUnix)) continue;
+      const waiting = queueFor(submissions, i).length;
+      return {
+        kind: 'review',
+        urgency: 'act',
+        label: waiting > 1
+          ? `Milestone ${i + 1}: ${waiting} deliveries waiting on you`
+          : `Milestone ${i + 1} delivered \u2014 awaiting your review`,
+        detail: waiting > 1
+          ? 'Judged oldest first. Release one, or reject it to see the next.'
+          : 'Release it, reject it, or it pays out automatically.',
+        deadline: reviewEndsAt(front, c.reviewWindow),
+      };
+    }
   }
-  // Matured: anyone can now complete the payment, so the agent should be told
-  // they can take it and the creator that they no longer control it.
-  if (c.submission && matured && (isCreator || isAgent)) {
+
+  // A matured claim: the agent should be told they can take it, and the creator
+  // that they no longer control the outcome.
+  for (let i = 0; i < c.milestoneCount; i++) {
+    if (c.milestonesDone & (1 << i)) continue;
+    const front = frontOfQueue(c, submissions, i);
+    if (!front || !reviewExpired(front, c.reviewWindow, nowUnix)) continue;
+    const isWinner = front.agent === wallet;
+    if (!isWinner && !isCreator) continue;
     return {
       kind: 'claimable',
       urgency: 'act',
-      label: isAgent
-        ? `Milestone ${c.submission.milestoneIndex + 1} is yours to claim`
-        : `Milestone ${c.submission.milestoneIndex + 1} review window has passed`,
-      detail: isAgent
+      label: isWinner
+        ? `Milestone ${i + 1} is yours to claim`
+        : `Milestone ${i + 1} review window has passed`,
+      detail: isWinner
         ? 'The review window lapsed, so anyone can release this to you.'
-        : 'Anyone can now release this to the agent.',
-      deadline: c.submission.reviewEndsAt + CLAIM_GRACE_WINDOW_SECONDS,
+        : 'Anyone can now release this to the agent who delivered it.',
+      deadline: reviewEndsAt(front, c.reviewWindow) + CLAIM_GRACE_WINDOW_SECONDS,
     };
   }
-  // A contract offered to this wallet, which lapses if ignored.
-  if (wallet === c.pendingAgent && c.status === 'funded') {
-    return {
-      kind: 'accept',
-      urgency: 'act',
-      label: 'You have been offered this contract',
-      detail: 'Accept it to start work. The offer lapses if you do not.',
-      deadline: c.nominationLapsesAt,
-    };
+
+  // An agent with work in the queue behind somebody else.
+  const mine = submissions.filter(s => s.agent === wallet && s.state === 'pending');
+  if (mine.length) {
+    const ahead = mine.reduce((n, s) => n + s.sequence - (c.milestoneRejected?.[s.milestoneIndex] ?? 0), 0);
+    if (ahead > 0) {
+      return {
+        kind: 'queued',
+        urgency: 'soon',
+        label: `Your delivery is ${ahead === 1 ? 'next' : `${ahead} back`} in the queue`,
+        detail: 'Earlier deliveries are judged first. Yours is judged if they are rejected.',
+        deadline: null,
+      };
+    }
   }
-  // Funded and idle: the creator has money escrowed and nobody building.
-  if (isCreator && c.status === 'funded' && !c.agent && !c.pendingAgent) {
-    return {
-      kind: 'nominate',
-      urgency: 'soon',
-      label: 'Funded — waiting for you to nominate an agent',
-      detail: 'Nobody can start work until you choose someone.',
-      deadline: c.deliveryDeadline || c.deadline,
-    };
+
+  // Funded and nobody has delivered: worth an agent’s attention, and worth a
+  // creator knowing their money is sitting there unworked.
+  if (c.status === 'funded' && !workClosed(c, nowUnix) && c.submissions === 0) {
+    if (isCreator) {
+      return {
+        kind: 'awaiting-work',
+        urgency: 'soon',
+        label: 'Funded and open \u2014 nobody has delivered yet',
+        detail: 'Any agent can pick this up. You do not need to choose one.',
+        deadline: c.workDeadline || c.deadline,
+      };
+    }
+    if (canWork(c, wallet, nowUnix)) {
+      return {
+        kind: 'open',
+        urgency: 'soon',
+        label: 'Open for work, nobody competing yet',
+        detail: 'Funded and unclaimed. Deliver it and the escrow is yours to win.',
+        deadline: c.workDeadline || c.deadline,
+      };
+    }
   }
-  // The agent's own clock, which they lose the contract by missing.
-  if (isAgent && c.status === 'building' && !c.submission) {
-    return {
-      kind: 'deliver',
-      urgency: 'soon',
-      label: 'Your delivery is due',
-      detail: 'Submit before the clock runs out or the escrow returns to backers.',
-      deadline: c.deliveryDeadline,
-    };
-  }
+
   // Housekeeping, offered but never urgent.
   if (reclaimableRent(c, wallet, nowUnix).claims.length) {
     return {
@@ -370,7 +504,6 @@ function pendingAttention(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
   }
   return null;
 }
-
 /// Whether a refund from this commission will be charged the connection fee.
 /// Once an agent has delivered something the protocol has done the part it
 /// controls, so the fee applies however the money leaves escrow.
@@ -391,7 +524,7 @@ const build = {
     creator, seed, goalLamports, milestoneBasisPoints, deadlineUnix,
     // Zero tells the program to use its own defaults, so a caller that does not
     // care about the clocks still gets workable ones.
-    deliveryWindowSeconds = 0, reviewWindowSeconds = 0,
+    workWindowSeconds = 0, reviewWindowSeconds = 0,
   }) {
     const commission = commissionPda(ctx.programId, creator, seed);
     const vault = vaultPda(ctx.programId, commission);
@@ -409,7 +542,7 @@ const build = {
         data: Buffer.concat([
           Buffer.from([IX.createCommission]), u64(seed), u64(goalLamports),
           u32(milestoneBasisPoints.length), ...milestoneBasisPoints.map(u16), i64(deadlineUnix),
-          i64(deliveryWindowSeconds), i64(reviewWindowSeconds),
+          i64(workWindowSeconds), i64(reviewWindowSeconds),
         ]),
       }),
     };
@@ -435,81 +568,137 @@ const build = {
     };
   },
 
-  selectAgent(ctx, { creator, commission, agent }) {
+  /// OPTIONAL: narrow a commission to one agent. Passing the creator's own key
+  /// clears the restriction and puts the work back on the open board.
+  inviteAgent(ctx, { creator, commission, agent }) {
     return {
       commission: key(commission),
       instruction: ix({
         programId: key(ctx.programId),
         keys: [meta(creator, true, false), meta(commission, false, true), meta(agent, false, false)],
-        data: Buffer.from([IX.selectAgent]),
+        data: Buffer.from([IX.inviteAgent]),
       }),
     };
   },
 
-  revokeAgent(ctx, { creator, commission }) {
+  /// Non-binding: reserves nothing, blocks nobody, confers no priority.
+  signalIntent(ctx, { agent, commission }) {
+    const intent = intentPda(ctx.programId, commission, agent);
     return {
-      commission: key(commission),
-      instruction: ix({
-        programId: key(ctx.programId),
-        keys: [meta(creator, true, false), meta(commission, false, true)],
-        data: Buffer.from([IX.revokeAgent]),
-      }),
-    };
-  },
-
-  acceptAgent(ctx, { agent, commission }) {
-    return {
-      commission: key(commission),
-      instruction: ix({
-        programId: key(ctx.programId),
-        keys: [meta(agent, true, false), meta(commission, false, true)],
-        data: Buffer.from([IX.acceptAgent]),
-      }),
-    };
-  },
-
-  releaseMilestone(ctx, { creator, commission, agent, milestoneIndex }) {
-    const vault = vaultPda(ctx.programId, commission);
-    return {
-      commission: key(commission), vault,
+      commission: key(commission), intent,
       instruction: ix({
         programId: key(ctx.programId),
         keys: [
-          meta(creator, true, false),
+          meta(agent, true, true),
           meta(commission, false, true),
+          meta(intent, false, true),
+          meta(systemProgram(), false, false),
+        ],
+        data: Buffer.from([IX.signalIntent]),
+      }),
+    };
+  },
+
+  withdrawIntent(ctx, { agent, commission }) {
+    const intent = intentPda(ctx.programId, commission, agent);
+    return {
+      commission: key(commission), intent,
+      instruction: ix({
+        programId: key(ctx.programId),
+        keys: [meta(agent, true, false), meta(commission, false, true), meta(intent, false, true)],
+        data: Buffer.from([IX.withdrawIntent]),
+      }),
+    };
+  },
+
+  /// Returns a losing agent's submission rent once it can no longer be paid.
+  closeSubmission(ctx, { agent, commission, milestoneIndex }) {
+    const submission = submissionPda(ctx.programId, commission, milestoneIndex, agent);
+    return {
+      commission: key(commission), submission,
+      instruction: ix({
+        programId: key(ctx.programId),
+        keys: [meta(agent, true, true), meta(commission, false, true), meta(submission, false, true)],
+        data: Buffer.from([IX.closeSubmission]),
+      }),
+    };
+  },
+
+  closeIntent(ctx, { agent, commission }) {
+    const intent = intentPda(ctx.programId, commission, agent);
+    return {
+      commission: key(commission), intent,
+      instruction: ix({
+        programId: key(ctx.programId),
+        keys: [meta(agent, true, true), meta(commission, false, true), meta(intent, false, true)],
+        data: Buffer.from([IX.closeIntent]),
+      }),
+    };
+  },
+
+  /// Pays one submission and closes its milestone.
+  ///
+  /// `signer` may be the creator at any time, or anyone once that submission's
+  /// review window has elapsed. The payee is read off the submission account, so
+  /// a caller cannot redirect the money.
+  releaseMilestone(ctx, { creator, signer, commission, agent, milestoneIndex }) {
+    const vault = vaultPda(ctx.programId, commission);
+    const submission = submissionPda(ctx.programId, commission, milestoneIndex, agent);
+    return {
+      commission: key(commission), vault, submission,
+      instruction: ix({
+        programId: key(ctx.programId),
+        keys: [
+          meta(signer || creator, true, false),
+          meta(commission, false, true),
+          meta(submission, false, true),
           meta(vault, false, true),
           meta(agent, false, true),
           meta(ctx.treasury, false, true),
         ],
-        data: Buffer.from([IX.releaseMilestone, milestoneIndex]),
+        data: Buffer.from([IX.releaseMilestone]),
       }),
     };
   },
 
-  /// The agent records a delivery, starting the review clock. `evidenceHash` is
-  /// 32 opaque bytes — a commit id, an artifact digest. The chain stores the
-  /// commitment, never the content.
+  /// Deliver work against a milestone. Open to anyone on an open commission:
+  /// no claim, no assignment, no permission.
+  ///
+  /// `evidenceHash` is 32 opaque bytes — a commit id, an artifact digest. The
+  /// chain stores the commitment; the content is recorded off chain and only
+  /// accepted if it hashes to this.
   submitDelivery(ctx, { agent, commission, milestoneIndex, evidenceHash }) {
     const hash = Buffer.isBuffer(evidenceHash) ? evidenceHash : Buffer.from(evidenceHash || [], 'hex');
     if (hash.length !== 32) throw new Error('evidenceHash must be exactly 32 bytes');
+    const submission = submissionPda(ctx.programId, commission, milestoneIndex, agent);
     return {
-      commission: key(commission),
+      commission: key(commission), submission,
       instruction: ix({
         programId: key(ctx.programId),
-        keys: [meta(agent, true, false), meta(commission, false, true)],
+        keys: [
+          meta(agent, true, true),
+          meta(commission, false, true),
+          meta(submission, false, true),
+          meta(systemProgram(), false, false),
+        ],
         data: Buffer.concat([Buffer.from([IX.submitDelivery, milestoneIndex]), hash]),
       }),
     };
   },
 
-  /// The creator refuses a delivery. Public, attributable, and it stops the
-  /// clock that would otherwise have paid the agent.
-  rejectDelivery(ctx, { creator, commission }) {
+  /// The creator refuses the delivery at the front of a milestone's queue.
+  /// Public, attributable, and it promotes the next one in line.
+  rejectDelivery(ctx, { creator, commission, agent, milestoneIndex }) {
+    const submission = submissionPda(ctx.programId, commission, milestoneIndex, agent);
     return {
-      commission: key(commission),
+      commission: key(commission), submission,
       instruction: ix({
         programId: key(ctx.programId),
-        keys: [meta(creator, true, false), meta(commission, false, true)],
+        keys: [
+          meta(creator, true, false),
+          meta(commission, false, true),
+          meta(submission, false, true),
+        ],
         data: Buffer.from([IX.rejectDelivery]),
       }),
     };
@@ -587,19 +776,18 @@ const build = {
 
 /// What a given wallet is allowed to do right now, straight from on-chain state.
 /// This is the question an autonomous agent actually needs answered.
-function availableActions(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
+///
+/// `submissions` is the decoded list for this commission. It is optional: pass
+/// it and the queue-sensitive answers become exact, omit it and you still get
+/// the answers that depend on the commission alone.
+function availableActions(c, wallet, options = {}) {
+  const nowUnix = typeof options === 'number'
+    ? options
+    : (options.nowUnix ?? Math.floor(Date.now() / 1000));
+  const submissions = (typeof options === 'object' && options.submissions) || [];
   const fundingExpired = nowUnix >= c.deadline;
-  // Once started, the delivery clock governs the commission whatever its status
-  // — including one rejected back into the pool and never re-accepted.
-  const deliveryExpired = c.deliveryDeadline > 0 && nowUnix >= c.deliveryDeadline;
-  const isCreator = wallet && wallet === c.creator;
-  const isAgent = wallet && wallet === c.agent;
-  const isNominee = wallet && wallet === c.pendingAgent;
-  const matured = reviewExpired(c, nowUnix);
-  // A delivery awaiting judgement freezes every exit, so that work which has
-  // been handed over cannot be cancelled or refunded out from under the agent.
-  // The freeze outlasts the review window by a grace period, so a claim that
-  // matures after the delivery deadline is not a race the agent can lose.
+  const closed = workClosed(c, nowUnix);
+  const isCreator = !!wallet && wallet === c.creator;
   const claimBlocks = claimProtected(c, nowUnix);
   const hasUnreleased = () => {
     for (let i = 0; i < c.milestoneCount; i++) if (!(c.milestonesDone & (1 << i))) return true;
@@ -608,53 +796,57 @@ function availableActions(c, wallet, nowUnix = Math.floor(Date.now() / 1000)) {
   const actions = [];
 
   if (c.status === 'funding' && !fundingExpired) actions.push('pledge');
-  if (c.status === 'funded' && isCreator && !c.pendingAgent && !c.agent && !fundingExpired) actions.push('selectAgent');
-  if (c.status === 'funded' && c.pendingAgent && !c.agent) {
-    const lapsed = c.nominationLapsesAt !== null && nowUnix >= c.nominationLapsesAt;
-    if (isCreator || lapsed) actions.push('revokeAgent');
-  }
-  if (c.status === 'funded' && isNominee && !fundingExpired) actions.push('acceptAgent');
 
-  if (c.status === 'funded' && !c.agent && !c.pendingAgent && !fundingExpired && !deliveryExpired && c.deliveryDeadline > 0) {
-    // Rejected back into the pool: still hireable, but only while the delivery
-    // clock the next agent would inherit still has time left on it.
-    if (isCreator) actions.push('selectAgent');
+  // The heart of it: a funded commission is workable by ANYONE. Under the old
+  // model an agent who found this job could do nothing at all until a human
+  // chose them, which is the bottleneck this replaced.
+  if (canWork(c, wallet, nowUnix) && hasUnreleased()) {
+    actions.push('submitDelivery');
+    actions.push('signalIntent');
   }
+  // Narrowing a commission to one agent stays available, but it is the
+  // exception rather than the path.
+  if (isCreator && ['funding', 'funded'].includes(c.status)) actions.push('inviteAgent');
 
-  if (c.status === 'building') {
-    // The agent hands work over; only they can, and only before their clock runs out.
-    if (isAgent && !c.submission && !deliveryExpired && hasUnreleased()) actions.push('submitDelivery');
-    // The creator may pay at any time. Anyone may finish a matured claim.
-    if (isCreator && hasUnreleased()) actions.push('releaseMilestone');
-    if (matured) actions.push('releaseMilestone');
+  // Judging happens strictly in order of arrival.
+  for (let i = 0; i < c.milestoneCount; i++) {
+    if (c.milestonesDone & (1 << i)) continue;
+    const front = frontOfQueue(c, submissions, i);
+    if (!front) continue;
+    const matured = reviewExpired(front, c.reviewWindow, nowUnix);
+    // The creator may pay at any time; anyone may complete a matured claim.
+    if (isCreator || matured) actions.push('releaseMilestone');
     // Refusal is available only while the window still belongs to the creator.
-    if (isCreator && c.submission && !matured) actions.push('rejectDelivery');
+    if (isCreator && !matured) actions.push('rejectDelivery');
   }
 
   if (!claimBlocks) {
-    // The creator may back out at will only while nobody has ever committed to
-    // the work. Once a delivery clock exists it governs, including after a
-    // rejection — otherwise rejecting would be an instant unilateral exit.
-    if (isCreator && ['funding', 'funded'].includes(c.status) && !c.deliveryDeadline) actions.push('cancel');
-    if (isAgent && c.status === 'building') actions.push('cancel');
-    if (!isCreator && !isAgent && fundingExpired && ['funding', 'funded'].includes(c.status)) actions.push('cancel');
-    if (deliveryExpired) actions.push('cancel');
+    // A funded bounty cannot be pulled out from under agents who may already
+    // be spending compute on it. Before funding it is still just an offer.
+    if (isCreator && c.status === 'funding') actions.push('cancel');
+    if (['funding', 'funded'].includes(c.status) && (fundingExpired || closed)) actions.push('cancel');
 
     const refundable = ['cancelled', 'refunded'].includes(c.status)
       || (fundingExpired && ['funding', 'funded'].includes(c.status))
-      || deliveryExpired;
+      || closed;
     if (refundable) actions.push('refund');
   }
 
-  // Reclaiming rent is never urgent and never affects escrow, so it is offered
-  // last and only once the account genuinely cannot be needed again.
+  // Reclaiming rent is never urgent and never touches escrow, so it comes last
+  // and only once an account genuinely cannot be needed again.
+  const mine = submissions.filter(s => s.agent === wallet);
+  const settledForMe = mine.some(s =>
+    s.state !== 'pending'
+    || (c.milestonesDone & (1 << s.milestoneIndex)) !== 0
+    || c.status === 'refunded'
+    || (closed && !claimBlocks));
+  if (settledForMe) actions.push('closeSubmission');
   for (const claim of reclaimableRent(c, wallet, nowUnix).claims) {
     if (claim.kind === 'pledge' && wallet) actions.push('closePledge');
     if (claim.kind === 'vault') actions.push('closeVault');
   }
   return [...new Set(actions)];
 }
-
 /// Extracts a program error name from a failed transaction, if there is one.
 function explainError(error) {
   const message = error?.message || String(error);
@@ -667,14 +859,17 @@ function explainError(error) {
 
 module.exports = {
   LAMPORTS_PER_SOL, BPS_DENOMINATOR, FEE_BASIS_POINTS, MAX_MILESTONES,
-  COMMISSION_ACCOUNT_BYTES, VAULT_RENT_LAMPORTS,
+  COMMISSION_ACCOUNT_BYTES, SUBMISSION_ACCOUNT_BYTES, INTENT_ACCOUNT_BYTES,
+  VAULT_RENT_LAMPORTS, PLEDGE_RENT_LAMPORTS, COMMISSION_RENT_LAMPORTS,
+  SUBMISSION_RENT_LAMPORTS, INTENT_RENT_LAMPORTS,
   MAX_FUNDING_DURATION_SECONDS,
-  MIN_DELIVERY_WINDOW_SECONDS, MAX_DELIVERY_WINDOW_SECONDS, DEFAULT_DELIVERY_WINDOW_SECONDS,
+  MIN_WORK_WINDOW_SECONDS, MAX_WORK_WINDOW_SECONDS, DEFAULT_WORK_WINDOW_SECONDS,
   MIN_REVIEW_WINDOW_SECONDS, MAX_REVIEW_WINDOW_SECONDS, DEFAULT_REVIEW_WINDOW_SECONDS,
-  NOMINATION_WINDOW_SECONDS, CLAIM_GRACE_WINDOW_SECONDS,
-  PLEDGE_RENT_LAMPORTS, COMMISSION_RENT_LAMPORTS,
-  reviewExpired, claimProtected, refundCarriesFee, reclaimableRent, pendingAttention,
-  IX, STATUS, ERRORS, ERROR_HELP,
-  commissionPda, vaultPda, pledgePda, decodeCommission, escrowRemaining,
+  CLAIM_GRACE_WINDOW_SECONDS, MAX_SUBMISSIONS_PER_MILESTONE,
+  reviewEndsAt, reviewExpired, claimProtected, workClosed, canWork,
+  frontOfQueue, queueFor, refundCarriesFee, reclaimableRent, pendingAttention,
+  IX, STATUS, SUBMISSION_STATE, ERRORS, ERROR_HELP,
+  commissionPda, vaultPda, pledgePda, submissionPda, intentPda,
+  decodeCommission, decodeSubmission, decodeIntent, escrowRemaining,
   build, availableActions, explainError, canBuildTransactions,
 };

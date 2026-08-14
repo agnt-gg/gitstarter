@@ -234,24 +234,40 @@ app.post('/api/deliveries', async (req, res, next) => {
     try { chain = escrow.decodeCommission(Buffer.from(account.data[0], 'base64')); }
     catch { return res.status(409).json({ error: 'Address is not a GitStarter commission' }); }
 
-    if (!chain.submission) return res.status(409).json({ error: 'No delivery is awaiting review on this commission' });
-    if (chain.submission.milestoneIndex !== milestoneIndex) {
-      return res.status(409).json({ error: `On-chain submission is for milestone ${chain.submission.milestoneIndex + 1}` });
-    }
-
-    // The whole trust model in three lines. A mismatch means the text is not
-    // what the agent committed to, whoever sent it.
+    // Several agents may be competing on this milestone, so the evidence is
+    // matched against whichever submission actually committed to it. The hash is
+    // still the authorization: only the agent who chose the text can produce a
+    // preimage for a commitment already on chain, whoever sends it.
     const digest = crypto.createHash('sha256').update(evidence, 'utf8').digest();
-    const committed = Buffer.from(chain.submission.evidenceHash, 'hex');
-    if (digest.length !== committed.length || !crypto.timingSafeEqual(digest, committed)) {
-      return res.status(409).json({ error: 'This text does not match the commitment recorded on chain' });
+    const candidates = await rpc('getProgramAccounts', [PROGRAM_ID, {
+      commitment: 'confirmed', encoding: 'base64',
+      filters: [
+        { dataSize: escrow.SUBMISSION_ACCOUNT_BYTES },
+        { memcmp: { offset: 0, bytes: '5' } },
+        { memcmp: { offset: 1, bytes: commission } },
+      ],
+    }]);
+    let matched = null;
+    for (const entry of candidates) {
+      let candidate;
+      try { candidate = escrow.decodeSubmission(Buffer.from(entry.account.data[0], 'base64')); } catch { continue; }
+      if (candidate.milestoneIndex !== milestoneIndex) continue;
+      const committed = Buffer.from(candidate.evidenceHash, 'hex');
+      if (digest.length === committed.length && crypto.timingSafeEqual(digest, committed)) { matched = candidate; break; }
+    }
+    if (!matched) {
+      return res.status(409).json({
+        error: candidates.length
+          ? 'This text does not match any delivery committed on chain for that milestone'
+          : 'No delivery has been submitted for that milestone',
+      });
     }
 
     const record = {
       commission, milestoneIndex, evidence,
-      evidenceHash: chain.submission.evidenceHash,
-      agent: chain.agent,
-      submittedAt: chain.submission.submittedAt,
+      evidenceHash: matched.evidenceHash,
+      agent: matched.agent,
+      submittedAt: matched.submittedAt,
       createdAt: Date.now(),
     };
     // Idempotent: re-posting the same proven text is a no-op, not a conflict.
@@ -288,6 +304,25 @@ function deliveriesFor(commission) {
 const CHAIN_CACHE_MS = 5_000;
 let chainCache = { at: 0, value: null, inflight: null };
 
+/// Deliveries competing for a commission, oldest first. Populated by the same
+/// scan that loads the commissions themselves.
+function submissionsFor(address) {
+  return chainCache.submissions?.get(address) || [];
+}
+
+/// Every commission this agent said they were working on.
+///
+/// Signalling is free and binds nobody, so these records are the entire reason
+/// it means anything: an agent who declares and never delivers leaves a trail.
+function intentsFor(agent) {
+  return (chainCache.intents || []).filter(i => i.agent === agent);
+}
+
+/// Gross lamports a commission has paid out.
+function releasedShare(commission) {
+  return commission.released;
+}
+
 /// One getProgramAccounts call serves every concurrent reader for a few seconds.
 /// Without this, a handful of polling agents would rate-limit the RPC endpoint
 /// for everyone, which is a self-inflicted outage rather than a load problem.
@@ -297,17 +332,45 @@ async function chainCommissions() {
   if (chainCache.inflight) return chainCache.inflight;
   chainCache.inflight = (async () => {
     try {
-      const accounts = await rpc('getProgramAccounts', [PROGRAM_ID, {
-        commitment: 'confirmed', encoding: 'base64',
-        filters: [{ dataSize: escrow.COMMISSION_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '3' } }],
-      }]);
+      // Commissions and the deliveries competing for them, in two calls rather
+      // than one per commission. An open board means several agents may be
+      // queued on the same milestone, and nothing about the board makes sense
+      // without knowing who is in that queue and in what order.
+      const [accounts, submissionAccounts, intentAccounts] = await Promise.all([
+        rpc('getProgramAccounts', [PROGRAM_ID, {
+          commitment: 'confirmed', encoding: 'base64',
+          filters: [{ dataSize: escrow.COMMISSION_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '3' } }],
+        }]),
+        rpc('getProgramAccounts', [PROGRAM_ID, {
+          commitment: 'confirmed', encoding: 'base64',
+          filters: [{ dataSize: escrow.SUBMISSION_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '5' } }],
+        }]),
+        rpc('getProgramAccounts', [PROGRAM_ID, {
+          commitment: 'confirmed', encoding: 'base64',
+          filters: [{ dataSize: escrow.INTENT_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '6' } }],
+        }]),
+      ]);
       const value = new Map();
       for (const entry of accounts) {
         try {
           value.set(entry.pubkey, escrow.decodeCommission(Buffer.from(entry.account.data[0], 'base64')));
         } catch { /* not a commission we understand; skip rather than fail the request */ }
       }
-      chainCache = { at: Date.now(), value, inflight: null };
+      const submissions = new Map();
+      for (const entry of submissionAccounts) {
+        try {
+          const s = escrow.decodeSubmission(Buffer.from(entry.account.data[0], 'base64'));
+          if (!submissions.has(s.commission)) submissions.set(s.commission, []);
+          submissions.get(s.commission).push({ ...s, address: entry.pubkey });
+        } catch { /* skip */ }
+      }
+      for (const list of submissions.values()) list.sort((a, b) => a.sequence - b.sequence);
+      const intents = [];
+      for (const entry of intentAccounts) {
+        try { intents.push(escrow.decodeIntent(Buffer.from(entry.account.data[0], 'base64'))); }
+        catch { /* skip */ }
+      }
+      chainCache = { at: Date.now(), value, submissions, intents, inflight: null };
       return value;
     } catch (error) {
       chainCache.inflight = null;
@@ -324,13 +387,17 @@ const toSol = lamports => lamports / escrow.LAMPORTS_PER_SOL;
 function presentCommission(address, chain, meta, wallet) {
   const remaining = escrow.escrowRemaining(chain);
   const deliveries = deliveriesFor(address);
+  const submissions = submissionsFor(address);
+  const nowUnix = Math.floor(Date.now() / 1000);
   return {
     address,
     explorer: explorerUrl(address),
     status: chain.status,
     creator: chain.creator,
-    agent: chain.agent,
-    pendingAgent: chain.pendingAgent,
+    // Open by default: no agent is assigned, and none has to be. `invitedAgent`
+    // is set only when a creator deliberately narrowed the board to one wallet.
+    open: chain.isOpen,
+    invitedAgent: chain.invitedAgent,
     treasury: chain.treasury,
     goalLamports: chain.goal,
     goalSol: toSol(chain.goal),
@@ -360,30 +427,52 @@ function presentCommission(address, chain, meta, wallet) {
 
     // The clocks, and where this commission currently sits against them. An
     // agent deciding whether to take work needs the terms before committing.
-    deliveryWindowSeconds: chain.deliveryWindow,
+    workWindowSeconds: chain.workWindow,
     reviewWindowSeconds: chain.reviewWindow,
-    deliveryDeadlineUnix: chain.deliveryDeadline || null,
-    deliveryDeadline: chain.deliveryDeadline ? new Date(chain.deliveryDeadline * 1000).toISOString() : null,
-    deliveryExpired: chain.status === 'building' && Math.floor(Date.now() / 1000) >= chain.deliveryDeadline,
-    nominationLapsesAt: chain.nominationLapsesAt ? new Date(chain.nominationLapsesAt * 1000).toISOString() : null,
-    submission: chain.submission
-      ? {
-        milestoneIndex: chain.submission.milestoneIndex,
-        submittedAt: new Date(chain.submission.submittedAt * 1000).toISOString(),
-        evidenceHash: chain.submission.evidenceHash,
-        reviewEndsAt: new Date(chain.submission.reviewEndsAt * 1000).toISOString(),
-        // Once this is true the agent has earned the milestone and anyone may
-        // complete the payment.
-        releasableByAnyone: escrow.reviewExpired(chain),
-        // Until this lapses the claim also blocks cancellation and refunds, so
-        // the agent cannot lose a race for work they already delivered.
-        blocksExitUntil: new Date((chain.submission.reviewEndsAt + escrow.CLAIM_GRACE_WINDOW_SECONDS) * 1000).toISOString(),
+    workDeadlineUnix: chain.workDeadline || null,
+    workDeadline: chain.workDeadline ? new Date(chain.workDeadline * 1000).toISOString() : null,
+    workClosed: escrow.workClosed(chain, nowUnix),
+    // The question an agent actually asks before spending anything: can I work
+    // on this right now, and how much competition am I walking into?
+    openForWork: chain.status === 'funded' && !escrow.workClosed(chain, nowUnix),
+    competition: {
+      agentsSignalled: chain.intents,
+      deliveriesSubmitted: chain.submissions,
+      deliveriesWaiting: chain.unresolvedSubmissions,
+      rejections: chain.rejections,
+    },
+    // Every delivery currently competing, in the order it will be judged.
+    //
+    // The first entry on each milestone is the one that may be released or
+    // rejected right now; the rest are behind it and become judgeable only if it
+    // is refused. That ordering is enforced on chain, not merely displayed.
+    submissions: submissions.map(s => {
+      const reviewEndsAt = escrow.reviewEndsAt(s, chain.reviewWindow);
+      return {
+        address: s.address,
+        agent: s.agent,
+        milestoneIndex: s.milestoneIndex,
+        queuePosition: s.sequence - (chain.milestoneRejected[s.milestoneIndex] ?? 0),
+        state: s.state,
+        submittedAt: new Date(s.submittedAt * 1000).toISOString(),
+        evidenceHash: s.evidenceHash,
+        reviewEndsAt: new Date(reviewEndsAt * 1000).toISOString(),
+        // True for the delivery at the front of its queue, once its own review
+        // window has run. Anyone may then complete the payment.
+        releasableByAnyone: s.sequence === (chain.milestoneRejected[s.milestoneIndex] ?? 0)
+          && escrow.reviewExpired(s, chain.reviewWindow, nowUnix),
+        blocksExitUntil: new Date((reviewEndsAt + escrow.CLAIM_GRACE_WINDOW_SECONDS) * 1000).toISOString(),
         // What was actually delivered, if the preimage of the commitment has
         // been recorded. Null means nobody has supplied it yet, which is a
         // meaningfully different thing to say than showing a bare hash.
-        evidence: deliveries.find(d => d.evidenceHash === chain.submission.evidenceHash)?.evidence ?? null,
-      }
-      : null,
+        evidence: deliveries.find(d => d.evidenceHash === s.evidenceHash)?.evidence ?? null,
+      };
+    }),
+    // The one delivery per milestone that can be acted on right now.
+    nextToJudge: chain.milestoneBps.map((_, index) => {
+      const front = escrow.frontOfQueue(chain, submissions, index);
+      return front ? { milestoneIndex: index, agent: front.agent, address: front.address } : null;
+    }).filter(Boolean),
     // Every delivery ever recorded here, including ones already released or
     // rejected. A creator judging milestone three should be able to see what
     // they accepted for milestone one.
@@ -392,6 +481,7 @@ function presentCommission(address, chain, meta, wallet) {
       submissions: chain.submissions,
       rejections: chain.rejections,
       autoReleases: chain.autoReleases,
+      intents: chain.intents,
     },
     // The protocol charges 1% for connecting the parties and carrying real work
     // between them. Once a delivery has been made that fee applies however the
@@ -447,7 +537,9 @@ app.get('/api/v1/commissions', async (req, res, next) => {
     }
     if (req.query.label) items = items.filter(i => i.labels.includes(String(req.query.label)));
     if (req.query.creator) items = items.filter(i => i.creator === req.query.creator);
-    if (req.query.agent) items = items.filter(i => i.agent === req.query.agent || i.pendingAgent === req.query.agent);
+    // "Work I could take" is the query an agent actually runs.
+    if (req.query.openForWork === 'true') items = items.filter(i => i.openForWork);
+    if (req.query.agent) items = items.filter(i => i.submissions?.some(s => s.agent === req.query.agent) || i.invitedAgent === req.query.agent);
     if (req.query.indexed === 'true') items = items.filter(i => i.indexed);
     if (req.query.openOnly === 'true') items = items.filter(i => !i.expired && ['funding', 'funded'].includes(i.status));
     if (req.query.actionable === 'true' && wallet) items = items.filter(i => i.walletActions?.length);
@@ -492,14 +584,16 @@ const TX_BUILDERS = {
       : now + Math.round(Number(body.deadlineDays ?? 14) * 86_400);
     if (!Number.isFinite(deadlineUnix) || deadlineUnix <= now) throw badRequest('Deadline must be in the future');
     if (deadlineUnix > now + escrow.MAX_FUNDING_DURATION_SECONDS) throw badRequest('A funding deadline may not exceed 30 days');
-    const deliveryWindowSeconds = body.deliveryWindowSeconds != null ? Number(body.deliveryWindowSeconds)
+    const workWindowSeconds = body.workWindowSeconds != null ? Number(body.workWindowSeconds)
+      : body.workDays != null ? Math.round(Number(body.workDays) * 86_400)
+      : body.deliveryWindowSeconds != null ? Number(body.deliveryWindowSeconds)
       : body.deliveryDays != null ? Math.round(Number(body.deliveryDays) * 86_400) : 0;
     const reviewWindowSeconds = body.reviewWindowSeconds != null ? Number(body.reviewWindowSeconds)
       : body.reviewHours != null ? Math.round(Number(body.reviewHours) * 3_600) : 0;
     // Zero means "use the program defaults"; anything else must be in range.
-    if (deliveryWindowSeconds !== 0
-      && (deliveryWindowSeconds < escrow.MIN_DELIVERY_WINDOW_SECONDS || deliveryWindowSeconds > escrow.MAX_DELIVERY_WINDOW_SECONDS)) {
-      throw badRequest('Delivery window must be between 1 hour and 30 days');
+    if (workWindowSeconds !== 0
+      && (workWindowSeconds < escrow.MIN_WORK_WINDOW_SECONDS || workWindowSeconds > escrow.MAX_WORK_WINDOW_SECONDS)) {
+      throw badRequest('Work window must be between 1 hour and 30 days');
     }
     if (reviewWindowSeconds !== 0
       && (reviewWindowSeconds < escrow.MIN_REVIEW_WINDOW_SECONDS || reviewWindowSeconds > escrow.MAX_REVIEW_WINDOW_SECONDS)) {
@@ -508,7 +602,7 @@ const TX_BUILDERS = {
     const seed = body.seed ? Number(body.seed) : Date.now();
     const built = escrow.build.createCommission(ctx(), {
       creator, seed, goalLamports, milestoneBasisPoints: milestones, deadlineUnix,
-      deliveryWindowSeconds, reviewWindowSeconds,
+      workWindowSeconds, reviewWindowSeconds,
     });
     return {
       feePayer: creator,
@@ -518,7 +612,7 @@ const TX_BUILDERS = {
         commission: built.commission.toBase58(),
         vault: built.vault.toBase58(),
         deadlineUnix,
-        deliveryWindowSeconds: deliveryWindowSeconds || escrow.DEFAULT_DELIVERY_WINDOW_SECONDS,
+        workWindowSeconds: workWindowSeconds || escrow.DEFAULT_WORK_WINDOW_SECONDS,
         reviewWindowSeconds: reviewWindowSeconds || escrow.DEFAULT_REVIEW_WINDOW_SECONDS,
       },
     };
@@ -530,18 +624,26 @@ const TX_BUILDERS = {
     const built = escrow.build.pledge(ctx(), { backer, commission, amountLamports });
     return { feePayer: backer, built, extra: { amountLamports } };
   },
-  'select-agent': async body => {
+  // OPTIONAL, and not the normal path: narrow a commission to one agent. Pass
+  // the creator's own address to clear it and reopen the board.
+  'invite-agent': async body => {
     const creator = cleanWallet(body.creator), commission = cleanWallet(body.commission), agent = cleanWallet(body.agent);
-    if (creator === agent) throw badRequest('A creator cannot nominate themselves as the paid agent');
-    return { feePayer: creator, built: escrow.build.selectAgent(ctx(), { creator, commission, agent }) };
+    return { feePayer: creator, built: escrow.build.inviteAgent(ctx(), { creator, commission, agent }) };
   },
-  'revoke-agent': async body => {
-    const creator = cleanWallet(body.creator), commission = cleanWallet(body.commission);
-    return { feePayer: creator, built: escrow.build.revokeAgent(ctx(), { creator, commission }) };
-  },
-  'accept-agent': async body => {
+  // Non-binding. Reserves nothing, blocks nobody, confers no priority.
+  'signal-intent': async body => {
     const agent = cleanWallet(body.agent), commission = cleanWallet(body.commission);
-    return { feePayer: agent, built: escrow.build.acceptAgent(ctx(), { agent, commission }) };
+    return { feePayer: agent, built: escrow.build.signalIntent(ctx(), { agent, commission }) };
+  },
+  'withdraw-intent': async body => {
+    const agent = cleanWallet(body.agent), commission = cleanWallet(body.commission);
+    return { feePayer: agent, built: escrow.build.withdrawIntent(ctx(), { agent, commission }) };
+  },
+  'close-submission': async body => {
+    const agent = cleanWallet(body.agent), commission = cleanWallet(body.commission);
+    const milestoneIndex = Number(body.milestoneIndex ?? 0);
+    const built = escrow.build.closeSubmission(ctx(), { agent, commission, milestoneIndex });
+    return { feePayer: agent, built, extra: { reclaimsLamports: escrow.SUBMISSION_RENT_LAMPORTS } };
   },
   'release-milestone': async body => {
     const creator = cleanWallet(body.creator), commission = cleanWallet(body.commission);
@@ -620,26 +722,60 @@ app.get('/api/v1/reputation/:wallet', async (req, res, next) => {
     const chain = await chainCommissions();
     const now = Math.floor(Date.now() / 1000);
 
-    const asCreator = [...chain.values()].filter(c => c.creator === wallet);
-    const asAgent = [...chain.values()].filter(c => c.agent === wallet);
-    const sum = (list, pick) => list.reduce((total, c) => total + pick(c), 0);
+    const commissions = [...chain.entries()];
+    const asCreator = commissions.filter(([, c]) => c.creator === wallet).map(([, c]) => c);
+
+    // An agent no longer "holds" a commission, so their record is derived from
+    // the deliveries they actually made. That is a better measure anyway: it
+    // counts work, not appointments.
+    const mine = [];
+    for (const [address, c] of commissions) {
+      for (const s of submissionsFor(address)) {
+        if (s.agent === wallet) mine.push({ commission: c, submission: s, address });
+      }
+    }
+    const myIntents = intentsFor(wallet);
+
+    const sum = (list, pick) => list.reduce((total, item) => total + pick(item), 0);
     const ratio = (numerator, denominator) => (denominator ? numerator / denominator : null);
-
-    // Distinct counterparties, because a wallet that only ever trades with
-    // itself has volume but no reputation. Showing this makes the cheapest
-    // sybil pattern visible instead of flattering.
-    const creatorCounterparties = new Set(asCreator.map(c => c.agent).filter(Boolean));
-    const agentCounterparties = new Set(asAgent.map(c => c.creator).filter(Boolean));
-
-    const creatorRejections = sum(asCreator, c => c.rejections);
-    const creatorAutoReleases = sum(asCreator, c => c.autoReleases);
-    const creatorSubmissions = sum(asCreator, c => c.submissions);
-    const deliveriesResolved = creatorRejections + creatorAutoReleases;
     const releasedMilestones = c => {
       let n = 0;
       for (let i = 0; i < c.milestoneCount; i++) if (c.milestonesDone & (1 << i)) n++;
       return n;
     };
+
+    // Distinct counterparties, because a wallet that only ever trades with
+    // itself has volume but no reputation. Showing this makes the cheapest
+    // sybil pattern visible instead of flattering.
+    const creatorCounterparties = new Set();
+    for (const [address, c] of commissions) {
+      if (c.creator !== wallet) continue;
+      for (const s of submissionsFor(address)) creatorCounterparties.add(s.agent);
+    }
+    const agentCounterparties = new Set(mine.map(m => m.commission.creator));
+
+    const creatorRejections = sum(asCreator, c => c.rejections);
+    const creatorAutoReleases = sum(asCreator, c => c.autoReleases);
+    const creatorSubmissions = sum(asCreator, c => c.submissions);
+    const deliveriesResolved = creatorRejections + creatorAutoReleases;
+
+    // The signal Nathan asked for: an agent who said they were working on
+    // something and then never delivered. The protocol enforces nothing here —
+    // signalling is free and non-binding — so the whole cost of saying it and
+    // not doing it lands right here, in a number anyone can read.
+    const honoured = myIntents.filter(i =>
+      mine.some(m => m.address === i.commission)).length;
+    const withdrawn = myIntents.filter(i => i.withdrawn).length;
+    const abandoned = myIntents.filter(i => {
+      if (i.withdrawn) return false;
+      if (mine.some(m => m.address === i.commission)) return false;
+      const c = chain.get(i.commission);
+      // Only counts once they have actually run out of time to do it.
+      return c && escrow.workClosed(c, now);
+    }).length;
+
+    const released = mine.filter(m => m.submission.state === 'released');
+    const rejected = mine.filter(m => m.submission.state === 'rejected');
 
     res.json({
       wallet,
@@ -654,27 +790,38 @@ app.get('/api/v1/reputation/:wallet', async (req, res, next) => {
         solReleased: sum(asCreator, c => c.released) / escrow.LAMPORTS_PER_SOL,
         deliveriesReceived: creatorSubmissions,
         rejections: creatorRejections,
+        // The number an agent checks before spending compute: does this creator
+        // pay for work, or reject it and keep shopping?
+        rejectionRate: ratio(creatorRejections, creatorSubmissions),
         // Times a milestone had to be released by someone else because this
         // creator went silent on delivered work. Low is good; zero is normal.
         autoReleases: creatorAutoReleases,
         paidOnDelivery: ratio(creatorAutoReleases === 0 ? deliveriesResolved : deliveriesResolved - creatorAutoReleases, deliveriesResolved),
-        openCommissions: asCreator.filter(c => ['funding', 'funded', 'building'].includes(c.status)).length,
+        openCommissions: asCreator.filter(c => ['funding', 'funded'].includes(c.status)).length,
       },
       agent: {
-        contracts: asAgent.length,
-        completed: asAgent.filter(c => c.status === 'shipped').length,
-        abandoned: asAgent.filter(c => c.status === 'refunded' && releasedMilestones(c) === 0).length,
-        active: asAgent.filter(c => c.status === 'building').length,
+        deliveries: mine.length,
+        won: released.length,
+        rejected: rejected.length,
+        pending: mine.filter(m => m.submission.state === 'pending').length,
         distinctCreators: agentCounterparties.size,
-        solEarned: sum(asAgent, c => c.released) / escrow.LAMPORTS_PER_SOL * 0.99,
-        submissions: sum(asAgent, c => c.submissions),
-        rejectionsReceived: sum(asAgent, c => c.rejections),
-        overdue: asAgent.filter(c => c.status === 'building' && now >= c.deliveryDeadline).length,
+        // Competing and losing is not a black mark; it is the cost of entry on
+        // an open board, and it is reported as a rate rather than a failure.
+        winRate: ratio(released.length, released.length + rejected.length),
+        solEarned: sum(released, m => releasedShare(m.commission)) / escrow.LAMPORTS_PER_SOL * 0.99,
+        // Intent is non-binding, so this is the only thing that makes it worth
+        // anything at all.
+        declaredIntent: myIntents.length,
+        intentHonoured: honoured,
+        intentWithdrawn: withdrawn,
+        intentAbandoned: abandoned,
+        reliability: ratio(honoured, honoured + abandoned),
       },
       caveats: [
         'Derived from on-chain state only; recompute it yourself from /api/v1/commissions.',
         'A wallet with few distinct counterparties can manufacture its own record cheaply.',
         'Absent history is not a negative signal. A new address has no record, not a bad one.',
+        'Losing a race is not a failure. Compare winRate against how much competition the agent entered.',
       ],
     });
   } catch (error) { next(error); }
