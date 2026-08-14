@@ -667,11 +667,12 @@ async function cleanupInstructions(address,commission){
     commitment:'confirmed',
     filters:[{dataSize:bytes},{memcmp:{offset:0,bytes:tag}},{memcmp:{offset:1,bytes:address}}],
   });
-  let pledges=[],submissions=[];
+  let pledges=[],submissions=[],intents=[];
   try{
-    [pledges,submissions]=await Promise.all([
+    [pledges,submissions,intents]=await Promise.all([
       owned(escrow.PLEDGE_ACCOUNT_BYTES,'4'),
       owned(escrow.SUBMISSION_ACCOUNT_BYTES,'5'),
+      owned(escrow.INTENT_ACCOUNT_BYTES,'6'),
     ]);
   }catch{return [];} // Housekeeping must never be the reason a payment fails.
 
@@ -688,6 +689,17 @@ async function cleanupInstructions(address,commission){
     try{
       const {agent,milestoneIndex}=escrow.decodeSubmission(account.data);
       instructions.push(escrow.build.closeSubmission(ESCROW_CTX,{agent,commission:address,milestoneIndex}).instruction);
+    }catch{/* same */}
+  }
+  // An intent holds a deposit too. Missing these was how the chore survived a
+  // fix that was supposed to remove it: the vault, the pledges and the
+  // submissions all came home while every agent who had merely SAID they were
+  // working on this kept their money locked in an account nothing would ever
+  // close. A declaration is finished the moment the commission is.
+  for(const {account} of intents){
+    try{
+      const {agent}=escrow.decodeIntent(account.data);
+      instructions.push(escrow.build.closeIntent(ESCROW_CTX,{agent,commission:address}).instruction);
     }catch{/* same */}
   }
   // A Solana transaction is size-limited, and every account it touches costs 32
