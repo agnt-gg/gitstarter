@@ -9,7 +9,7 @@ const { PublicKey, Transaction } = web3;
 const escrow = require('../shared/escrow');
 const $ = id => document.getElementById(id);
 const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL;
-const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], activity:null, filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light',
+const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], activity:null, profile:null, profileId:null, myHandle:null, filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light',
   // Address of the commission whose dialog is open, so a live update can redraw
   // it; the websocket subscription id; and the newest slot we have proof of, so
   // no read can hand back state older than our own confirmed transaction.
@@ -454,6 +454,12 @@ function render(){
   const openCount=state.projects.filter(p=>p.status!=='shipped'&&p.status!=='refunded').length,closedCount=state.projects.length-openCount;
   const header=`<div class="Box-header"><div class="list-summary"><span>${statusIcon(STATUS_UI.funding)}<b>${openCount} Open</b></span><span>${statusIcon(STATUS_UI.shipped)}${closedCount} Closed</span></div><div class="list-tools"><label class="hint" for="sortSelect" style="margin:0">Sort</label><select class="tool-select" id="sortSelect"><option value="newest" ${state.sort==='newest'?'selected':''}>Newest</option><option value="funding" ${state.sort==='funding'?'selected':''}>Most funded</option><option value="deadline" ${state.sort==='deadline'?'selected':''}>Deadline</option></select></div></div>`;
   const labelBar=labels.length?`<div class="label-filter"><button class="label-button ${state.label==='all'?'on':''}" data-label="all">All labels</button>${labels.map(label=>`<button class="label-button ${state.label===label?'on':''}" data-label="${esc(label)}">${esc(label)}</button>`).join('')}</div>`:'';
+  handleEditor();
+  if(state.filter==='profile'){
+    $('listBox').innerHTML=`<div class="Box-header"><div class="list-summary"><span><b>Profile</b></span>`
+      +`<button class="btn" data-f="all" type="button">Back to the board</button></div></div>`+profileView();
+    return;
+  }
   if(state.filter==='activity'){
     $('listBox').innerHTML=`<div class="Box-header"><div class="list-summary"><span><b>My activity</b></span></div></div>`+activityView();
     return;
@@ -475,8 +481,116 @@ async function loadBalance(){try{const lamports=await state.connection.getBalanc
 async function loadActivity(){
   const wallet=currentWallet();
   if(!wallet){state.activity=null;return;}
-  try{state.activity=await api(`/api/v1/activity/${wallet}`);}
+  try{
+    state.activity=await api(`/api/v1/activity/${wallet}`);
+    state.myHandle=state.activity.handles?.[wallet]||null;
+  }
   catch(error){console.error(error);state.activity={failed:true};}
+}
+
+/// Somebody, as a name and an address together.
+///
+/// Always both. A handle is a label a wallet put on itself, so showing it alone
+/// would let a familiar-looking name stand in for the only thing that actually
+/// identifies a counterparty — and the address is what gets paid.
+function who(wallet,handles={},{short=true}={}){
+  if(!wallet)return '<span class="who">\u2014</span>';
+  const handle=handles[wallet];
+  const address=short?`${wallet.slice(0,4)}\u2026${wallet.slice(-4)}`:wallet;
+  return `<span class="who">`
+    +(handle?`<span class="handle" data-profile="${esc(wallet)}">@${esc(handle)}</span>`:'')
+    +`<span class="addr mono" data-profile="${esc(wallet)}" title="${esc(wallet)}">${esc(address)}</span></span>`;
+}
+
+async function loadProfile(id){
+  state.profileId=id; state.profile=null; render();
+  try{
+    // Identity and reputation are computed separately on purpose: one is what
+    // this wallet said about itself, the other is what the chain says about it.
+    const [profile,reputation]=await Promise.all([
+      api(`/api/v1/profile/${encodeURIComponent(id)}`),
+      api(`/api/v1/reputation/${encodeURIComponent(id)}`).catch(()=>null),
+    ]);
+    state.profile={...profile,reputation};
+  }catch(error){state.profile={failed:true,message:error.message};}
+  render();
+}
+
+function profileView(){
+  const p=state.profile;
+  if(!p)return '<div class="blank"><h3>Loading\u2026</h3></div>';
+  if(p.failed)return `<div class="blank"><h3>No such handle or wallet</h3><p>${esc(p.message||'')}</p></div>`;
+  const sol=n=>fmtBase(Math.round((n||0)*LAMPORTS_PER_SOL));
+  const rep=p.reputation||{};
+  const agent=rep.agent||{}, creator=rep.creator||{};
+  const pct=v=>v==null?'\u2014':`${Math.round(v*100)}%`;
+  const mine=currentWallet()===p.wallet;
+
+  const head=`<div class="profile-head">`
+    +`<h1>${p.handle?`@${esc(p.handle)}`:'Unnamed wallet'}`
+    +(mine?'<span class="lbl gray">you</span>':'')+`</h1>`
+    +`<div class="addr">${esc(p.wallet)}</div>`
+    +(p.bio?`<p class="bio">${esc(p.bio)}</p>`:'')
+    +(p.link?`<p class="bio"><a href="${esc(safeHttpUrl(p.link)||'#')}" target="_blank" rel="noopener noreferrer nofollow">${esc(p.link)}</a></p>`:'')
+    // Said plainly. A name here is not an endorsement by this service, and
+    // somebody deciding whether to trust a stranger with money should know
+    // exactly which parts of this page are claims and which are arithmetic.
+    +`<p class="profile-caveat">${p.handle?'This name was set by that wallet itself and is not verified by anyone. ':''}`
+    +`Everything below is computed from on-chain history and can be recomputed by anyone.</p>`
+    +`</div>`;
+
+  const stats=`<div class="activity-totals">`
+    +`<div class="metric"><b>${sol(agent.solEarned)} SOL</b><span>Earned from ${agent.won||0} won</span></div>`
+    +`<div class="metric"><b>${pct(agent.winRate)}</b><span>Win rate, judged only</span></div>`
+    +`<div class="metric"><b>${sol(creator.solReleased)} SOL</b><span>Paid out over ${creator.commissions||0} posted</span></div>`
+    +`<div class="metric"><b>${pct(creator.rejectionRate)}</b><span>Refuses delivered work</span></div>`
+    +`</div>`;
+
+  const delivered=p.delivered.filter(d=>d.state==='released');
+  const open=p.posted.filter(x=>x.openForWork);
+  const line=(title,detail,address)=>`<div class="Box-row activity-row" data-id="${esc(address)}" style="cursor:pointer">`
+    +`<div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600">${esc(title||'Untitled bounty')}</span></div>`
+    +`<div class="row-meta">${detail}</div></div></div>`;
+
+  return head+stats
+    +activitySection('Delivered and paid','',
+      delivered.map(d=>line(d.title,`milestone ${d.milestoneNumber} \u00b7 ${sol(d.payoutSol)} SOL \u00b7 ${new Date(d.submittedAt).toLocaleDateString()}`,d.commission)),
+      'No completed work yet. That is not a bad signal \u2014 a new wallet has no record, not a poor one.')
+    +activitySection('Open for work right now','',
+      open.map(x=>line(x.title,`${sol(x.pledgedSol)} SOL escrowed \u00b7 ${x.deliveries} delivered so far`,x.commission)),'')
+    +activitySection('Also posted','',
+      p.posted.filter(x=>!x.openForWork).map(x=>line(x.title,
+        `${x.status} \u00b7 paid ${sol(x.releasedSol)} SOL${x.rejections?` \u00b7 ${x.rejections} refused`:''}`,x.commission)),'')
+    +activitySection('Delivered, not paid',
+      'Refused, or beaten to it by an earlier delivery.',
+      p.delivered.filter(d=>d.state!=='released'&&d.state!=='pending').map(d=>line(d.title,
+        `milestone ${d.milestoneNumber} \u00b7 ${d.state==='rejected'?'refused':'somebody delivered first'}`,d.commission)),'');
+}
+
+/// The name editor, on your own account card only.
+function handleEditor(){
+  const box=$('wHandle');
+  if(!box)return;
+  if(state.authStatus!=='authenticated'){
+    box.innerHTML='<p class="hint">Sign in to choose a public name.</p>';
+    return;
+  }
+  const current=state.myHandle;
+  box.innerHTML=(current?`<div class="handle-current">You are <b>@${esc(current)}</b> \u00b7 <span class="handle" data-profile="${esc(currentWallet())}" style="cursor:pointer;color:var(--accent-fg)">view profile</span></div>`:'')
+    +`<div class="handle-form">`
+    +`<input id="handleInput" type="text" maxlength="32" placeholder="${current?'change your name':'choose a name'}" value="">`
+    +`<button class="btn" id="bSetHandle" type="button">${current?'Rename':'Claim'}</button></div>`
+    +`<p class="hint">Letters, numbers and hyphens. A name is a label on your address, never a substitute for it \u2014 and once claimed it can never be transferred to another wallet, so nobody can inherit the reputation you build under it.</p>`;
+}
+
+async function saveHandle(){
+  const handle=($('handleInput')?.value||'').trim();
+  if(!handle)throw new Error('Enter a name first.');
+  const saved=await api('/api/v1/handle',{method:'POST',body:JSON.stringify({handle})});
+  state.myHandle=saved.handle;
+  showToast(`You are now @${saved.handle}. This name is yours permanently.`);
+  render();
+  refresh().catch(()=>{});
 }
 
 /// One line in the activity view. Clicking it opens the same dialog the board
@@ -629,7 +743,7 @@ function deliveryHistory(p,currentHash){
     +past.map(d=>`<div class="evidence past"><div class="evidence-head">Milestone ${d.milestoneIndex+1} \u00b7 ${new Date(d.submittedAt*1000).toLocaleString()}</div><div class="evidence-body">${evidenceHtml(d.evidence)}</div></div>`).join('')
     +'</details>';
 }
-function row(p){const ui=STATUS_UI[p.status]||STATUS_UI.refunded,m=p.meta||{},percent=p.goal?Math.min(100,p.pledged/p.goal*100):0,labels=Array.isArray(m.labels)?m.labels:[];const attention=attentionFor(p);let cursor=0;const segments=p.milestoneBps.map((bps,index)=>{const start=cursor;cursor+=bps/100;const fill=Math.max(0,Math.min(100,(percent-start)/(bps/100)*100));return `<span class="milestone-segment" style="width:${bps/100}%"><span class="milestone-fill ${ui.cls}" style="display:block;width:${fill}%"></span></span>`;}).join('');return `<div class="Box-row" data-id="${p.address}" style="cursor:pointer"><div class="row-status">${statusIcon(ui)}</div><div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600;font-size:16px">${esc(m.title||'Untitled bounty')}</span>${m.title?'':'<span class="lbl gray">no description posted</span>'}<span class="lbl ${ui.cls}">${esc(ui.detail)}</span>${attention?`<span class="lbl attention ${attention.urgency}">${esc(attention.label)}${attention.deadline?` \u00b7 ${timeLeft(attention.deadline)}`:''}</span>`:''}${labels.map(label=>`<span class="lbl gray">${esc(label)}</span>`).join('')}</div><div class="row-meta"><span class="mono">${p.address.slice(0,8)}…</span><span>created by ${p.creator.slice(0,6)}…</span><span>·</span><span>${esc(m.license||'created on chain')}</span><span>·</span><span>${p.milestoneCount} milestones</span></div><div class="milestone-track" aria-label="${percent.toFixed(1)}% funded across ${p.milestoneCount} milestones">${segments}</div></div><div class="row-right"><span class="amt">${fmtBase(p.pledged)} <span class="of">/ ${fmtBase(p.goal)} SOL</span></span><span class="hint">${p.pledgerCount} ${p.pledgerCount===1?'backer':'backers'}</span></div></div>`;}
+function row(p){const ui=STATUS_UI[p.status]||STATUS_UI.refunded,m=p.meta||{},percent=p.goal?Math.min(100,p.pledged/p.goal*100):0,labels=Array.isArray(m.labels)?m.labels:[];const attention=attentionFor(p);let cursor=0;const segments=p.milestoneBps.map((bps,index)=>{const start=cursor;cursor+=bps/100;const fill=Math.max(0,Math.min(100,(percent-start)/(bps/100)*100));return `<span class="milestone-segment" style="width:${bps/100}%"><span class="milestone-fill ${ui.cls}" style="display:block;width:${fill}%"></span></span>`;}).join('');return `<div class="Box-row" data-id="${p.address}" style="cursor:pointer"><div class="row-status">${statusIcon(ui)}</div><div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600;font-size:16px">${esc(m.title||'Untitled bounty')}</span>${m.title?'':'<span class="lbl gray">no description posted</span>'}<span class="lbl ${ui.cls}">${esc(ui.detail)}</span>${attention?`<span class="lbl attention ${attention.urgency}">${esc(attention.label)}${attention.deadline?` \u00b7 ${timeLeft(attention.deadline)}`:''}</span>`:''}${labels.map(label=>`<span class="lbl gray">${esc(label)}</span>`).join('')}</div><div class="row-meta"><span class="mono">${p.address.slice(0,8)}…</span><span>created by ${who(p.creator,m.creator_handle?{[p.creator]:m.creator_handle}:{})}</span><span>·</span><span>${esc(m.license||'created on chain')}</span><span>·</span><span>${p.milestoneCount} milestones</span></div><div class="milestone-track" aria-label="${percent.toFixed(1)}% funded across ${p.milestoneCount} milestones">${segments}</div></div><div class="row-right"><span class="amt">${fmtBase(p.pledged)} <span class="of">/ ${fmtBase(p.goal)} SOL</span></span><span class="hint">${p.pledgerCount} ${p.pledgerCount===1?'backer':'backers'}</span></div></div>`;}
 function closeDialog(){state.openProject=null;$('overlay').classList.remove('on');$('dlg').className='dlg';$('dlg').innerHTML='';}
 function openProject(address){
   const p=state.projects.find(x=>x.address===address);if(!p)return;
@@ -926,7 +1040,11 @@ function showProgress(message){
 function hideProgress(){const t=$('toast');if(t.classList.contains('busy')){t.className='toast';}}
 function showNotice(message){showToast(message);}
 function showError(error){console.error(error);hideProgress();showToast(friendlyWalletError(error));}
-document.addEventListener('click',e=>{const t=e.target.closest('button,[data-id]');if(!t)return;if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();if(t.dataset.f==='activity')loadActivity().then(render).catch(()=>{});}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index,t.dataset.agent).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
+document.addEventListener('click',e=>{const t=e.target.closest('button,[data-profile],[data-id]');if(!t)return;
+  // Checked before the row, so clicking somebody's name opens who they are
+  // rather than the commission the name happens to be sitting inside.
+  if(t.dataset.profile){state.filter='profile';loadProfile(t.dataset.profile).catch(showError);return;}
+  if(t.id==='bSetHandle'){saveHandle().catch(showError);return;}if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();if(t.dataset.f==='activity')loadActivity().then(render).catch(()=>{});}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index,t.dataset.agent).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('overlay').classList.contains('on'))closeDialog();});
 $('q').addEventListener('input',render);
 document.addEventListener('change',event=>{if(event.target.id==='sortSelect'){state.sort=event.target.value;render();}});

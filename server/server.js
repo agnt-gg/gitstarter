@@ -157,7 +157,11 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 app.get('/api/commissions', (_req, res) => {
-  const rows = db.prepare('SELECT * FROM commissions ORDER BY created_at DESC LIMIT 200').all();
+  // The poster's chosen name travels with the row the board already fetches, so
+  // a list of commissions can say who posted them without a request per row.
+  const rows = db.prepare(`SELECT c.*, h.handle AS creator_handle
+    FROM commissions c LEFT JOIN handles h ON h.wallet = c.creator
+    ORDER BY c.created_at DESC LIMIT 200`).all();
   // One grouped query rather than one per commission: the browser renders the
   // review panel straight from this list, so the evidence has to arrive with it.
   const byCommission = new Map();
@@ -525,6 +529,9 @@ function presentCommission(address, chain, meta, wallet) {
         evidence: deliveries.find(d => d.evidenceHash === s.evidenceHash)?.evidence ?? null,
       };
     }),
+    // Names for every wallet on this commission, so a queue of 44-character
+    // addresses can be read. Always alongside the address, never instead of it.
+    handles: handlesFor([chain.creator, ...submissions.map(s => s.agent)]),
     // The one delivery per milestone that can be acted on right now.
     nextToJudge: chain.milestoneBps.map((_, index) => {
       const front = escrow.frontOfQueue(chain, submissions, index);
@@ -765,6 +772,146 @@ function requireLamports(body, field) {
   return Math.round(Number(lamports));
 }
 
+// ── identity ────────────────────────────────────────────────────────────
+//
+// A wallet is the identity of record and a handle is only ever a label on it.
+// Nothing here is accepted where an address is expected, and every view that
+// shows a handle shows the address with it, so a name can never be the thing
+// somebody pays.
+
+/// Names that would let a stranger borrow authority they do not have.
+const RESERVED_HANDLES = new Set([
+  'gitstarter', 'admin', 'administrator', 'official', 'support', 'help', 'staff',
+  'team', 'moderator', 'mod', 'system', 'root', 'security', 'treasury', 'escrow',
+  'agnt', 'solana', 'api', 'www', 'null', 'undefined', 'anonymous', 'me', 'you',
+]);
+
+function cleanHandle(value) {
+  const handle = cleanText(value, 32);
+  // Deliberately narrow: no spaces, no punctuation, no mixed scripts. A name
+  // that can contain a Cyrillic "a" is a name that can impersonate.
+  if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{1,30}[a-zA-Z0-9])$/.test(handle)) {
+    throw badRequest('A handle is 3 to 32 characters, letters, numbers and hyphens, starting and ending with a letter or number');
+  }
+  const key = handle.toLowerCase();
+  if (RESERVED_HANDLES.has(key)) throw badRequest('That handle is reserved');
+  // A name that looks like an address is a name designed to be mistaken for one.
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,}$/.test(handle)) throw badRequest('A handle may not look like a wallet address');
+  return { handle, key };
+}
+
+/// The wallet behind a handle, or the address itself if that is what was given.
+function resolveIdentity(id) {
+  const row = db.prepare('SELECT wallet FROM handles WHERE handle_key = ?').get(String(id || '').replace(/^@/, '').toLowerCase());
+  if (row) return row.wallet;
+  return cleanWallet(id);
+}
+
+/// Handles for a set of wallets, so a list can show names without N queries.
+function handlesFor(wallets) {
+  const unique = [...new Set(wallets.filter(Boolean))];
+  if (!unique.length) return {};
+  const rows = db.prepare(`SELECT wallet, handle FROM handles WHERE wallet IN (${unique.map(() => '?').join(',')})`).all(...unique);
+  return Object.fromEntries(rows.map(row => [row.wallet, row.handle]));
+}
+
+/// Claim or update the name on the signed-in wallet.
+app.post('/api/v1/handle', requireAuth, (req, res, next) => {
+  try {
+    const { handle, key } = cleanHandle(req.body.handle);
+    const bio = req.body.bio == null ? '' : cleanText(req.body.bio, 280);
+    const link = req.body.link ? cleanHttpUrl(req.body.link) : '';
+
+    // A name is bound to the first wallet that took it, for good. Without this,
+    // an agent could build a record as one name, rename, and leave the name free
+    // for somebody else to inherit the recognition of.
+    const claim = db.prepare('SELECT wallet FROM handle_claims WHERE handle_key = ?').get(key);
+    if (claim && claim.wallet !== req.wallet) {
+      return res.status(409).json({ error: 'That handle belongs to another wallet' });
+    }
+
+    const now = Date.now();
+    db.transaction(() => {
+      db.prepare('INSERT INTO handle_claims(handle_key,wallet,claimed_at) VALUES(?,?,?) ON CONFLICT(handle_key) DO NOTHING')
+        .run(key, req.wallet, now);
+      db.prepare(`INSERT INTO handles(wallet,handle,handle_key,bio,link,created_at,updated_at)
+        VALUES(@wallet,@handle,@key,@bio,@link,@now,@now)
+        ON CONFLICT(wallet) DO UPDATE SET
+          handle=excluded.handle, handle_key=excluded.handle_key,
+          bio=excluded.bio, link=excluded.link, updated_at=excluded.updated_at`)
+        .run({ wallet: req.wallet, handle, key, bio, link, now });
+    })();
+    res.json({ wallet: req.wallet, handle, bio, link });
+  } catch (error) { next(error); }
+});
+
+/// A public profile, by handle or by address.
+///
+/// Everything here is either signed by the wallet itself or derived from chain
+/// state anyone can recompute. There is no self-reported achievement in it,
+/// which is the only reason a stranger should believe any of it.
+app.get('/api/v1/profile/:handleOrWallet', async (req, res, next) => {
+  try {
+    let wallet;
+    try { wallet = resolveIdentity(req.params.handleOrWallet); }
+    catch { return res.status(404).json({ error: 'No such handle or wallet' }); }
+    if (!rateLimit(`profile:${req.ip}`, 60, 60_000)) return res.status(429).json({ error: 'Rate limit exceeded' });
+
+    const chain = await chainCommissions();
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const identity = db.prepare('SELECT * FROM handles WHERE wallet = ?').get(wallet);
+    const meta = new Map(db.prepare('SELECT * FROM commissions').all().map(row => [row.address, row]));
+
+    // Work this wallet delivered, kept after settlement swept the accounts.
+    const delivered = [];
+    for (const row of db.prepare('SELECT * FROM delivery_history WHERE agent = ? ORDER BY submitted_at DESC LIMIT 50').all(wallet)) {
+      const c = chain.get(row.commission);
+      if (!c) continue;
+      const live = submissionsFor(row.commission)
+        .find(s => s.agent === wallet && s.milestoneIndex === row.milestone_index);
+      delivered.push({
+        commission: row.commission,
+        title: meta.get(row.commission)?.title || null,
+        milestoneNumber: row.milestone_index + 1,
+        state: live ? live.state : settledState(c, row.milestone_index, row.sequence, row.last_state),
+        payoutSol: toSol(milestonePayout(c, row.milestone_index)),
+        submittedAt: new Date(row.submitted_at * 1000).toISOString(),
+      });
+    }
+
+    const posted = [...chain.entries()]
+      .filter(([, c]) => c.creator === wallet)
+      .map(([address, c]) => ({
+        commission: address,
+        title: meta.get(address)?.title || null,
+        status: c.status,
+        pledgedSol: toSol(c.pledged),
+        releasedSol: toSol(c.released),
+        deliveries: c.submissions,
+        rejections: c.rejections,
+        openForWork: c.status === 'funded' && !escrow.workClosed(c, nowUnix),
+      }));
+
+    res.json({
+      wallet,
+      handle: identity?.handle || null,
+      bio: identity?.bio || '',
+      link: identity?.link || '',
+      namedSince: identity ? new Date(identity.created_at).toISOString() : null,
+      explorer: explorerUrl(wallet),
+      // Stated plainly so nobody reads a name as an endorsement: it is a label
+      // the wallet set on itself, not something this service verified.
+      handleIsSelfDeclared: true,
+      delivered,
+      posted,
+      firstSeen: [
+        ...delivered.map(d => d.submittedAt),
+        ...posted.map(p => meta.get(p.commission)?.created_at).filter(Boolean).map(ms => new Date(ms).toISOString()),
+      ].sort()[0] || null,
+    });
+  } catch (error) { next(error); }
+});
+
 /// Everything one wallet is involved in, on both sides, past and present.
 ///
 /// The board answers "what work exists". This answers "what am I part of",
@@ -882,6 +1029,7 @@ app.get('/api/v1/activity/:wallet', async (req, res, next) => {
         working: signalled.filter(s => s.outcome === 'working'),
         settled: signalled.filter(s => s.outcome !== 'working'),
       },
+      handles: handlesFor([wallet]),
       totals: {
         postedCount: posted.length,
         postedOpen: posted.length - finishedPosted.length,

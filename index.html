@@ -189,6 +189,26 @@ svg{fill:currentColor;vertical-align:text-bottom;flex:none}
 }
 .unav button:hover{background:var(--neutral-muted)}
 .unav button.on{font-weight:600;border-bottom-color:#fd8c73}
+/* Identity. A handle is always shown WITH the address it labels, never instead
+   of it, so nobody can be paid on the strength of a name. */
+.who{display:inline-flex;align-items:baseline;gap:6px;min-width:0}
+.who .handle{color:var(--accent-fg);font-weight:600;cursor:pointer}
+.who .handle:hover{text-decoration:underline}
+.who .addr{font:400 12px var(--mono);color:var(--fg-muted);cursor:pointer}
+.who .addr:hover{color:var(--accent-fg)}
+.profile-head{padding:20px 16px;border-bottom:1px solid var(--border)}
+.profile-head h1{margin:0 0 4px;font-size:22px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.profile-head .addr{font:400 13px var(--mono);color:var(--fg-muted);word-break:break-all}
+.profile-head .bio{margin:10px 0 0;max-width:70ch;line-height:1.5}
+.profile-caveat{
+  margin:12px 0 0;padding:8px 12px;border-radius:var(--radius);
+  background:var(--neutral-muted);color:var(--fg-muted);font-size:12px;max-width:70ch;
+}
+.handle-form{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.handle-form input{flex:1;min-width:120px}
+.handle-current{margin-top:8px;font-size:13px}
+.handle-current b{color:var(--accent-fg)}
+
 /* The personal view. Grouped by relationship rather than status, so the
    headings carry the meaning and the rows stay quiet. */
 .activity-totals{
@@ -651,6 +671,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
         <div class="account-name"><span class="account-dot"></span><span id="wAlias">—</span></div>
         <span class="account-address" id="wAddress">—</span>
         <div class="account-state" id="wAuth"><span>Wallet connected</span><button class="btn primary" id="bFinishAuth" type="button">Finish sign-in</button></div>
+        <div id="wHandle"></div>
       </div>
       <div class="stat"><b id="wBal">—</b> SOL wallet balance</div>
       <div class="stat"><b id="wProj">—</b> commissions created</div>
@@ -667,7 +688,7 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 <div class="overlay" id="overlay"><div class="dlg" id="dlg"></div></div>
 <div class="toast" id="toast"></div>
 
-<script src="/app.js?v=20260814-my-activity" defer></script>
+<script src="/app.js?v=20260814-profiles" defer></script>
 
 </body>
 </html>

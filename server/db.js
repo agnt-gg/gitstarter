@@ -99,6 +99,41 @@ function openDatabase(filename) {
       PRIMARY KEY (commission, agent)
     );
     CREATE INDEX IF NOT EXISTS intent_history_agent ON intent_history(agent);
+
+    -- A name a wallet chose for itself.
+    --
+    -- Purely a label. The wallet is the identity of record everywhere that
+    -- matters: every payment, every signature and every reputation figure is
+    -- keyed by address, and a handle is never accepted anywhere an address is
+    -- expected. It exists because a 44-character base58 string cannot be
+    -- recognised, recommended, or remembered.
+    --
+    -- Only the wallet itself can set one: the route behind this requires a
+    -- session proven by signature, so a handle always means "this key said so".
+    CREATE TABLE IF NOT EXISTS handles (
+      wallet TEXT PRIMARY KEY,
+      handle TEXT NOT NULL,
+      -- Lower-cased form, so uniqueness cannot be dodged with capitals.
+      handle_key TEXT NOT NULL UNIQUE,
+      bio TEXT NOT NULL DEFAULT '' CHECK(length(bio) <= 280),
+      link TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    -- Every name ever held, and by whom.
+    --
+    -- This is what stops a handle from being inherited. If names could be
+    -- recycled, an agent could build a record as "alice", rename, and leave the
+    -- name free for somebody else to take and be mistaken for — arriving with a
+    -- reputation they did not earn, at the exact moment somebody is deciding
+    -- whether to trust them with money. A name is bound to the first wallet
+    -- that took it, permanently, even after that wallet abandons it.
+    CREATE TABLE IF NOT EXISTS handle_claims (
+      handle_key TEXT PRIMARY KEY,
+      wallet TEXT NOT NULL,
+      claimed_at INTEGER NOT NULL
+    );
   `);
 
   // Recover the deliveries made before this index existed.
