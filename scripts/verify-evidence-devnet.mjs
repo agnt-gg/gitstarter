@@ -86,8 +86,9 @@ await refuses('a milestone index outside the schedule',
 
 // ── the honest path ─────────────────────────────────────────────────────────
 const accepted = await post('/api/deliveries', { commission, milestoneIndex: 0, evidence: EVIDENCE });
-assert.ok(accepted.ok, `the correct evidence was rejected: ${JSON.stringify(await accepted.json())}`);
+// A fetch body can only be consumed once, so read it before asserting on it.
 const record = await accepted.json();
+assert.ok(accepted.ok, `the correct evidence was rejected: ${JSON.stringify(record)}`);
 assert.equal(record.verified, true);
 assert.equal(record.evidenceHash, evidenceHash.toString('hex'));
 assert.equal(record.agent, agent.publicKey.toBase58(), 'the agent is read from chain, not from the request');
@@ -113,12 +114,25 @@ if (listed) {
   pass('the list the browser renders from carries it too');
 }
 
-// Clean up so the test leaves nothing behind.
-await send(escrow.build.cancel(ctx, { signer: agent.publicKey, commission }).instruction, [agent]);
+// Clean up by settling, not by cancelling: a pending delivery deliberately
+// blocks every exit, so trying to cancel around one fails with SubmissionPending
+// — which is the claim protection working, not a teardown problem.
+await send(escrow.build.releaseMilestone(ctx, {
+  creator: payer.publicKey, commission, agent: agent.publicKey, milestoneIndex: 0,
+}).instruction);
 await pause();
-await send(escrow.build.refund(ctx, { backer: payer.publicKey, commission }).instruction);
+await send(escrow.build.releaseMilestone(ctx, {
+  creator: payer.publicKey, commission, agent: agent.publicKey, milestoneIndex: 1,
+}).instruction);
 await pause();
-pass('test commission cancelled and refunded');
+pass('both milestones released, settling the delivery');
+
+// Shipped and empty, so the rent can come home.
+await send(escrow.build.closePledge(ctx, { backer: payer.publicKey, commission }).instruction);
+await pause();
+await send(escrow.build.closeVault(ctx, { signer: payer.publicKey, commission, creator: payer.publicKey }).instruction);
+await pause();
+pass('pledge and vault closed, rent reclaimed');
 
 console.log(`\nALL ${results.length} LIVE EVIDENCE CHECKS PASSED`);
 connection._rpcWebSocket?.close();
