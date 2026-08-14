@@ -129,6 +129,59 @@ function openDatabase(filename) {
     -- reputation they did not earn, at the exact moment somebody is deciding
     -- whether to trust them with money. A name is bound to the first wallet
     -- that took it, permanently, even after that wallet abandons it.
+    -- Something that happened that a specific wallet needs to know about.
+    --
+    -- The review clock runs whether or not anybody has the page open. A creator
+    -- who is handed finished work and never looks pays out automatically when
+    -- the window lapses; an agent whose delivery matured has money sitting there
+    -- unclaimed. Both were discoverable only by opening the right dialog and
+    -- reading it, which is not a mechanism, it is a hope.
+    --
+    -- Written by the same scan that already reads the whole board, so a
+    -- notification is a state TRANSITION that was actually observed on chain,
+    -- never an intention recorded ahead of time.
+    CREATE TABLE IF NOT EXISTS notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wallet TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      commission TEXT NOT NULL,
+      milestone_index INTEGER,
+      body TEXT NOT NULL,
+      -- Identifies the transition, so re-observing the same board state cannot
+      -- tell somebody twice. This is the whole idempotency story.
+      dedupe_key TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL,
+      read_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS notifications_wallet ON notifications(wallet, read_at, id DESC);
+
+    -- An agent's answer to being refused.
+    --
+    -- On chain a rejection is final and one-sided: the creator says no, the
+    -- queue advances, and nothing records that the agent disagreed. Between
+    -- people who know each other that is fine. Between strangers it means a
+    -- creator can take delivery, refuse, and carry no cost for it.
+    --
+    -- This CANNOT move money — the escrow is the program's and stays that way.
+    -- What it does is make a refusal answerable in public: a contested rejection
+    -- appears on the creator's own profile, where the next agent deciding
+    -- whether to spend compute on their bounty will read it.
+    CREATE TABLE IF NOT EXISTS disputes (
+      commission TEXT NOT NULL,
+      milestone_index INTEGER NOT NULL,
+      agent TEXT NOT NULL,
+      creator TEXT NOT NULL,
+      reason TEXT NOT NULL CHECK(length(reason) <= 2000),
+      -- The creator's answer, if they give one. Silence is itself a signal and
+      -- is displayed as such.
+      response TEXT NOT NULL DEFAULT '',
+      responded_at INTEGER,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (commission, milestone_index, agent)
+    );
+    CREATE INDEX IF NOT EXISTS disputes_creator ON disputes(creator);
+    CREATE INDEX IF NOT EXISTS disputes_agent ON disputes(agent);
+
     CREATE TABLE IF NOT EXISTS handle_claims (
       handle_key TEXT PRIMARY KEY,
       wallet TEXT NOT NULL,

@@ -9,7 +9,7 @@ const { PublicKey, Transaction } = web3;
 const escrow = require('../shared/escrow');
 const $ = id => document.getElementById(id);
 const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL;
-const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], activity:null, profile:null, profileId:null, myHandle:null, filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light',
+const state = { config:null, connection:null, wallet:null, walletName:null, provider:null, session:null, sessionWallet:null, authStatus:'disconnected', connecting:false, metadata:[], projects:[], activity:null, profile:null, profileId:null, myHandle:null, inbox:null, agents:null, filter:'all', label:'all', sort:'newest', theme:localStorage.getItem('gitstarter.theme')||'light',
   // Address of the commission whose dialog is open, so a live update can redraw
   // it; the websocket subscription id; and the newest slot we have proof of, so
   // no read can hand back state older than our own confirmed transaction.
@@ -177,6 +177,9 @@ async function authenticate(){
     }
     const signature=bs58Encode(signed.signature||signed);const result=await api('/api/auth/verify',{method:'POST',body:JSON.stringify({wallet,message:challenge.message,signature})});
     state.session=true;state.sessionWallet=wallet;state.authStatus='authenticated';render();
+    // Signing in is the moment somebody has decided to take part. Asking who
+    // they are here, once, is a step in that flow rather than an interruption.
+    offerNameOnce().catch(()=>{});
   }catch(error){state.authStatus='connected';render();throw error;}
 }
 /// Reattaches the live wallet object to an existing session without asking the
@@ -346,7 +349,7 @@ async function refresh(){
   render();
   // Fire and forget: the board must never wait on a personal view, and this
   // re-renders itself when it lands.
-  loadActivity().then(render).catch(()=>{});
+  Promise.all([loadActivity(),loadMyIdentity(),loadInbox()]).then(render).catch(()=>{});
   subscribeToCommissions();
 }
 
@@ -434,7 +437,11 @@ function render(){
   document.documentElement.dataset.theme=state.theme; $('themeLabel').textContent=state.theme==='light'?'Dark':'Light';
   const wallet=currentWallet();$('bWallet').textContent=wallet?`${state.walletName||'Wallet'} · ${wallet.slice(0,4)}…${wallet.slice(-4)}`:'Connect wallet';
   $('accountEmpty').style.display=wallet?'none':'block';$('accountCard').classList.toggle('on',!!wallet);
-  if(wallet){$('wAlias').textContent=walletAlias(wallet);$('wAddress').textContent=wallet;const auth=$('wAuth');if(state.authStatus==='authenticated'){auth.className='account-state signed';auth.innerHTML='<span>✓ Signed in to GitStarter</span>';}else if(state.authStatus==='signing'){auth.className='account-state';auth.innerHTML='<span>Waiting for signature…</span>';}else{auth.className='account-state';auth.innerHTML='<span>Wallet connected</span><button class="btn primary" id="bFinishAuth" type="button">Finish sign-in</button>';}}
+  // The name this wallet actually chose, not an invented one. This used to show
+  // a generated alias like "Amber-Badger-x9k2" that existed only in this
+  // browser: nobody else ever saw it, so it read as an identity while being the
+  // one label on the page that could not be looked up or trusted by anyone.
+  if(wallet){$('wAlias').innerHTML=state.myHandle?`<span class="handle" data-profile="${esc(wallet)}">@${esc(state.myHandle)}</span>`:'<span style="color:var(--fg-muted);font-weight:400">Unnamed wallet</span>';$('wAddress').textContent=wallet;const auth=$('wAuth');if(state.authStatus==='authenticated'){auth.className='account-state signed';auth.innerHTML='<span>✓ Signed in to GitStarter</span>';}else if(state.authStatus==='signing'){auth.className='account-state';auth.innerHTML='<span>Waiting for signature…</span>';}else{auth.className='account-state';auth.innerHTML='<span>Wallet connected</span><button class="btn primary" id="bFinishAuth" type="button">Finish sign-in</button>';}}
   const labels=[...new Set(state.projects.flatMap(p=>Array.isArray(p.meta?.labels)?p.meta.labels:[]))].sort();
   // Anything this wallet is holding up, or being held up by. Computed once and
   // reused by the filter, the counter and the empty state.
@@ -448,6 +455,14 @@ function render(){
     // A personal view, not a filter of the board: it includes work whose
     // on-chain accounts are gone, which no filter over the board could show.
     +(wallet?`<button data-f="activity" class="needs-you ${state.filter==='activity'?'on':''}">My activity${state.activity?.needsYou?.length?` <span class="counter">${state.activity.needsYou.length}</span>`:''}</button>`:'')
+    // Your own profile needs its own way in. It was reachable only by clicking
+    // somebody's name on a row — which works for looking up a stranger and is
+    // useless for the far more common question, "what does my record look like
+    // to the people deciding whether to hire me?"
+    +(wallet?`<button data-f="profile" data-profile="${esc(wallet)}" class="needs-you ${state.filter==='profile'&&state.profileId===wallet?'on':''}">My profile${state.myHandle?` <span class="counter">@${esc(state.myHandle)}</span>`:''}</button>`:'')
+    // A board you can look somebody up on but never find anybody on is a board
+    // where only the already-known get hired.
+    +`<button data-f="agents" class="needs-you ${state.filter==='agents'?'on':''}">Agents</button>`
     // Only shown when there is something to show, so it never becomes furniture
     // the eye learns to skip.
     +(needsYou.length?`<button data-f="needs-you" class="needs-you ${state.filter==='needs-you'?'on':''}${needsAction.length?' urgent':''}">Needs you <span class="counter">${needsYou.length}</span></button>`:'');
@@ -455,6 +470,27 @@ function render(){
   const header=`<div class="Box-header"><div class="list-summary"><span>${statusIcon(STATUS_UI.funding)}<b>${openCount} Open</b></span><span>${statusIcon(STATUS_UI.shipped)}${closedCount} Closed</span></div><div class="list-tools"><label class="hint" for="sortSelect" style="margin:0">Sort</label><select class="tool-select" id="sortSelect"><option value="newest" ${state.sort==='newest'?'selected':''}>Newest</option><option value="funding" ${state.sort==='funding'?'selected':''}>Most funded</option><option value="deadline" ${state.sort==='deadline'?'selected':''}>Deadline</option></select></div></div>`;
   const labelBar=labels.length?`<div class="label-filter"><button class="label-button ${state.label==='all'?'on':''}" data-label="all">All labels</button>${labels.map(label=>`<button class="label-button ${state.label===label?'on':''}" data-label="${esc(label)}">${esc(label)}</button>`).join('')}</div>`:'';
   handleEditor();
+  // The badge is the product here: it is what makes an unattended review window
+  // something you find out about rather than something that happens to you.
+  const bell=$('bInbox'),count=$('inboxCount');
+  if(bell){
+    bell.style.display=state.authStatus==='authenticated'?'':'none';
+    const unread=state.inbox?.unread||0;
+    count.textContent=unread>9?'9+':String(unread);
+    count.classList.toggle('on',unread>0);
+  }
+  if(state.filter==='agents'){
+    $('listBox').innerHTML=`<div class="Box-header"><div class="list-summary"><span><b>Agents</b></span>`
+      +`<input class="search" id="agentQ" type="text" placeholder="Search by name or bio\u2026" style="max-width:220px;border-color:var(--border);color:var(--fg)" value="${esc(state.agentQuery||'')}">`
+      +`</div></div>`+agentsView();
+    // Re-rendering replaced the field the user is typing into, so put them back
+    // where they were rather than dropping the caret on every result.
+    if(state.agentFocus){
+      const input=$('agentQ');
+      if(input){input.focus();input.setSelectionRange(input.value.length,input.value.length);}
+    }
+    return;
+  }
   if(state.filter==='profile'){
     $('listBox').innerHTML=`<div class="Box-header"><div class="list-summary"><span><b>Profile</b></span>`
       +`<button class="btn" data-f="all" type="button">Back to the board</button></div></div>`+profileView();
@@ -478,6 +514,19 @@ async function loadBalance(){try{const lamports=await state.connection.getBalanc
 /// which is the question somebody actually arrives with and which no amount of
 /// filtering the board can produce — because the things you care about include
 /// commissions whose on-chain accounts have already been swept away.
+/// Your own name, fetched on its own.
+///
+/// Deliberately not a side effect of loading the activity view: the account card
+/// and the profile tab both name you, and both are on screen before anything
+/// else is opened. Deriving it from another view's response meant the page
+/// could sit there calling you unnamed while you had a name.
+async function loadMyIdentity(){
+  const wallet=currentWallet();
+  if(!wallet){state.myHandle=null;return;}
+  try{state.myHandle=(await api(`/api/v1/profile/${wallet}`)).handle||null;}
+  catch{/* an unreachable profile must not stop the board rendering */}
+}
+
 async function loadActivity(){
   const wallet=currentWallet();
   if(!wallet){state.activity=null;return;}
@@ -528,7 +577,8 @@ function profileView(){
 
   const head=`<div class="profile-head">`
     +`<h1>${p.handle?`@${esc(p.handle)}`:'Unnamed wallet'}`
-    +(mine?'<span class="lbl gray">you</span>':'')+`</h1>`
+    +(mine?'<span class="lbl gray">this is you</span>':'')
+    +(mine?'<button class="btn" id="bEditProfile" type="button" style="margin-left:auto">Edit profile</button>':'')+`</h1>`
     +`<div class="addr">${esc(p.wallet)}</div>`
     +(p.bio?`<p class="bio">${esc(p.bio)}</p>`:'')
     +(p.link?`<p class="bio"><a href="${esc(safeHttpUrl(p.link)||'#')}" target="_blank" rel="noopener noreferrer nofollow">${esc(p.link)}</a></p>`:'')
@@ -552,7 +602,37 @@ function profileView(){
     +`<div class="row-main"><div class="row-title"><span style="color:var(--fg);font-weight:600">${esc(title||'Untitled bounty')}</span></div>`
     +`<div class="row-meta">${detail}</div></div></div>`;
 
-  return head+stats
+  // On your own profile, the numbers a stranger cannot see: what you have
+  // riding on the board right now. Everything below this line is the same view
+  // everyone else gets, which is the point — you should be able to read your own
+  // record exactly as somebody deciding whether to hire you reads it.
+  const a=state.activity;
+  const yours=mine&&a&&!a.failed?`<div class="activity-totals">`
+    +`<div class="metric"><b>${sol(a.totals.solInEscrow)} SOL</b><span>Escrowed in my bounties</span></div>`
+    +`<div class="metric"><b>${a.deliveries.inPlay.length}</b><span>My deliveries awaiting judgement</span></div>`
+    +`<div class="metric"><b>${a.posted.open.length}</b><span>My bounties still open</span></div>`
+    +`<div class="metric"><b>${a.needsYou.length}</b><span>Waiting on me right now</span></div>`
+    +`</div>`
+    +(a.needsYou.length?`<div class="activity-section"><h3>Waiting on you <span class="counter">${a.needsYou.length}</span></h3>`
+      +a.needsYou.map(item=>activityRow(item,esc(item.attention.detail))).join('')+`</div>`:'')
+    :'';
+
+  const publicNote=mine
+    ? `<div class="activity-section"><h3>How this reads to everyone else</h3>`
+      +`<p class="hint">Everything below is your public record. It is what a creator sees before trusting you with escrow, and what an agent sees before spending compute on your bounty.</p></div>`
+    : '';
+
+  // Refusals this wallet handed out that were contested. On the creator's own
+  // page, because that is where somebody deciding whether to work for them is
+  // actually looking.
+  const against=(p.disputesAgainstThem||[]);
+  const disputes=against.length?`<div class="activity-section">`
+    +`<h3>Contested refusals <span class="counter">${against.length}</span></h3>`
+    +`<p class="hint">Work this wallet took delivery of and refused, where the agent disagreed. ${
+      against.filter(d=>!d.answered).length?'An unanswered objection is shown as unanswered.':''}</p>`
+    +against.map(d=>disputeBlock(d,{canAnswer:mine})).join('')+`</div>`:'';
+
+  return head+stats+yours+publicNote+disputes
     +activitySection('Delivered and paid','',
       delivered.map(d=>line(d.title,`milestone ${d.milestoneNumber} \u00b7 ${sol(d.payoutSol)} SOL \u00b7 ${new Date(d.submittedAt).toLocaleDateString()}`,d.commission)),
       'No completed work yet. That is not a bad signal \u2014 a new wallet has no record, not a poor one.')
@@ -567,7 +647,135 @@ function profileView(){
         `milestone ${d.milestoneNumber} \u00b7 ${d.state==='rejected'?'refused':'somebody delivered first'}`,d.commission)),'');
 }
 
-/// The name editor, on your own account card only.
+// ── the inbox ─────────────────────────────────────────────────────
+//
+// The one part of this that has to be visible without opening anything. A
+// review window counts down whether or not the page is open, and silence pays
+// the agent, so "nobody told me" is a way for a creator to lose money and for an
+// agent to leave money sitting unclaimed.
+
+async function loadInbox(){
+  if(state.authStatus!=='authenticated'){state.inbox=null;return;}
+  try{state.inbox=await api('/api/v1/notifications');}
+  catch{/* an inbox that will not load must not stop the board */}
+}
+
+function openInbox(){
+  const inbox=state.inbox;
+  const rows=(inbox?.notifications||[]).map(n=>`<div class="note ${n.read?'':'unread'} ${n.actionable?'act':''}" data-id="${esc(n.commission)}">`
+    +`<span class="note-dot"></span><div class="note-body">`
+    +`<b>${esc(n.title||'Untitled bounty')}</b>`
+    +`<span>${esc(n.body)} \u00b7 ${new Date(n.createdAt).toLocaleString()}</span>`
+    +`</div></div>`).join('');
+  $('dlg').className='dlg';
+  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy">`
+    +`<h1>What happened</h1><div class="sub">Anything with a clock or money on it is marked in red.</div>`
+    +`</div>${closeIcon()}</div></div>`
+    +(rows||'<div class="blank"><h3>Nothing yet</h3><p>You will be told here when work is delivered to you, when a delivery of yours is judged, and when a review window lapses.</p></div>')
+    +(inbox?.unread?`<div class="action-row" style="padding:12px 16px"><button class="btn" id="bReadAll" type="button">Mark all as read</button></div>`:'');
+  $('overlay').classList.add('on');
+  // Reading them is the act of opening this, so clear the badge immediately
+  // rather than making it another thing to remember to do.
+  if(inbox?.unread)markInboxRead().catch(()=>{});
+}
+
+async function markInboxRead(){
+  await api('/api/v1/notifications/read',{method:'POST',body:JSON.stringify({})});
+  if(state.inbox){state.inbox.unread=0;state.inbox.notifications.forEach(n=>{n.read=true;});}
+  render();
+}
+
+// ── contesting a refusal ────────────────────────────────────────────
+
+function openDispute(commission,milestoneIndex){
+  $('dlg').className='dlg';
+  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy">`
+    +`<h1>Contest this refusal</h1><div class="sub">Milestone ${Number(milestoneIndex)+1}</div>`
+    +`</div>${closeIcon()}</div></div><div class="dlg-content">`
+    // Said before they write it, because an agent who expects this to recover
+    // the money will be angrier at us than at the refusal.
+    +`<p class="profile-caveat">This does not move the escrow and cannot \u2014 money a stranger could freeze by objecting is money no creator would put up. What it does is attach your objection to the creator's public profile, where the next agent deciding whether to work for them will read it.</p>`
+    +`<div class="field"><label for="disputeReason">What do you disagree with?</label>`
+    +`<textarea id="disputeReason" maxlength="2000" placeholder="Point at the acceptance criteria and what you delivered against them."></textarea></div>`
+    +`<div class="action-row"><button class="btn primary" id="doDispute" data-id="${esc(commission)}" data-index="${esc(String(milestoneIndex))}" type="button">Put this on the record</button>`
+    +`<button class="btn" id="bX" type="button">Cancel</button></div></div>`;
+  $('overlay').classList.add('on');
+}
+
+async function submitDispute(commission,milestoneIndex){
+  const reason=($('disputeReason')?.value||'').trim();
+  if(!reason)throw new Error('Say what you disagree with.');
+  await api('/api/v1/disputes',{method:'POST',body:JSON.stringify({commission,milestoneIndex:Number(milestoneIndex),reason})});
+  closeDialog();
+  showToast('Recorded. It now appears on that creator\u2019s public profile.');
+  if(state.filter==='profile')loadProfile(state.profileId).catch(()=>{});
+}
+
+function openDisputeReply(commission,milestoneIndex,agent){
+  $('dlg').className='dlg';
+  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy">`
+    +`<h1>Answer this objection</h1><div class="sub">Milestone ${Number(milestoneIndex)+1}</div>`
+    +`</div>${closeIcon()}</div></div><div class="dlg-content">`
+    +`<p class="profile-caveat">Your answer sits next to their objection on your profile. Saying nothing is also shown, so this is worth answering.</p>`
+    +`<div class="field"><label for="disputeResponse">Your answer</label>`
+    +`<textarea id="disputeResponse" maxlength="2000" placeholder="Why the delivery did not meet the criteria you posted."></textarea></div>`
+    +`<div class="action-row"><button class="btn primary" id="doDisputeReply" data-id="${esc(commission)}" data-index="${esc(String(milestoneIndex))}" data-agent="${esc(agent)}" type="button">Post my answer</button>`
+    +`<button class="btn" id="bX" type="button">Cancel</button></div></div>`;
+  $('overlay').classList.add('on');
+}
+
+async function submitDisputeReply(commission,milestoneIndex,agent){
+  const response=($('disputeResponse')?.value||'').trim();
+  if(!response)throw new Error('Write your answer.');
+  await api('/api/v1/disputes/respond',{method:'POST',body:JSON.stringify({commission,milestoneIndex:Number(milestoneIndex),agent,response})});
+  closeDialog();
+  showToast('Answered.');
+  if(state.filter==='profile')loadProfile(state.profileId).catch(()=>{});
+}
+
+// ── the directory ─────────────────────────────────────────────────
+
+async function loadAgents(query=''){
+  state.agents=null;render();
+  try{state.agents=await api(`/api/v1/agents${query?`?q=${encodeURIComponent(query)}`:''}`);}
+  catch(error){state.agents={failed:true,message:error.message};}
+  render();
+}
+
+function agentsView(){
+  const a=state.agents;
+  if(!a)return '<div class="blank"><h3>Loading\u2026</h3></div>';
+  if(a.failed)return `<div class="blank"><h3>Could not load the directory</h3><p>${esc(a.message||'')}</p></div>`;
+  const pct=v=>v==null?'\u2014':`${Math.round(v*100)}%`;
+  const rows=a.agents.map((agent,index)=>`<div class="agent-row" data-profile="${esc(agent.wallet)}">`
+    +`<span class="agent-rank">${index+1}</span>`
+    +`<div class="agent-main">${who(agent.wallet,agent.handle?{[agent.wallet]:agent.handle}:{})}`
+    +(agent.bio?`<div class="bio">${esc(agent.bio)}</div>`:'')
+    +`<div class="bio">${agent.won} won \u00b7 ${agent.delivered} delivered \u00b7 ${pct(agent.winRate)} win rate \u00b7 ${agent.distinctCreators} distinct creator${agent.distinctCreators===1?'':'s'}</div></div>`
+    +`<div class="agent-num"><b>${fmtBase(Math.round(agent.solEarned*LAMPORTS_PER_SOL))} SOL</b>earned</div></div>`).join('');
+  return `<div class="activity-section"><h3>Agents who have delivered <span class="counter">${a.agents.length}</span></h3>`
+    +`<p class="hint">Ranked by SOL earned, which is the one figure neither side can inflate alone: it took a creator\u2019s escrow and a creator\u2019s release. ${esc(a.caveats?.[1]||'')}</p></div>`
+    +(rows||'<div class="blank"><h3>Nobody yet</h3><p>Anyone who delivers on a bounty appears here.</p></div>');
+}
+
+/// A dispute, as both sides of it.
+function disputeBlock(d,{canAnswer=false}={}){
+  return `<div class="dispute">`
+    +`<div class="who-said">${esc(d.title||'Untitled bounty')} \u00b7 milestone ${d.milestoneNumber} \u00b7 ${new Date(d.createdAt).toLocaleDateString()}</div>`
+    +`<p>${esc(d.reason)}</p>`
+    +(d.answered
+      ? `<div class="answer"><div class="who-said">The creator answered</div><p>${esc(d.response)}</p></div>`
+      : `<div class="answer"><div class="who-said">No answer given.</div>`
+        +(canAnswer?`<button class="btn" data-reply="${esc(d.commission)}" data-index="${esc(String(d.milestoneNumber-1))}" data-agent="${esc(d.agent||'')}" type="button" style="margin-top:6px">Answer this</button>`:'')
+        +`</div>`)
+    +`</div>`;
+}
+
+/// The account card's identity line.
+///
+/// One line, not a form. Choosing a name is a thing you do once when you sign
+/// in; leaving a permanent text box in the sidebar made an occasional decision
+/// look like a setting that needed attention on every visit.
 function handleEditor(){
   const box=$('wHandle');
   if(!box)return;
@@ -575,22 +783,72 @@ function handleEditor(){
     box.innerHTML='<p class="hint">Sign in to choose a public name.</p>';
     return;
   }
+  box.innerHTML=state.myHandle
+    ? `<div class="handle-current"><span class="handle" data-profile="${esc(currentWallet())}">View my profile</span> \u00b7 <button class="linkish" id="bEditProfile" type="button">Edit</button></div>`
+    : `<div class="handle-current"><button class="btn" id="bEditProfile" type="button">Choose your name</button></div>`;
+}
+
+/// Choosing, or changing, how you appear to everyone else.
+///
+/// Opened once automatically after a first sign-in, and from your own profile
+/// afterwards. It asks for everything at once because these three fields are one
+/// decision — "who am I on this board" — rather than three settings.
+function openNameDialog({firstTime=false}={}){
   const current=state.myHandle;
-  box.innerHTML=(current?`<div class="handle-current">You are <b>@${esc(current)}</b> \u00b7 <span class="handle" data-profile="${esc(currentWallet())}" style="cursor:pointer;color:var(--accent-fg)">view profile</span></div>`:'')
-    +`<div class="handle-form">`
-    +`<input id="handleInput" type="text" maxlength="32" placeholder="${current?'change your name':'choose a name'}" value="">`
-    +`<button class="btn" id="bSetHandle" type="button">${current?'Rename':'Claim'}</button></div>`
-    +`<p class="hint">Letters, numbers and hyphens. A name is a label on your address, never a substitute for it \u2014 and once claimed it can never be transferred to another wallet, so nobody can inherit the reputation you build under it.</p>`;
+  const p=state.profile&&state.profile.wallet===currentWallet()?state.profile:{};
+  $('dlg').className='dlg';
+  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy">`
+    +`<h1>${firstTime?'Choose your name':'Edit your profile'}</h1>`
+    +`<div class="sub">${firstTime
+      ? 'This is how creators and agents will see you on the board. You can skip it and stay an address.'
+      : 'How you appear to everyone else.'}</div>`
+    +`</div>${closeIcon()}</div></div>`
+    +`<div class="dlg-content">`
+    +`<div class="field"><label for="handleInput">Name</label>`
+    +`<input id="handleInput" type="text" maxlength="32" placeholder="e.g. rust-agent" value="${esc(current||'')}">`
+    +`<div class="hint">Letters, numbers and hyphens. A name labels your address, it never replaces it \u2014 both are always shown together, and nothing is ever paid to a name.</div></div>`
+    +`<div class="field"><label for="bioInput">About you</label>`
+    +`<textarea id="bioInput" maxlength="280" placeholder="What you build, or what you are looking for.">${esc(p.bio||'')}</textarea></div>`
+    +`<div class="field"><label for="linkInput">Link</label>`
+    +`<input id="linkInput" type="text" maxlength="200" placeholder="https://github.com/you" value="${esc(p.link||'')}"></div>`
+    // Said before they commit, not after. This is the one irreversible thing on
+    // the page, and it is irreversible for their benefit rather than ours.
+    +`<p class="profile-caveat">A name is bound to this wallet permanently. Renaming later frees nothing, so nobody can ever pick up a name you built a reputation under and be mistaken for you.</p>`
+    +`<div class="action-row" style="margin-top:16px">`
+    +`<button class="btn primary" id="doSetHandle" type="button">${current?'Save':'Claim this name'}</button>`
+    +`<button class="btn" id="bX" type="button">${firstTime?'Skip for now':'Cancel'}</button></div>`
+    +`</div>`;
+  $('overlay').classList.add('on');
 }
 
 async function saveHandle(){
   const handle=($('handleInput')?.value||'').trim();
   if(!handle)throw new Error('Enter a name first.');
-  const saved=await api('/api/v1/handle',{method:'POST',body:JSON.stringify({handle})});
+  const saved=await api('/api/v1/handle',{method:'POST',body:JSON.stringify({
+    handle,bio:($('bioInput')?.value||'').trim(),link:($('linkInput')?.value||'').trim(),
+  })});
   state.myHandle=saved.handle;
+  closeDialog();
   showToast(`You are now @${saved.handle}. This name is yours permanently.`);
-  render();
+  // Both the board and your own profile now say something different about you.
+  if(state.filter==='profile')loadProfile(currentWallet()).catch(()=>{});
+  else render();
   refresh().catch(()=>{});
+}
+
+/// Offers the name dialog once, the first time a wallet signs in without one.
+///
+/// Remembered per wallet so declining is respected: being asked the same
+/// question on every visit is how a prompt becomes something people learn to
+/// dismiss without reading.
+async function offerNameOnce(){
+  const wallet=currentWallet();
+  if(!wallet||state.authStatus!=='authenticated')return;
+  await loadMyIdentity();
+  const key=`gitstarter.named.${wallet}`;
+  if(state.myHandle||localStorage.getItem(key))return render();
+  localStorage.setItem(key,'asked');
+  openNameDialog({firstTime:true});
 }
 
 /// One line in the activity view. Clicking it opens the same dialog the board
@@ -665,7 +923,11 @@ function activityView(){
     +activitySection('Delivered but not paid',
       'Refused, or beaten to it by somebody who delivered earlier. Being beaten is the ordinary cost of an open board, not a mark against you.',
       a.deliveries.lost.map(item=>activityRow(item,
-        `milestone ${item.milestoneNumber} \u00b7 ${item.state==='rejected'?'the creator refused this':'somebody ahead of me won it'}`)),'')
+        `milestone ${item.milestoneNumber} \u00b7 ${item.state==='rejected'
+          // Only a refusal can be contested. Being beaten to a milestone is
+          // nobody's fault and there is nothing to answer for.
+          ? `the creator refused this \u00b7 <button class="linkish" data-dispute="${esc(item.address)}" data-index="${esc(String(item.milestoneIndex))}" type="button">contest it</button>`
+          : 'somebody ahead of me won it'}`)),'')
 
     +activitySection('Said I would work on it',
       'Signalling reserves nothing. It only means something because not following through is visible.',
@@ -1044,9 +1306,29 @@ document.addEventListener('click',e=>{const t=e.target.closest('button,[data-pro
   // Checked before the row, so clicking somebody's name opens who they are
   // rather than the commission the name happens to be sitting inside.
   if(t.dataset.profile){state.filter='profile';loadProfile(t.dataset.profile).catch(showError);return;}
-  if(t.id==='bSetHandle'){saveHandle().catch(showError);return;}if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();if(t.dataset.f==='activity')loadActivity().then(render).catch(()=>{});}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index,t.dataset.agent).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
+  if(t.id==='bMyProfile'){state.filter='profile';loadProfile(currentWallet()).catch(showError);return;}
+  if(t.id==='doSetHandle'){saveHandle().catch(showError);return;}
+  if(t.id==='bEditProfile'){openNameDialog();return;}
+  if(t.id==='bInbox'){openInbox();return;}
+  if(t.id==='bReadAll'){markInboxRead().catch(showError);return;}
+  if(t.dataset.dispute){openDispute(t.dataset.dispute,t.dataset.index);return;}
+  if(t.id==='doDispute'){submitDispute(t.dataset.id,t.dataset.index).catch(showError);return;}
+  if(t.dataset.reply){openDisputeReply(t.dataset.reply,t.dataset.index,t.dataset.agent);return;}
+  if(t.id==='doDisputeReply'){submitDisputeReply(t.dataset.id,t.dataset.index,t.dataset.agent).catch(showError);return;}if(t.id==='bWallet')openWalletModal();else if(t.dataset.wallet)connectWallet(t.dataset.wallet).catch(showError);else if(t.id==='bTheme'){state.theme=state.theme==='light'?'dark':'light';localStorage.setItem('gitstarter.theme',state.theme);render();}else if(t.id==='bNew')openCreate().catch(showError);else if(t.id==='bFinishAuth')authenticate().catch(showError);else if(t.id==='bX'||t.id==='overlay')closeDialog();else if(t.id==='doCreate')createCommission().catch(showError);else if(t.dataset.f){state.filter=t.dataset.f;render();if(t.dataset.f==='activity')loadActivity().then(render).catch(()=>{});else if(t.dataset.f==='agents')loadAgents(state.agentQuery||'').catch(()=>{});}else if(t.dataset.label){state.label=t.dataset.label;render();}else if(t.dataset.action==='pledge')pledge(t.dataset.id).catch(showError);else if(t.dataset.action)simpleAction(t.dataset.action,t.dataset.id,t.dataset.index,t.dataset.agent).catch(showError);else if(t.dataset.id)openProject(t.dataset.id);});
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('overlay').classList.contains('on'))closeDialog();});
 $('q').addEventListener('input',render);
+// Delegated, because this input is created and destroyed by every render — a
+// listener bound to the element itself would survive exactly one keystroke.
+let agentSearchTimer=null;
+document.addEventListener('input',event=>{
+  if(event.target.id!=='agentQ')return;
+  state.agentQuery=event.target.value;
+  state.agentFocus=true;
+  clearTimeout(agentSearchTimer);
+  // Debounced: a request per keystroke would rate-limit the searcher out of
+  // their own search.
+  agentSearchTimer=setTimeout(()=>loadAgents(state.agentQuery).catch(()=>{}),250);
+});
 document.addEventListener('change',event=>{if(event.target.id==='sortSelect'){state.sort=event.target.value;render();}});
 (async()=>{try{
   state.config=verifyConfig(await api('/api/config'));

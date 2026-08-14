@@ -3,6 +3,27 @@
 Devnet money is free, so devnet mistakes are free. Everything below exists
 because a mistake here is not.
 
+## Preflight
+
+Everything the service needs to point at mainnet is already an environment
+variable, so switching clusters is a config change that takes about a minute.
+That is exactly why this runbook exists: the work is not the switch, it is being
+able to say honestly that the switch should be thrown.
+
+```sh
+node scripts/mainnet-preflight.mjs --cluster mainnet-beta
+```
+
+It checks the live chain and exits non-zero while any blocker stands — the
+upgrade authority, whether that authority is also the treasury, whether every
+setting is explicit rather than falling back to a devnet default, whether an
+independent review exists, and whether the database is backed up.
+
+Run against the current devnet deployment it reports **eight blockers**, the
+largest being that the upgrade authority is a single hot key which is also the
+treasury. That is the honest state of things, and the sections below are how it
+gets fixed.
+
 ## Keys
 
 Two keypairs were generated for production and have never been used on any
@@ -143,7 +164,9 @@ solana-verify verify-from-repo -u mainnet-beta \
 - **Cap early commissions.** Nothing in the program limits size. Keep the first
   ones small enough that a total loss is survivable.
 - **Fund the first bounty yourself** and complete a full cycle — create, pledge,
-  nominate, accept, release, verify payout — before inviting strangers.
+  deliver from a second wallet, judge, release, verify payout — before inviting
+  strangers. There is no nomination step: the board is open, and anyone may
+  deliver against a funded commission without being selected first.
 - **Watch the treasury.** Fee arrivals are the cheapest live signal that
   releases are working.
 - The pause switch is the only emergency lever, and it only stops *new*
@@ -155,9 +178,17 @@ solana-verify verify-from-repo -u mainnet-beta \
 These are documented in `MECHANICS.md` and are deliberate for a first release,
 not oversights:
 
-- No on-chain arbitration. The deadline is the dispute mechanism.
-- Account rent (~0.0035 SOL per commission, ~0.0014 per backer) is not
-  reclaimable in this version.
+- No on-chain arbitration. The deadline is still the mechanism that decides
+  money, and it should be: escrow a stranger could freeze by objecting is escrow
+  no creator would fund. A refusal can now be **contested off chain**, which
+  attaches the agent's objection — and the creator's answer or silence — to the
+  creator's public profile. That makes refusing answerable without making it
+  blockable.
+- Account rent is returned automatically. Settling a commission sweeps the
+  vault, every pledge and every submission and intent record in the same
+  transaction, and `scripts/sweep-deposits.mjs` returns anything a settlement
+  missed. Only the commission account's own ~0.0028 SOL stays, deliberately: it
+  is the permanent public record reputation is computed from.
 - One deadline covers both funding and delivery, so a late-funded commission
   gives its agent less time.
 - No independent professional audit. The program has been adversarially reviewed

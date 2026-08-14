@@ -339,6 +339,71 @@ const rememberChainState = db.transaction((submissionsByCommission, intents) => 
   for (const i of intents) rememberIntent.run({ ...i, withdrawn: i.withdrawn ? 1 : 0, now });
 });
 
+const rememberNotification = db.prepare(`
+  INSERT INTO notifications (wallet, kind, commission, milestone_index, body, dedupe_key, created_at)
+  VALUES (@wallet, @kind, @commission, @milestoneIndex, @body, @dedupeKey, @now)
+  ON CONFLICT(dedupe_key) DO NOTHING`);
+
+/// Turns the board, as it is right now, into things specific wallets need told.
+///
+/// Derived from current state rather than from a diff against the last scan,
+/// and every event carries a key that encodes the exact transition it describes.
+/// So observing the same board a thousand times produces the same keys and the
+/// unique index drops all but the first — which means this is correct across a
+/// restart, a crash mid-scan, or two servers scanning at once, none of which a
+/// remembered-previous-state diff would survive.
+function detectEvents(commissions, submissionsByCommission, nowUnix) {
+  const events = [];
+  const say = (wallet, kind, commission, milestoneIndex, body, dedupeKey) =>
+    events.push({ wallet, kind, commission, milestoneIndex, body, dedupeKey });
+
+  for (const [address, c] of commissions) {
+    const queue = submissionsByCommission.get(address) || [];
+    for (const s of queue) {
+      const paid = (c.milestonesDone & (1 << s.milestoneIndex)) !== 0;
+      const front = s.sequence === (c.milestoneRejected[s.milestoneIndex] ?? 0);
+      const m = s.milestoneIndex + 1;
+
+      if (s.state === 'rejected') {
+        say(s.agent, 'delivery-rejected', address, s.milestoneIndex,
+          `Your delivery for milestone ${m} was refused. You can contest it, which puts your objection on the creator's public record.`,
+          `rejected:${address}:${s.milestoneIndex}:${s.agent}`);
+        continue;
+      }
+      if (s.state === 'released') {
+        say(s.agent, 'delivery-paid', address, s.milestoneIndex,
+          `You were paid for milestone ${m}.`,
+          `paid:${address}:${s.milestoneIndex}:${s.agent}`);
+        continue;
+      }
+      if (s.state !== 'pending' || paid || !front) continue;
+
+      // The case that actually costs money if nobody is looking: work has been
+      // delivered, the review window is counting down, and staying silent pays
+      // it out automatically.
+      const expired = escrow.reviewExpired(s, c.reviewWindow, nowUnix);
+      if (expired) {
+        say(c.creator, 'review-lapsed', address, s.milestoneIndex,
+          `Milestone ${m} was delivered and your review window has passed. That delivery can now be released by anyone, including the agent.`,
+          `lapsed:${address}:${s.milestoneIndex}:${s.sequence}`);
+        say(s.agent, 'claimable', address, s.milestoneIndex,
+          `Milestone ${m} is yours to claim — the review window passed without an answer.`,
+          `claimable:${address}:${s.milestoneIndex}:${s.agent}`);
+      } else {
+        say(c.creator, 'delivery-waiting', address, s.milestoneIndex,
+          `Milestone ${m} was delivered and is waiting on you. Release it, refuse it, or it pays out when the window closes.`,
+          `waiting:${address}:${s.milestoneIndex}:${s.sequence}`);
+      }
+    }
+  }
+  return events;
+}
+
+const recordEvents = db.transaction(events => {
+  const now = Date.now();
+  for (const event of events) rememberNotification.run({ ...event, now });
+});
+
 /// Deliveries competing for a commission, oldest first. Populated by the same
 /// scan that loads the commissions themselves.
 function submissionsFor(address) {
@@ -431,6 +496,10 @@ async function chainCommissions() {
       // settling sweep closes these accounts. Nothing is invented here: every
       // row is a verbatim observation of an account that existed at this moment.
       try { rememberChainState(submissions, intents); } catch { /* an index that fails must never fail a read */ }
+      // Same rule: telling somebody what happened must never be the reason they
+      // cannot read the board.
+      try { recordEvents(detectEvents(value, submissions, Math.floor(Date.now() / 1000))); }
+      catch (error) { console.error('notification scan failed', error); }
       chainCache = { at: Date.now(), value, submissions, intents, inflight: null };
       return value;
     } catch (error) {
@@ -845,6 +914,192 @@ app.post('/api/v1/handle', requireAuth, (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// ── what happened while you were away ─────────────────────────────────
+
+/// Everything this wallet has been told, newest first.
+app.get('/api/v1/notifications', requireAuth, (req, res, next) => {
+  try {
+    const rows = db.prepare('SELECT * FROM notifications WHERE wallet = ? ORDER BY id DESC LIMIT 100').all(req.wallet);
+    const titles = db.prepare('SELECT address, title FROM commissions').all();
+    const byAddress = new Map(titles.map(row => [row.address, row.title]));
+    res.json({
+      unread: rows.filter(row => !row.read_at).length,
+      notifications: rows.map(row => ({
+        id: row.id,
+        kind: row.kind,
+        commission: row.commission,
+        title: byAddress.get(row.commission) || null,
+        milestoneIndex: row.milestone_index,
+        body: row.body,
+        read: !!row.read_at,
+        // Whether this one costs money if ignored. The point of an inbox is to
+        // separate those from the rest, not to list everything equally.
+        actionable: ['delivery-waiting', 'review-lapsed', 'claimable', 'dispute-opened'].includes(row.kind),
+        createdAt: new Date(row.created_at).toISOString(),
+      })),
+    });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/v1/notifications/read', requireAuth, (req, res, next) => {
+  try {
+    db.prepare('UPDATE notifications SET read_at = ? WHERE wallet = ? AND read_at IS NULL')
+      .run(Date.now(), req.wallet);
+    res.json({ ok: true });
+  } catch (error) { next(error); }
+});
+
+// ── contesting a refusal ──────────────────────────────────────────────
+//
+// A rejection on chain is final and one-sided, and it should be: escrow that a
+// stranger can freeze by objecting is escrow no creator would ever fund.
+//
+// So this does not touch the money. It makes the refusal ANSWERABLE. The
+// agent's objection is attached to the creator's public record, where the next
+// agent deciding whether to spend compute on their bounty will read it, and the
+// creator's reply — or their silence — sits next to it.
+
+/// Contest a rejection. Only the agent who was refused, and only if they were.
+app.post('/api/v1/disputes', requireAuth, async (req, res, next) => {
+  try {
+    const commission = cleanWallet(req.body.commission);
+    const milestoneIndex = Number(req.body.milestoneIndex);
+    const reason = cleanText(req.body.reason, 2000);
+    if (!reason) return res.status(400).json({ error: 'Say what you disagree with' });
+    if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0 || milestoneIndex >= escrow.MAX_MILESTONES) {
+      return res.status(400).json({ error: 'milestoneIndex out of range' });
+    }
+
+    const chain = await chainCommissions();
+    const c = chain.get(commission);
+    if (!c) return res.status(404).json({ error: 'Unknown commission' });
+
+    // The claim has to be true. A dispute is only meaningful because it can only
+    // be filed by somebody the chain agrees was actually refused.
+    const row = db.prepare('SELECT * FROM delivery_history WHERE commission = ? AND milestone_index = ? AND agent = ?')
+      .get(commission, milestoneIndex, req.wallet);
+    if (!row) return res.status(404).json({ error: 'No delivery of yours on that milestone' });
+    const live = submissionsFor(commission).find(s => s.agent === req.wallet && s.milestoneIndex === milestoneIndex);
+    const state = live ? live.state : settledState(c, milestoneIndex, row.sequence, row.last_state);
+    if (state !== 'rejected') {
+      return res.status(409).json({ error: 'That delivery was not refused, so there is nothing to contest' });
+    }
+
+    const now = Date.now();
+    db.prepare(`INSERT INTO disputes (commission, milestone_index, agent, creator, reason, created_at)
+      VALUES (@commission, @milestoneIndex, @agent, @creator, @reason, @now)
+      ON CONFLICT(commission, milestone_index, agent) DO UPDATE SET reason = excluded.reason`)
+      .run({ commission, milestoneIndex, agent: req.wallet, creator: c.creator, reason, now });
+
+    rememberNotification.run({
+      wallet: c.creator, kind: 'dispute-opened', commission, milestoneIndex,
+      body: `Your refusal on milestone ${milestoneIndex + 1} was contested. Your answer, or your silence, is shown on your profile.`,
+      dedupeKey: `dispute:${commission}:${milestoneIndex}:${req.wallet}`, now,
+    });
+    res.status(201).json({ ok: true });
+  } catch (error) { next(error); }
+});
+
+/// The creator's answer. Only the creator, and only once there is a dispute.
+app.post('/api/v1/disputes/respond', requireAuth, (req, res, next) => {
+  try {
+    const commission = cleanWallet(req.body.commission);
+    const milestoneIndex = Number(req.body.milestoneIndex);
+    const agent = cleanWallet(req.body.agent);
+    const response = cleanText(req.body.response, 2000);
+    if (!response) return res.status(400).json({ error: 'Write your answer' });
+
+    const dispute = db.prepare('SELECT * FROM disputes WHERE commission = ? AND milestone_index = ? AND agent = ?')
+      .get(commission, milestoneIndex, agent);
+    if (!dispute) return res.status(404).json({ error: 'No such dispute' });
+    if (dispute.creator !== req.wallet) return res.status(403).json({ error: 'Only the creator can answer this' });
+
+    const now = Date.now();
+    db.prepare('UPDATE disputes SET response = ?, responded_at = ? WHERE commission = ? AND milestone_index = ? AND agent = ?')
+      .run(response, now, commission, milestoneIndex, agent);
+    rememberNotification.run({
+      wallet: agent, kind: 'dispute-answered', commission, milestoneIndex,
+      body: `The creator answered your objection on milestone ${milestoneIndex + 1}.`,
+      dedupeKey: `disputed-answer:${commission}:${milestoneIndex}:${agent}:${now}`, now,
+    });
+    res.json({ ok: true });
+  } catch (error) { next(error); }
+});
+
+// ── finding somebody ─────────────────────────────────────────────────
+
+/// Everyone who has ever delivered, with the record they built doing it.
+///
+/// A board with no directory is a board where you can look somebody up but
+/// never find them, so the only agents who get work are the ones who happened to
+/// be seen. Ranked by what they earned, because that is the number neither side
+/// can inflate on their own: it took a creator's escrow and a creator's release.
+app.get('/api/v1/agents', async (req, res, next) => {
+  try {
+    if (!rateLimit(`agents:${req.ip}`, 60, 60_000)) return res.status(429).json({ error: 'Rate limit exceeded' });
+    const chain = await chainCommissions();
+    const search = String(req.query.q || '').trim().toLowerCase().slice(0, 32);
+
+    const byAgent = new Map();
+    for (const row of db.prepare('SELECT * FROM delivery_history').all()) {
+      const c = chain.get(row.commission);
+      if (!c) continue;
+      const live = submissionsFor(row.commission)
+        .find(s => s.agent === row.agent && s.milestoneIndex === row.milestone_index);
+      const state = live ? live.state : settledState(c, row.milestone_index, row.sequence, row.last_state);
+      if (!byAgent.has(row.agent)) {
+        byAgent.set(row.agent, {
+          wallet: row.agent, delivered: 0, won: 0, rejected: 0, pending: 0,
+          solEarned: 0, creators: new Set(), lastSeen: 0,
+        });
+      }
+      const agent = byAgent.get(row.agent);
+      agent.delivered++;
+      agent.creators.add(c.creator);
+      agent.lastSeen = Math.max(agent.lastSeen, row.submitted_at);
+      if (state === 'released') { agent.won++; agent.solEarned += toSol(milestonePayout(c, row.milestone_index)); }
+      else if (state === 'rejected') agent.rejected++;
+      else if (state === 'pending') agent.pending++;
+    }
+
+    const handles = handlesFor([...byAgent.keys()]);
+    const bios = new Map(db.prepare('SELECT wallet, bio FROM handles').all().map(row => [row.wallet, row.bio]));
+    let agents = [...byAgent.values()].map(agent => ({
+      wallet: agent.wallet,
+      handle: handles[agent.wallet] || null,
+      bio: bios.get(agent.wallet) || '',
+      delivered: agent.delivered,
+      won: agent.won,
+      rejected: agent.rejected,
+      pending: agent.pending,
+      distinctCreators: agent.creators.size,
+      solEarned: Number(agent.solEarned.toFixed(9)),
+      // Judged work only, so an agent is not marked down for having submitted
+      // something nobody has looked at yet.
+      winRate: (agent.won + agent.rejected) ? agent.won / (agent.won + agent.rejected) : null,
+      lastDeliveredAt: new Date(agent.lastSeen * 1000).toISOString(),
+    }));
+
+    if (search) {
+      agents = agents.filter(agent =>
+        (agent.handle || '').toLowerCase().includes(search)
+        || agent.wallet.toLowerCase().startsWith(search)
+        || agent.bio.toLowerCase().includes(search));
+    }
+    agents.sort((a, b) => b.solEarned - a.solEarned || b.won - a.won);
+
+    res.json({
+      agents: agents.slice(0, 100),
+      // Stated so a thin directory is not mistaken for a thorough one.
+      caveats: [
+        'Ranked by SOL earned, which requires a creator to have escrowed and released it.',
+        'A wallet with few distinct counterparties can manufacture its own record cheaply. Check distinctCreators.',
+        'Absent history is not a negative signal. A new address has no record, not a bad one.',
+      ],
+    });
+  } catch (error) { next(error); }
+});
+
 /// A public profile, by handle or by address.
 ///
 /// Everything here is either signed by the wallet itself or derived from chain
@@ -904,6 +1159,30 @@ app.get('/api/v1/profile/:handleOrWallet', async (req, res, next) => {
       handleIsSelfDeclared: true,
       delivered,
       posted,
+      // Refusals this wallet handed out that the agent disagreed with, and
+      // whether they answered. On a board between strangers, a creator who
+      // takes delivery and refuses should carry that where it is read.
+      disputesAgainstThem: db.prepare('SELECT * FROM disputes WHERE creator = ? ORDER BY created_at DESC LIMIT 20')
+        .all(wallet).map(row => ({
+          commission: row.commission,
+          title: meta.get(row.commission)?.title || null,
+          milestoneNumber: row.milestone_index + 1,
+          agent: row.agent,
+          reason: row.reason,
+          response: row.response || null,
+          answered: !!row.responded_at,
+          createdAt: new Date(row.created_at).toISOString(),
+        })),
+      disputesTheyRaised: db.prepare('SELECT * FROM disputes WHERE agent = ? ORDER BY created_at DESC LIMIT 20')
+        .all(wallet).map(row => ({
+          commission: row.commission,
+          title: meta.get(row.commission)?.title || null,
+          milestoneNumber: row.milestone_index + 1,
+          reason: row.reason,
+          response: row.response || null,
+          answered: !!row.responded_at,
+          createdAt: new Date(row.created_at).toISOString(),
+        })),
       firstSeen: [
         ...delivered.map(d => d.submittedAt),
         ...posted.map(p => meta.get(p.commission)?.created_at).filter(Boolean).map(ms => new Date(ms).toISOString()),
