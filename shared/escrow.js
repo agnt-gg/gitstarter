@@ -83,14 +83,34 @@ const STATUS = ['funding', 'funded', 'building', 'shipped', 'refunded'];
 
 /// EscrowError discriminants, so a rejected transaction can be explained rather
 /// than surfaced as "custom program error: 0x18".
+/// EscrowError discriminants, transcribed from program/src/lib.rs.
+///
+/// `impl From<EscrowError> for ProgramError` is `Custom(e as u32)` — no offset —
+/// so these numbers are exactly the enum's. This map was previously partial and
+/// had code 1 labelled `AlreadyInitialized` when 1 is `NotInitialized`, which
+/// meant a real failure could be reported to a user as the wrong cause. A test
+/// now parses the Rust enum and asserts this table matches it entry for entry.
 const ERRORS = {
-  1: 'AlreadyInitialized',
+  0: 'AlreadyInitialized',
+  1: 'NotInitialized',
   2: 'Unauthorized',
+  3: 'BadPda',
+  4: 'BadOwner',
+  5: 'BadMint',
+  6: 'BadTokenProgram',
   7: 'BadStatus',
+  8: 'MathOverflow',
+  9: 'GoalNotMet',
+  10: 'GoalAlreadyMet',
   11: 'MilestoneAlreadyReleased',
+  12: 'BadMilestones',
   13: 'NothingToRefund',
   14: 'DeadlineNotPassed',
   15: 'Paused',
+  16: 'AmountZero',
+  17: 'AgentAlreadySet',
+  18: 'AgentNotSet',
+  19: 'BadAccountTag',
   20: 'InsufficientVault',
   21: 'BadTreasury',
   22: 'DeadlineInPast',
@@ -119,6 +139,14 @@ const ERROR_HELP = {
   DeadlineTooFar: `A funding deadline cannot exceed ${MAX_FUNDING_DURATION_SECONDS / 86_400} days.`,
   GoalTooSmall: `The goal must be at least ${BPS_DENOMINATOR} lamports.`,
   NoPendingAgent: 'There is no unaccepted nomination to withdraw.',
+  BadMilestones: `Use 1 to ${MAX_MILESTONES} milestones, and make them sum to exactly 100%.`,
+  GoalNotMet: 'This commission has not reached its funding goal yet.',
+  GoalAlreadyMet: 'This commission is already fully funded.',
+  AmountZero: 'Enter an amount greater than zero.',
+  AgentAlreadySet: 'This commission already has an agent.',
+  AgentNotSet: 'This commission does not have an agent yet.',
+  InsufficientVault: 'The escrow does not hold enough to cover that.',
+  MathOverflow: 'That value is out of range.',
   NoSubmission: 'There is no delivery awaiting review on this commission.',
   ReviewWindowOpen: 'The review window has not finished, so only the creator can act yet.',
   BadWindow: 'Delivery and review windows must be between one hour and their maximums.',

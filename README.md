@@ -492,13 +492,26 @@ Returned as `custom program error: 0x<hex>`.
 
 | Dec | Name | Meaning |
 |---|---|---|
-| 1 | AlreadyInitialized | That account already exists |
+| 0 | AlreadyInitialized | That account already exists |
+| 1 | NotInitialized | That account has not been created yet |
 | 2 | Unauthorized | Wrong wallet for this action |
+| 3 | BadPda | An account address did not derive as expected |
+| 4 | BadOwner | An account is owned by the wrong program |
+| 5 | BadMint | Unused; retained for layout compatibility |
+| 6 | BadTokenProgram | Unused; retained for layout compatibility |
 | 7 | BadStatus | Wrong lifecycle state |
+| 8 | MathOverflow | A value went out of range |
+| 9 | GoalNotMet | The funding goal has not been reached |
+| 10 | GoalAlreadyMet | The commission is already fully funded |
 | 11 | MilestoneAlreadyReleased | Already paid |
+| 12 | BadMilestones | Milestones must be 1 to 8 slices summing to 10000 bps |
 | 13 | NothingToRefund | Pledge already settled |
 | 14 | DeadlineNotPassed | The relevant clock has not run out yet |
 | 15 | Paused | New commissions and pledges are paused |
+| 16 | AmountZero | Amount must be greater than zero |
+| 17 | AgentAlreadySet | An agent is already nominated or accepted |
+| 18 | AgentNotSet | No agent holds this contract |
+| 19 | BadAccountTag | Account discriminator did not match |
 | 20 | InsufficientVault | Not enough escrow remains |
 | 21 | BadTreasury | Treasury does not match the one recorded at creation |
 | 22 | DeadlineInPast | Deadline must be in the future |
