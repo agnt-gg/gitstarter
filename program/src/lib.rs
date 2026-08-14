@@ -646,8 +646,10 @@ pub enum Instruction {
     /// Accounts: [agent(w)] [commission(w)] [submission(w)]
     CloseSubmission,
 
-    /// 15. Agent reclaims the rent on an intent once the commission is settled.
-    /// Accounts: [agent(s,w)] [commission(w)] [intent(w)]
+    /// 15. Returns an intent's deposit once the commission is settled.
+    ///
+    /// Anyone may send this; it always pays the agent named on the intent.
+    /// Accounts: [agent(w)] [commission(w)] [intent(w)]
     CloseIntent,
 }
 
@@ -1957,7 +1959,14 @@ fn close_intent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     let agent = next_account_info(ai)?;
     let commission_ai = next_account_info(ai)?;
     let intent_ai = next_account_info(ai)?;
-    assert_signer(agent)?;
+    // Deliberately NOT signed by the agent, for the same reason as ClosePledge
+    // and CloseSubmission: the deposit has exactly one possible destination, so
+    // an unsigned crank cannot misdirect it.
+    //
+    // This was the one close that still demanded a signature, which quietly
+    // broke the settling sweep: the creator signs that transaction, the agent
+    // is not there to sign, so bundling an intent close made the whole cleanup
+    // fail and every deposit on that commission stayed locked.
 
     let c = load_commission(commission_ai, program_id)?;
     assert_pda(

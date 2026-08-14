@@ -37,8 +37,8 @@ Solana transaction signed by *your* keypair.
 | Config PDA | `DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29` |
 | Fee treasury | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
 | Settlement asset | native SOL |
-| Program hash | `f311b7eacf53dd5499abb6a39c6f4c90cc845d50fde2c5fbb1819147c34b707e` |
-| Deployed in slot | `483903130` |
+| Program hash | `bebb2f448510f143a44381c41ee3ab399c73dc83bb96051b314f9b9bc208c212` |
+| Deployed in slot | `483931335` |
 
 Confirm that hash yourself rather than trusting this file:
 
@@ -455,7 +455,7 @@ integers are little-endian.
 | 12 | ClosePledge | — | backer(s,w), commission(w), pledge(w) |
 | 13 | CloseVault | — | signer(s), commission(w), vault(w), creator(w) |
 | 14 | CloseSubmission | — | agent(s,w), commission(w), submission(w) |
-| 15 | CloseIntent | — | agent(s,w), commission(w), intent(w) |
+| 15 | CloseIntent | — | agent(w), commission(w), intent(w) |
 
 `(s)` = signer, `(w)` = writable. `system` is `11111111111111111111111111111111`.
 

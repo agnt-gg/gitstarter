@@ -148,6 +148,55 @@ test('every party gets their own deposit back, not the caller', async () => {
     'the vault reserve goes to the creator who paid for it');
 });
 
+test('the sweep needs no signature but the settler\'s own', async () => {
+  // The whole design rests on this: the settling transaction is signed by ONE
+  // wallet, and the backers and agents whose deposits are coming home are not
+  // present to sign for their own money.
+  //
+  // CloseIntent was the one instruction that still demanded the agent's
+  // signature. Bundling it made the entire cleanup unsendable, and because a
+  // failed cleanup falls back to sending the payment alone, every deposit on
+  // any commission with an intent silently stayed locked. Nothing failed
+  // loudly; the money just did not move.
+  const instructions = await sweep({
+    pledges: [pledgeAccount(BACKER)],
+    submissions: [submissionAccount(AGENT, 0)],
+    intents: [intentAccount(AGENT)],
+  });
+  const settler = CREATOR;
+  for (const instruction of instructions) {
+    for (const key of instruction.keys) {
+      assert.ok(
+        !key.isSigner || key.pubkey.toBase58() === settler,
+        `a close instruction requires ${key.pubkey.toBase58().slice(0, 8)} to sign, `
+        + 'but only the settling wallet is there to do it',
+      );
+    }
+  }
+});
+
+test('every close builder is safe to crank on somebody else\'s behalf', () => {
+  // The generalisable version, checked against the builders directly rather
+  // than through one sweep: a deposit return that needs its owner present is a
+  // deposit that strands, because the owner is never present.
+  const ctx = { programId: PROGRAM, configPda: 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29', treasury: BACKER };
+  const cranker = CREATOR;
+  const builders = {
+    closePledge: escrow.build.closePledge(ctx, { backer: AGENT, commission: COMMISSION }),
+    closeSubmission: escrow.build.closeSubmission(ctx, { agent: AGENT, commission: COMMISSION, milestoneIndex: 0 }),
+    closeIntent: escrow.build.closeIntent(ctx, { agent: AGENT, commission: COMMISSION }),
+    closeVault: escrow.build.closeVault(ctx, { signer: cranker, commission: COMMISSION, creator: BACKER }),
+  };
+  for (const [name, built] of Object.entries(builders)) {
+    const signers = built.instruction.keys.filter(k => k.isSigner).map(k => k.pubkey.toBase58());
+    assert.ok(
+      signers.every(s => s === cranker),
+      `escrow.build.${name} requires ${signers.join(', ')} to sign; a deposit whose `
+      + 'return needs its owner present is a deposit that never comes back',
+    );
+  }
+});
+
 test('a sweep is capped so it cannot make the payment too large to send', async () => {
   // A transaction is size-limited and every account it touches costs bytes. A
   // busy commission must not be able to make its own final payment unsendable.

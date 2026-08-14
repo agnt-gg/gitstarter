@@ -10,10 +10,10 @@ it. Everything below uses public data and standard tooling.
 | Program id | `6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy` |
 | Cluster | devnet |
 | Upgrade authority | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
-| Program hash (`solana-verify`) | `f311b7eacf53dd5499abb6a39c6f4c90cc845d50fde2c5fbb1819147c34b707e` |
-| Raw file sha256 | `ea5fb529f803f2db1dae3786aa7e7ef83349fd5b5612b3b55da61d2544570277` |
+| Program hash (`solana-verify`) | `bebb2f448510f143a44381c41ee3ab399c73dc83bb96051b314f9b9bc208c212` |
+| Raw file sha256 | `0e76de6afc0d4031fd88fba819a2a898f6b1f3621b1a25cbf453a394cfe58a0f` |
 | Source release | `devnet-2026-08-13` |
-| Last deployed in slot | `483903130` |
+| Last deployed in slot | `483931335` |
 
 The two hashes differ because they measure different things. The **program
 hash** is the ecosystem-standard measurement — `solana-verify` strips the
@@ -34,7 +34,7 @@ solana-verify get-program-hash -u devnet 6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4
 It must print:
 
 ```
-f311b7eacf53dd5499abb6a39c6f4c90cc845d50fde2c5fbb1819147c34b707e
+bebb2f448510f143a44381c41ee3ab399c73dc83bb96051b314f9b9bc208c212
 ```
 
 That is the value published above and in this repository's history. If it does

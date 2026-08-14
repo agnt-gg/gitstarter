@@ -304,23 +304,76 @@ function deliveriesFor(commission) {
 const CHAIN_CACHE_MS = 5_000;
 let chainCache = { at: 0, value: null, inflight: null };
 
+/// Records the current on-chain state of every delivery and intent.
+///
+/// Settling a commission closes these accounts so their deposits go home
+/// unasked, which is right for the money and wrong for the record: an agent's
+/// entire history vanished the moment they got paid. The chain remains the
+/// authority — this only remembers what it said while it was still saying it.
+const rememberDelivery = db.prepare(`
+  INSERT INTO delivery_history
+    (commission, milestone_index, agent, sequence, submitted_at, evidence_hash, last_state, first_seen, last_seen)
+  VALUES (@commission, @milestoneIndex, @agent, @sequence, @submittedAt, @evidenceHash, @state, @now, @now)
+  ON CONFLICT(commission, milestone_index, agent) DO UPDATE SET
+    last_state = excluded.last_state,
+    sequence = excluded.sequence,
+    last_seen = excluded.last_seen
+  WHERE delivery_history.last_state != excluded.last_state`);
+const rememberIntent = db.prepare(`
+  INSERT INTO intent_history (commission, agent, signalled_at, withdrawn, last_seen)
+  VALUES (@commission, @agent, @signalledAt, @withdrawn, @now)
+  ON CONFLICT(commission, agent) DO UPDATE SET
+    withdrawn = excluded.withdrawn,
+    last_seen = excluded.last_seen
+  WHERE intent_history.withdrawn != excluded.withdrawn`);
+
+const rememberChainState = db.transaction((submissionsByCommission, intents) => {
+  const now = Math.floor(Date.now() / 1000);
+  for (const list of submissionsByCommission.values()) {
+    for (const s of list) rememberDelivery.run({ ...s, now });
+  }
+  for (const i of intents) rememberIntent.run({ ...i, withdrawn: i.withdrawn ? 1 : 0, now });
+});
+
 /// Deliveries competing for a commission, oldest first. Populated by the same
 /// scan that loads the commissions themselves.
 function submissionsFor(address) {
   return chainCache.submissions?.get(address) || [];
 }
 
-/// Every commission this agent said they were working on.
+/// What a delivery's outcome was, once its account has been swept away.
 ///
-/// Signalling is free and binds nobody, so these records are the entire reason
-/// it means anything: an agent who declares and never delivers leaves a trail.
-function intentsFor(agent) {
-  return (chainCache.intents || []).filter(i => i.agent === agent);
+/// This needs no stored verdict because the queue is judged strictly in order,
+/// so the commission's own two counters settle it: a delivery at position
+/// `sequence` was refused if more than that many have been rejected, it won if
+/// it is the one at the front of a milestone that paid out, and it was simply
+/// never judged if somebody ahead of it won first.
+function settledState(commission, milestoneIndex, sequence, lastObserved) {
+  // A terminal state we actually saw on chain beats any inference.
+  if (lastObserved === 'released' || lastObserved === 'rejected') return lastObserved;
+
+  const rejectedAhead = commission.milestoneRejected[milestoneIndex] ?? 0;
+  const paid = (commission.milestonesDone & (1 << milestoneIndex)) !== 0;
+  if (sequence < rejectedAhead) return 'rejected';
+  if (sequence === rejectedAhead) {
+    if (paid) return 'released';
+    // A commission that ended without paying this milestone never judged it.
+    return commission.status === 'refunded' ? 'superseded' : 'pending';
+  }
+  // Behind somebody in the queue: judged only if those ahead were refused.
+  return paid || commission.status === 'refunded' ? 'superseded' : 'pending';
 }
 
-/// Gross lamports a commission has paid out.
-function releasedShare(commission) {
-  return commission.released;
+/// Net lamports an agent received for winning one milestone.
+///
+/// The slice is `bps` of the pot, less the 1% connection fee, matching
+/// `split_fee` in the program. The milestone that completes a schedule also
+/// absorbs the rounding dust from every earlier slice, which is a handful of
+/// lamports and is not attributed here rather than being guessed at.
+function milestonePayout(commission, milestoneIndex) {
+  const bps = commission.milestoneBps[milestoneIndex] ?? 0;
+  const gross = Math.floor((commission.pledged * bps) / 10_000);
+  return gross - Math.floor((gross * escrow.FEE_BASIS_POINTS) / 10_000);
 }
 
 /// One getProgramAccounts call serves every concurrent reader for a few seconds.
@@ -370,6 +423,10 @@ async function chainCommissions() {
         try { intents.push(escrow.decodeIntent(Buffer.from(entry.account.data[0], 'base64'))); }
         catch { /* skip */ }
       }
+      // Copy what the chain currently says into the durable index, BEFORE the
+      // settling sweep closes these accounts. Nothing is invented here: every
+      // row is a verbatim observation of an account that existed at this moment.
+      try { rememberChainState(submissions, intents); } catch { /* an index that fails must never fail a read */ }
       chainCache = { at: Date.now(), value, submissions, intents, inflight: null };
       return value;
     } catch (error) {
@@ -728,13 +785,34 @@ app.get('/api/v1/reputation/:wallet', async (req, res, next) => {
     // An agent no longer "holds" a commission, so their record is derived from
     // the deliveries they actually made. That is a better measure anyway: it
     // counts work, not appointments.
+    //
+    // It has to come from the durable index rather than from live accounts,
+    // because settling a commission closes them. Reading only what is still on
+    // chain meant a wallet that had just won three jobs and been paid reported
+    // zero deliveries and zero earnings — the record was erased at the exact
+    // moment it was worth something.
     const mine = [];
-    for (const [address, c] of commissions) {
-      for (const s of submissionsFor(address)) {
-        if (s.agent === wallet) mine.push({ commission: c, submission: s, address });
-      }
+    for (const row of db.prepare('SELECT * FROM delivery_history WHERE agent = ?').all(wallet)) {
+      const c = chain.get(row.commission);
+      if (!c) continue; // a commission from a layout this build cannot read
+      const live = submissionsFor(row.commission).find(s => s.agent === wallet && s.milestoneIndex === row.milestone_index);
+      mine.push({
+        commission: c,
+        address: row.commission,
+        milestoneIndex: row.milestone_index,
+        // A live account is the most current truth. Once it is gone, the
+        // outcome is still exactly determined by the commission's own
+        // counters: the queue is judged in order, so a delivery at position
+        // `sequence` was rejected if the milestone has rejected more than that,
+        // won if it is the one at the front of a released milestone, and simply
+        // never judged if somebody ahead of it won.
+        state: live ? live.state : settledState(c, row.milestone_index, row.sequence, row.last_state),
+      });
     }
-    const myIntents = intentsFor(wallet);
+    // Intents are swept on settlement too, so the same reasoning applies.
+    const myIntents = db.prepare('SELECT * FROM intent_history WHERE agent = ?').all(wallet)
+      .filter(row => chain.has(row.commission))
+      .map(row => ({ commission: row.commission, withdrawn: !!row.withdrawn }));
 
     const sum = (list, pick) => list.reduce((total, item) => total + pick(item), 0);
     const ratio = (numerator, denominator) => (denominator ? numerator / denominator : null);
@@ -774,8 +852,11 @@ app.get('/api/v1/reputation/:wallet', async (req, res, next) => {
       return c && escrow.workClosed(c, now);
     }).length;
 
-    const released = mine.filter(m => m.submission.state === 'released');
-    const rejected = mine.filter(m => m.submission.state === 'rejected');
+    const released = mine.filter(m => m.state === 'released');
+    const rejected = mine.filter(m => m.state === 'rejected');
+    // Delivered, never judged, because somebody ahead in the queue won. Not a
+    // failure and not a rejection, so it is reported as neither.
+    const superseded = mine.filter(m => m.state === 'superseded');
 
     res.json({
       wallet,
@@ -803,12 +884,16 @@ app.get('/api/v1/reputation/:wallet', async (req, res, next) => {
         deliveries: mine.length,
         won: released.length,
         rejected: rejected.length,
-        pending: mine.filter(m => m.submission.state === 'pending').length,
+        // Delivered in good faith but never judged, because an earlier delivery
+        // won the milestone. On an open board this is the normal cost of
+        // competing and must not read as a failure.
+        superseded: superseded.length,
+        pending: mine.filter(m => m.state === 'pending').length,
         distinctCreators: agentCounterparties.size,
         // Competing and losing is not a black mark; it is the cost of entry on
         // an open board, and it is reported as a rate rather than a failure.
         winRate: ratio(released.length, released.length + rejected.length),
-        solEarned: sum(released, m => releasedShare(m.commission)) / escrow.LAMPORTS_PER_SOL * 0.99,
+        solEarned: sum(released, m => milestonePayout(m.commission, m.milestoneIndex)) / escrow.LAMPORTS_PER_SOL,
         // Intent is non-binding, so this is the only thing that makes it worth
         // anything at all.
         declaredIntent: myIntents.length,

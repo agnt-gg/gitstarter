@@ -639,13 +639,17 @@ const build = {
     };
   },
 
+  /// Returns an intent's deposit to the agent who declared it.
+  ///
+  /// The agent does not sign. They are not present when the creator settles the
+  /// commission, so requiring them would make the whole sweep unsendable.
   closeIntent(ctx, { agent, commission }) {
     const intent = intentPda(ctx.programId, commission, agent);
     return {
       commission: key(commission), intent,
       instruction: ix({
         programId: key(ctx.programId),
-        keys: [meta(agent, true, true), meta(commission, false, true), meta(intent, false, true)],
+        keys: [meta(agent, false, true), meta(commission, false, true), meta(intent, false, true)],
         data: Buffer.from([IX.closeIntent]),
       }),
     };

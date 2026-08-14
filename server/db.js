@@ -59,6 +59,46 @@ function openDatabase(filename) {
       PRIMARY KEY (commission, evidence_hash)
     );
     CREATE INDEX IF NOT EXISTS deliveries_commission ON deliveries(commission, submitted_at DESC);
+
+    -- What the chain used to say, kept after it stops saying it.
+    --
+    -- Submission and intent accounts are closed when a commission settles, so
+    -- their deposits go home without anyone being asked. That is right for the
+    -- money and wrong for the record: an agent's proof of work disappeared at
+    -- the exact moment they earned it, and a reputation lookup reported zero
+    -- deliveries for a wallet that had just been paid three times.
+    --
+    -- These tables are an INDEX, never an authority. Every row is a copy of
+    -- something the program said, written only while the account still exists,
+    -- and nothing here can create a delivery that never happened: an entry is
+    -- only ever reconciled against the commission's own on-chain counters.
+    CREATE TABLE IF NOT EXISTS delivery_history (
+      commission TEXT NOT NULL,
+      milestone_index INTEGER NOT NULL CHECK(milestone_index BETWEEN 0 AND 7),
+      agent TEXT NOT NULL,
+      -- Position in that milestone's queue, which is what decides who was
+      -- judged and in what order once the accounts are gone.
+      sequence INTEGER NOT NULL,
+      submitted_at INTEGER NOT NULL,
+      evidence_hash TEXT NOT NULL,
+      -- Last state observed on chain. 'pending' here means the account was
+      -- swept before anyone read it again, which the reconciler resolves.
+      last_state TEXT NOT NULL,
+      first_seen INTEGER NOT NULL,
+      last_seen INTEGER NOT NULL,
+      PRIMARY KEY (commission, milestone_index, agent)
+    );
+    CREATE INDEX IF NOT EXISTS delivery_history_agent ON delivery_history(agent);
+
+    CREATE TABLE IF NOT EXISTS intent_history (
+      commission TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      signalled_at INTEGER NOT NULL,
+      withdrawn INTEGER NOT NULL DEFAULT 0,
+      last_seen INTEGER NOT NULL,
+      PRIMARY KEY (commission, agent)
+    );
+    CREATE INDEX IF NOT EXISTS intent_history_agent ON intent_history(agent);
   `);
   return db;
 }

@@ -1183,7 +1183,9 @@ async fn a_deposit_cannot_be_returned_while_the_commission_is_live() {
         EscrowInstruction::ClosePledge,
     );
     assert!(
-        send(&mut w.ctx, &[close_pledge.clone()], &[]).await.is_err(),
+        send(&mut w.ctx, &[close_pledge.clone()], &[])
+            .await
+            .is_err(),
         "a funded commission still owes this backer; their record must survive"
     );
 
@@ -1203,9 +1205,13 @@ async fn a_deposit_cannot_be_returned_while_the_commission_is_live() {
     );
 
     // Once it has genuinely settled, the same unsigned instruction works.
-    send(&mut w.ctx, &[submit_ix(w.alice.pubkey(), commission, 0, 1)], &[&w.alice])
-        .await
-        .unwrap();
+    send(
+        &mut w.ctx,
+        &[submit_ix(w.alice.pubkey(), commission, 0, 1)],
+        &[&w.alice],
+    )
+    .await
+    .unwrap();
     send(
         &mut w.ctx,
         &[release_ix(
@@ -1221,9 +1227,9 @@ async fn a_deposit_cannot_be_returned_while_the_commission_is_live() {
     .await
     .unwrap();
     let before = balance(&mut w.ctx, w.backer_a.pubkey()).await;
-    send(&mut w.ctx, &[close_pledge], &[])
-        .await
-        .expect("a settled commission returns the deposit to anyone who asks on the backer's behalf");
+    send(&mut w.ctx, &[close_pledge], &[]).await.expect(
+        "a settled commission returns the deposit to anyone who asks on the backer's behalf",
+    );
     assert_eq!(
         balance(&mut w.ctx, w.backer_a.pubkey()).await - before,
         PLEDGE_RENT

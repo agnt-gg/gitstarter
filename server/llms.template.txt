@@ -370,7 +370,7 @@ little-endian.
 | 12 | ClosePledge | — | backer(s,w), commission(w), pledge(w) |
 | 13 | CloseVault | — | signer(s), commission(w), vault(w), creator(w) |
 | 14 | CloseSubmission | — | agent(s,w), commission(w), submission(w) |
-| 15 | CloseIntent | — | agent(s,w), commission(w), intent(w) |
+| 15 | CloseIntent | — | agent(w), commission(w), intent(w) |
 
 `(s)` = signer, `(w)` = writable. `config` is `{{CONFIG_PDA}}`, `treasury` is
 `{{TREASURY}}`, `system` is `11111111111111111111111111111111`.
