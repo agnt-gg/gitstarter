@@ -83,6 +83,20 @@ const createKey = Keypair.generate();
 const [multisigPda] = multisig.getMultisigPda({ createKey: createKey.publicKey });
 const [vaultPda] = multisig.getVaultPda({ multisigPda, index: 0 });
 
+// Said BEFORE sending, not after.
+//
+// The public mainnet RPC gives up confirming after 30 seconds, and a timeout is
+// not a failure — it means "unknown". The first attempt at this hit exactly that,
+// and because the address was only printed on success, a transaction that had
+// actually landed would have left a live multisig whose address nobody knew:
+// the createKey that derives it is ephemeral and exists only in this process.
+//
+// Printing first turns an unknown outcome into a checkable one.
+console.log(`\n  multisig       ${multisigPda.toBase58()}`);
+console.log(`  VAULT          ${vaultPda.toBase58()}`);
+console.log('                 ^ derived before sending, so a timeout is recoverable');
+console.log('\n  sending\u2026');
+
 const signature = await multisig.rpc.multisigCreateV2({
   connection,
   createKey,
@@ -102,7 +116,28 @@ const signature = await multisig.rpc.multisigCreateV2({
   treasury: programConfig.treasury,
   sendOptions: { skipPreflight: false },
 });
-await connection.confirmTransaction(signature, 'confirmed');
+
+// Wait for the ACCOUNT, not for the signature.
+//
+// Confirming a signature answers "did my transaction land", which is a question
+// about the mechanism. The thing actually worth knowing is whether the multisig
+// exists — and that survives an RPC that drops the connection, a retry, or a
+// second run of this script.
+const deadline = Date.now() + 120_000;
+let created = null;
+while (Date.now() < deadline) {
+  created = await connection.getAccountInfo(multisigPda, 'confirmed');
+  if (created) break;
+  await new Promise(resolve => setTimeout(resolve, 3_000));
+}
+if (!created) {
+  console.log(`\n  the account has not appeared after two minutes.`);
+  console.log(`  signature: ${signature}`);
+  console.log(`  check:     ${multisigPda.toBase58()}`);
+  console.log('  Nothing was lost if it never landed — the payer keeps its SOL and this can');
+  console.log('  be rerun. Verify before retrying, so a landed transaction is not duplicated.');
+  process.exit(1);
+}
 
 // ── read back what was actually created ─────────────────────────────────────
 //

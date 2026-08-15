@@ -84,22 +84,34 @@ a 1-of-1 wearing a costume.
 Whoever runs it pays and then has no further power, which is why it does not
 need to be one of the signers.
 
-**Rehearsed on devnet**, with all three real signer addresses:
+### Live on mainnet
+
+Created 2026-08-15, and verified by reading it back off the chain:
 
 | | |
 |---|---|
-| multisig | `685kCG1ebqLEzedXnTZaHbPR1ZGq6taf2N6tkzcDRrWP` |
-| vault (the future upgrade authority) | `8hX8yPXKJt986ypm6JSPo2rV82sZajwDviDUprpvHWgZ` |
+| **multisig** | `44zhDZj5rGez4EEqkzUqGnoPvvJ6weMyRnz2A8s8qPfN` |
+| **VAULT — the upgrade authority** | `Efa2qpUAsUMyGDyDR7LATA6qKqxrjQQ9uuUcZthdLY3H` |
 | verified | 2 of 3, configAuthority none, timeLock 0 |
+| cost | 0.002509 SOL |
 
-The devnet program's authority was deliberately **not** moved to it. Doing so
-would mean every devnet deploy needed two human signatures, which would end the
-ability to iterate here — and rehearsing the creation is the part with anything
-to learn. Moving the authority is one documented command either way.
+The vault is the address that holds the upgrade authority. It derives from the
+multisig, so it cannot be substituted for another account.
 
-**Mainnet cost: 0.002509 SOL.** Account rent 0.002499, Squads creation fee
-currently zero, plus network fees. The fee is read from Squads' own on-chain
-config at runtime rather than assumed.
+The devnet rehearsal is `685kCG1ebqLEzedXnTZaHbPR1ZGq6taf2N6tkzcDRrWP`, vault
+`8hX8yPXKJt986ypm6JSPo2rV82sZajwDviDUprpvHWgZ`. The devnet program's authority
+was deliberately left as a hot key: pointing it at a multisig would mean two
+human signatures for every devnet deploy, which ends the ability to iterate.
+
+**A confirmation timeout is not a failure.** The first mainnet attempt timed out
+after 30 seconds on the public RPC, which means *unknown*, not *failed*. The
+script now prints the multisig address **before** sending and then waits for the
+account to appear rather than for the signature to confirm — because the
+createKey that derives the address is ephemeral, so a transaction that landed
+after a timeout would have left a live multisig nobody could name.
+
+If it times out again: check the printed address before rerunning. Retrying a
+transaction that actually landed creates a second multisig and pays for it twice.
 
 ### The launch cap
 
