@@ -129,7 +129,10 @@ test('a confirmed transaction pins every later read to its slot', () => {
   // publicnode.com's WSS accepts signatureSubscribe but never replies. The
   // slot now comes from getSignatureStatuses' response, not from the WSS
   // subscription callback. The pinning INVARIANT is unchanged.
-  assert.match(send, /getSignatureStatuses\(\[sig\]\)/,
+  // Polling call goes through callWithFailover so a 504 rotates the pool
+  // to the next endpoint. The INVARIANT is that confirmation is polled
+  // (not WSS-subscribed); the mechanism is a routed call now.
+  assert.match(send, /getSignatureStatuses/,
     'confirmation must poll rather than subscribe to a WSS endpoint that hangs');
   assert.doesNotMatch(send, /confirmTransaction\(sig/,
     'the WSS confirmation path was the bug; nothing must call it any more');
