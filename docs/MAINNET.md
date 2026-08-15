@@ -32,26 +32,90 @@ network:
 | Role | Address |
 |---|---|
 | Program ID | `HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4` |
-| Initializer / admin / treasury | `AactHbz74TBh1nGkEMeHaAdpwUGQHqnBrKabZefLikYj` |
+| Initializer | `AactHbz74TBh1nGkEMeHaAdpwUGQHqnBrKabZefLikYj` |
 
 They live at `~/gitstarter-mainnet-keys/` inside WSL, mode 600, outside the git
-repository.
-
-**These are hot keys on a development machine. They are correct for the first
-deployment and wrong for steady state.** Before real volume:
-
-1. Move the **upgrade authority** to a Squads multisig, or burn it outright with
-   `solana program set-upgrade-authority --final`. Burning is the strongest
-   possible statement: it makes the escrow rules permanently immutable, and it
-   means a compromise of this machine cannot rewrite the program over live
-   funds. It also means bugs can never be patched — do it only once the program
-   has been running unmodified for a while.
-2. Move the **treasury** to a separate key from the admin. Treasury compromise
-   costs accrued fees; upgrade-authority compromise costs everything. They
-   should not share a blast radius.
+repository. The initializer address is compiled into the binary behind the
+`mainnet` feature, so only that key can ever call `InitConfig`.
 
 The devnet keypair at `~/gitstarter-program/deployer.json` must never be used on
 mainnet. It has been handled loosely in chat transcripts and on disk.
+
+### Four roles, four keys
+
+The protocol has exactly four privileged positions. They are currently one key
+on devnet, which is the single biggest thing wrong with it. Their worst cases
+are nothing like each other, so collapsing them gives the smallest role the
+blast radius of the largest:
+
+| Role | What it can do | Worst case | Signs | Belongs |
+|---|---|---|---|---|
+| Upgrade authority | Replace the program | **Every vault drained** | Once, on upgrade | Multisig, or burned |
+| Admin | `SetPaused`, nothing else | New work halted | Rarely | Multisig |
+| Treasury | Receives the 1% | Accrued fees stolen | **Never** | Hardware wallet |
+| Operator | Posts bounties, signs in | That wallet's float | Constantly | Hot, kept small |
+
+The admin genuinely cannot touch escrow — it has no instruction that moves SOL,
+changes the fee, or seizes a vault. It is a nuisance key, not a custody key.
+
+**The treasury never signs.** In both instructions that pay it, `ReleaseMilestone`
+and `Refund`, it appears as a writable account and not a signer: the program
+credits it directly. So it can be the coldest key you own — a hardware wallet, a
+multisig, a seed phrase in a safe — and none of that makes anything slower for
+anybody. `server/test/treasury.test.js` pins this, because a builder that started
+asking the treasury to sign would break cold storage silently and nobody would
+find out until a payout was due.
+
+### InitConfig is irreversible, and it is the one that matters
+
+There is no `SetTreasury`, no `SetAdmin` and no `SetFee`. `InitConfig` fixes the
+admin to whoever signed it — necessarily the initializer — and the treasury to
+whatever address is passed, and both are permanent for the life of that program.
+Each commission then snapshots the treasury when it is created, so even a
+hypothetical config change could not redirect fees on SOL already escrowed.
+
+The consequence is easy to miss and expensive: **you do not "move the treasury
+later".** Getting it wrong is fixed only by deploying a new program and
+abandoning the old one. Choose the cold address before running `InitConfig`, not
+after launch.
+
+The initializer must sign that transaction, but the treasury it names is a free
+parameter. Splitting them costs nothing except knowing to do it at that moment:
+
+```sh
+# signed by the initializer, naming a treasury that is NOT the initializer
+PROGRAM_ID=<mainnet program id> \
+TREASURY_WALLET=<COLD_ADDRESS> \
+DEPLOYER_KEYPAIR=~/gitstarter-mainnet-keys/initializer.json \
+SOLANA_RPC_URL=<your endpoint> \
+node scripts/init-config.mjs
+```
+
+The script refuses to run without an explicit `TREASURY_WALLET` and prints what
+it is about to make permanent before it sends anything.
+
+Afterwards, confirm what the chain actually enforces rather than what you meant:
+
+```sh
+node scripts/treasury-status.mjs --cluster mainnet-beta
+```
+
+### Order of operations
+
+The order is the safety property. Every step that reduces trust must happen
+while there is nothing at stake, because doing it later means a window where
+real escrow sits under a hot key:
+
+1. Deploy the program with the hot initializer. Nothing is at stake yet.
+2. Verify the deployed hash (`scripts/check-program-hash.mjs`).
+3. **Transfer the upgrade authority to the multisig, before any config exists.**
+4. `InitConfig`, naming the cold treasury.
+5. Run the preflight. Run a full cycle with your own money, at a size you would
+   shrug at losing.
+6. Only then tell anybody it exists.
+
+Steps 3 and 4 in that order matter: authority first, because until it moves, the
+key on your laptop can rewrite the rules that everything after step 4 depends on.
 
 ## Build
 

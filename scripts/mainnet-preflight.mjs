@@ -14,6 +14,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import escrow from '../shared/escrow.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -24,6 +25,10 @@ const RPC = arg('rpc') || process.env.RPC_URL
   || (CLUSTER === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
 const PROGRAM_ID = process.env.PROGRAM_ID || '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
 const TREASURY = process.env.TREASURY_WALLET || '4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY';
+const CONFIG_PDA = process.env.CONFIG_PDA || 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29';
+/// Compiled into the program behind the `mainnet` feature. A mainnet deployment
+/// whose admin is not this key was built from a devnet binary.
+const MAINNET_INITIALIZER = 'AactHbz74TBh1nGkEMeHaAdpwUGQHqnBrKabZefLikYj';
 
 const results = [];
 /// severity: 'blocker' stops a launch. 'warn' is a decision somebody must make
@@ -70,17 +75,82 @@ try {
   check('blocker', 'program is readable on this cluster', false, error.message);
 }
 
-// ── 2. The authority must not also be a participant ─────────────────────────
+// ── 2. Four roles, four keys ────────────────────────────────────────────
 //
-// Separate from the above even when the authority is a multisig: a wallet that
-// both takes the protocol fee and can rewrite the protocol has no separation at
-// all, and the same key posting bounties means one compromise loses everything
-// at once.
-check('blocker', 'upgrade authority is separate from the treasury',
-  authority === null || authority !== TREASURY,
-  authority === TREASURY
-    ? `the upgrade authority and the treasury are the same wallet (${TREASURY}). One compromised key is then the whole system.`
-    : 'separate');
+// The protocol has exactly four privileged positions and they have wildly
+// different worst cases: the upgrade authority can take everything, the admin
+// can only pause, the treasury holds accrued fees, and an operating wallet
+// holds whatever float it needs. Collapsing them means every worst case shares
+// one key, and the blast radius of the smallest becomes the blast radius of the
+// largest.
+//
+// Read from the chain, not from configuration: what this service believes and
+// what the program enforces are different claims, and only one decides where
+// money goes.
+let config = null;
+try {
+  const account = await rpc('getAccountInfo', [CONFIG_PDA, { encoding: 'base64', commitment: 'confirmed' }]);
+  if (account?.value) config = escrow.decodeConfig(Buffer.from(account.value.data[0], 'base64'));
+} catch { /* reported by the check below */ }
+
+check('blocker', 'the config the program actually enforces is readable', !!config,
+  config ? `admin ${config.admin}, treasury ${config.treasury}` : `no config at ${CONFIG_PDA} on ${CLUSTER}`);
+
+if (config) {
+  check('blocker', 'the deployed treasury is the one this service advertises',
+    config.treasury === TREASURY,
+    config.treasury === TREASURY ? 'match'
+      : `the program pays fees to ${config.treasury} but this service tells people ${TREASURY}. `
+        + 'The program wins, and it cannot be changed — there is no SetTreasury instruction.');
+
+  check('blocker', 'upgrade authority is separate from the treasury',
+    authority === null || authority !== config.treasury,
+    authority === config.treasury
+      ? `both are ${config.treasury}. One compromised key is then the whole system.`
+      : 'separate');
+
+  check('blocker', 'admin is separate from the treasury',
+    config.admin !== config.treasury,
+    config.admin === config.treasury
+      ? 'the admin key gets used — it is how you pause — and the treasury key should be offline almost always. '
+        + 'Sharing them means one of those habits loses, and it will be the safe one.'
+      : 'separate');
+
+  // An operating wallet signs constantly: posting bounties, signing in, paying
+  // fees. That is the opposite of what a fee vault should be doing.
+  let creators = new Set();
+  try {
+    const accounts = await rpc('getProgramAccounts', [PROGRAM_ID, {
+      commitment: 'confirmed', encoding: 'base64',
+      filters: [{ dataSize: escrow.COMMISSION_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '3' } }],
+    }]);
+    for (const entry of accounts) {
+      try { creators.add(escrow.decodeCommission(Buffer.from(entry.account.data[0], 'base64')).creator); }
+      catch { /* skip */ }
+    }
+  } catch { /* leave the set empty rather than assert something unmeasured */ }
+
+  check('blocker', 'the treasury is not also an operating wallet',
+    !creators.has(config.treasury),
+    creators.has(config.treasury)
+      ? 'the treasury has posted commissions itself, so it signs regularly and its balance is '
+        + 'operating float mixed with revenue. Neither its safety nor its accounting survives that.'
+      : 'receives only');
+
+  // A mainnet program built without the `mainnet` feature trusts the disposable
+  // devnet initializer, and that key is the permanent admin of whatever it
+  // initialized.
+  if (CLUSTER === 'mainnet-beta') {
+    check('blocker', 'the deployed binary was built with the mainnet initializer',
+      config.admin === MAINNET_INITIALIZER,
+      config.admin === MAINNET_INITIALIZER ? 'correct build'
+        : `admin is ${config.admin}, not the mainnet initializer. This looks like a devnet build `
+          + 'deployed to mainnet, and the admin cannot be changed afterwards.');
+  }
+
+  check('warn', 'the board is not paused', !config.paused,
+    config.paused ? 'new commissions and pledges are currently blocked' : 'accepting work');
+}
 
 // ── 3. Nothing may be running on a default ──────────────────────────────────
 //

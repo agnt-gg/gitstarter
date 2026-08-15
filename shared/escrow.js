@@ -61,6 +61,7 @@ const CLAIM_GRACE_WINDOW_SECONDS = 86_400;
 const COMMISSION_ACCOUNT_BYTES = 275;
 const SUBMISSION_ACCOUNT_BYTES = 109;
 const PLEDGE_ACCOUNT_BYTES = 83;
+const CONFIG_ACCOUNT_BYTES = 67;
 const INTENT_ACCOUNT_BYTES = 75;
 // Rent-exemption minimums. Solana charges for 128 bytes of account overhead plus
 // the account's own data, at 6960 lamports per byte. These are locked up for as
@@ -301,6 +302,24 @@ function decodeSubmission(data) {
   const evidenceHash = Buffer.from(b.subarray(o, o + 32)).toString('hex'); o += 32;
   const state = SUBMISSION_STATE[b[o++]] || 'unknown';
   return { commission, agent, milestoneIndex, sequence, submittedAt, evidenceHash, state };
+}
+
+/// Decodes the singleton Config account.
+///
+/// Worth being able to read without trusting anyone's word for it: this is where
+/// the two permanent roles live. `admin` is fixed to whoever called InitConfig
+/// and can only pause; `treasury` is fixed at that same moment and receives
+/// every fee. Neither can be changed afterwards — the program has no SetAdmin,
+/// no SetTreasury and no SetFee — so this account is the whole of the protocol's
+/// trusted configuration, and it is two public keys.
+function decodeConfig(data) {
+  const b = Buffer.from(data);
+  if (b.length !== CONFIG_ACCOUNT_BYTES) throw new Error('Not a config account');
+  if (b[0] !== 1) throw new Error('Not a config account');
+  let o = 1;
+  const pk = () => { const v = bs58.encode(b.subarray(o, o + 32)); o += 32; return v; };
+  const admin = pk(), treasury = pk();
+  return { admin, treasury, paused: !!b[o], bump: b[o + 1] };
 }
 
 /// Decodes a Pledge account — one backer's stake in one commission.
@@ -880,7 +899,7 @@ function explainError(error) {
 
 module.exports = {
   LAMPORTS_PER_SOL, BPS_DENOMINATOR, FEE_BASIS_POINTS, MAX_MILESTONES,
-  COMMISSION_ACCOUNT_BYTES, SUBMISSION_ACCOUNT_BYTES, INTENT_ACCOUNT_BYTES, PLEDGE_ACCOUNT_BYTES,
+  COMMISSION_ACCOUNT_BYTES, SUBMISSION_ACCOUNT_BYTES, INTENT_ACCOUNT_BYTES, PLEDGE_ACCOUNT_BYTES, CONFIG_ACCOUNT_BYTES,
   VAULT_RENT_LAMPORTS, PLEDGE_RENT_LAMPORTS, COMMISSION_RENT_LAMPORTS,
   SUBMISSION_RENT_LAMPORTS, INTENT_RENT_LAMPORTS,
   MAX_FUNDING_DURATION_SECONDS,
@@ -891,6 +910,6 @@ module.exports = {
   frontOfQueue, queueFor, refundCarriesFee, reclaimableRent, pendingAttention,
   IX, STATUS, SUBMISSION_STATE, ERRORS, ERROR_HELP,
   commissionPda, vaultPda, pledgePda, submissionPda, intentPda,
-  decodeCommission, decodeSubmission, decodeIntent, decodePledge, escrowRemaining,
+  decodeCommission, decodeSubmission, decodeIntent, decodePledge, decodeConfig, escrowRemaining,
   build, availableActions, explainError, canBuildTransactions,
 };
