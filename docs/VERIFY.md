@@ -84,27 +84,50 @@ different toolchain", not necessarily "the source does not match".
 
 The toolchain-independent check is the **reproducible build** below.
 
-## 3. Reproducible build (not yet published)
+## 3. Reproducible build (executed — the hash matches)
 
 A [`solana-verify`](https://github.com/Ellipsis-Labs/solana-verifiable-build)
 build pins the toolchain inside a container, which is what makes a hash
 comparison meaningful across machines and what drives the "Program is verified"
-badge on explorers:
+badge on explorers.
+
+Two flags are load-bearing and the build FAILS or produces a different binary
+without them:
+
+- `--base-image solanafoundation/solana-verifiable-build:4.0.2` — the deployed
+  binary was built with Agave 4.0.2 / platform-tools v1.53 (rustc 1.89). The
+  default image is chosen from the `solana-program = "1.18"` crate version,
+  whose cargo cannot even parse this repository's v4 `Cargo.lock`.
+- `-- --features mainnet` — compiles in the production initializer. A build
+  without it is a devnet binary and cannot match.
 
 ```bash
 cargo install solana-verify
-solana-verify build --library-name gitstarter_escrow
+cd gitstarter/program
+solana-verify build \
+  --base-image solanafoundation/solana-verifiable-build:4.0.2 \
+  --library-name gitstarter_escrow -- --features mainnet
 solana-verify get-executable-hash target/deploy/gitstarter_escrow.so
 solana-verify get-program-hash -u mainnet-beta HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4
-solana-verify verify-from-repo -u mainnet-beta \
-  --program-id HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4 \
-  https://github.com/agnt-gg/gitstarter --library-name gitstarter_escrow --mount-path program
 ```
 
-**Status: not done yet.** It requires Docker, and the explorer badge is driven
-by a verification registry that is mainnet-oriented. This will be published as
-part of the mainnet deployment, where it actually matters. Until then, section 2
-is the honest substitute: same-toolchain reproduction plus a published hash.
+Executed 2026-08-15. Both commands print
+
+```
+4b420a7857def4b3b836defcf1b7657c3db7ec7e0946c16e5fd25cc71fbd6148
+```
+
+so the container build reproduces the deployed program exactly. (The raw
+sha256 of the container-built `.so` is
+`8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9`; it differs
+from the raw sha of the original deploy artifact only in trailing padding,
+which is why the program hash — padding-stripped — is the number to quote.)
+
+Registering this in the OtterSec verification registry (what flips the explorer
+badge) requires the on-chain build-params PDA to be written by the upgrade
+authority — a 2-of-3 Squads vault, deliberately not something one machine can
+do alone. The registration transaction is prepared with
+`solana-verify export-pda-tx` and executed through the multisig.
 
 ## 4. Verify behaviour, not just bytes
 
