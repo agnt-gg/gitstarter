@@ -22,6 +22,20 @@ PROGRAM_ID=HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4
 TREASURY_WALLET=6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P
 CONFIG_PDA=E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2
 MULTISIG_ADDRESS=44zhDZj5rGez4EEqkzUqGnoPvvJ6weMyRnz2A8s8qPfN
+# gitstarter.xyz is canonical; every other name 308s to it. These two are the
+# only places the domain has any behaviour attached:
+#   SIGN_IN_DOMAIN  goes inside the message a wallet is asked to sign, so it has
+#                   to match the address bar or it reads as a phishing attempt.
+#   PUBLIC_BASE_URL is what /llms.txt tells agents to call. Set explicitly
+#                   rather than derived from the Host header, which is supplied
+#                   by whoever is asking.
+SIGN_IN_DOMAIN=gitstarter.xyz
+PUBLIC_BASE_URL=https://gitstarter.xyz
+# The watchdog probes the public site, so it must probe the canonical name —
+# pointed at the old one it would only ever be measuring the redirect.
+HEALTHCHECK_URL=https://gitstarter.xyz
+# Paths on disk, deliberately unchanged: the site is renamed, the directory
+# layout is not, and moving it would break the deploy hook and every backup path.
 DATABASE_PATH=/var/www/gitstarter.agnt.gg/data/gitstarter-mainnet.sqlite
 DB_BACKUP_PATH=/var/backups/gitstarter
 ENVEOF

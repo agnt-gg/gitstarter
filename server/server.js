@@ -42,7 +42,14 @@ const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 // __Host- forbids a Domain attribute and requires Secure + Path=/, so a
 // compromised sibling subdomain cannot force a cookie onto this origin.
 const SESSION_COOKIE = '__Host-gitstarter_session';
-const SIGN_IN_DOMAIN = process.env.SIGN_IN_DOMAIN || 'gitstarter.agnt.gg';
+// The domain named inside the message a wallet is asked to sign.
+//
+// It has to be the domain the user is looking at. A message that says
+// "Domain: gitstarter.agnt.gg" presented on gitstarter.xyz is indistinguishable
+// from a phishing attempt, and it is the exact thing every wallet guide tells
+// people to refuse — so getting this wrong either trains users to ignore the
+// warning or stops them signing in at all.
+const SIGN_IN_DOMAIN = process.env.SIGN_IN_DOMAIN || 'gitstarter.xyz';
 const db = openDatabase(DB_PATH);
 const app = express();
 app.disable('x-powered-by');
@@ -1595,7 +1602,7 @@ app.post('/api/v1/tx/:action', async (req, res, next) => {
 app.get('/llms.txt', (_req, res) => {
   res.type('text/plain; charset=utf-8').send(llmsTxt({
     cluster: CLUSTER, programId: PROGRAM_ID, configPda: CONFIG_PDA,
-    treasury: TREASURY_WALLET, rpcUrl: PUBLIC_RPC_URL,
+    treasury: TREASURY_WALLET, rpcUrl: PUBLIC_RPC_URL, signInDomain: SIGN_IN_DOMAIN,
   }));
 });
 

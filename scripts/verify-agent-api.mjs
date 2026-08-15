@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { Transaction, PublicKey } from '@solana/web3.js';
 
-const BASE = process.env.GITSTARTER_BASE || 'https://gitstarter.agnt.gg';
+const BASE = process.env.GITSTARTER_BASE || 'https://gitstarter.xyz';
 // Read from the live API first, exactly as a real agent would — an agent has no
 // compiled-in constants. Hardcoding the program id here meant this script kept
 // certifying the devnet deployment after the real one moved to mainnet, and

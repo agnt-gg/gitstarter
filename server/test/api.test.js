@@ -67,6 +67,35 @@ test('challenge requests are rate limited per wallet', async () => {
   }
   assert.ok(codes.includes(429), 'nonce overwriting must not be an unlimited anonymous primitive');
 });
+test('every place the site names itself agrees on one domain', async () => {
+  // The site moved from gitstarter.agnt.gg to gitstarter.xyz and three separate
+  // places carried the name independently: the message wallets are asked to
+  // sign, the base URL published to agents, and a sentence in the agent manual
+  // telling agents to REJECT any message not carrying that exact domain.
+  //
+  // A mismatch is not cosmetic. A user reading gitstarter.xyz while their wallet
+  // shows "Domain: gitstarter.agnt.gg" is being asked to do the precise thing
+  // every wallet guide says to refuse, and an agent following a stale manual
+  // rejects the legitimate challenge. So this reads all three off the RUNNING
+  // server and requires them to be the same fact.
+  const wallet = bs58.encode(nacl.sign.keyPair().publicKey);
+  const challenge = await fetch(base + '/api/auth/challenge', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({wallet}) }).then(r=>r.json());
+  const signed = /^Domain: (\S+)$/m.exec(challenge.message);
+  assert.ok(signed, 'the challenge must name a domain, or nothing binds the signature to this site');
+
+  const manual = await fetch(base + '/llms.txt').then(r => r.text());
+  assert.equal(/\{\{\w+\}\}/.test(manual), false, 'an uninterpolated placeholder would publish a literal template');
+
+  const claimed = /`Domain: (\S+?)`/.exec(manual);
+  assert.ok(claimed, 'the manual must tell agents which domain to expect');
+  assert.equal(claimed[1], signed[1],
+    'the manual tells agents to reject any message not carrying this domain, so it must be the one actually signed');
+
+  const published = /^Base URL: (\S+)$/m.exec(manual);
+  assert.ok(published, 'the manual must publish a base URL');
+  assert.equal(new URL(published[1]).host, signed[1],
+    'agents are told to call one host and sign for another otherwise');
+});
 test('a malformed wallet cannot create a permanent nonce row', async () => {
   const r = await fetch(base + '/api/auth/challenge', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({wallet:'abc'}) });
   assert.equal(r.status, 400);

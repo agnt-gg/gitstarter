@@ -14,7 +14,7 @@ import {
 } from '@solana/web3.js';
 import escrow from '../shared/escrow.js';
 
-const API = process.env.GITSTARTER_API || 'https://gitstarter.agnt.gg';
+const API = process.env.GITSTARTER_API || 'https://gitstarter.xyz';
 const ctx = {
   programId: '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy',
   configPda: 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29',

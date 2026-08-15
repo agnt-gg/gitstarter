@@ -13,7 +13,7 @@ import {
 
 const bs58 = bs58Module.default || bs58Module;
 const RPC_URL = 'https://api.devnet.solana.com';
-const SITE_URL = 'https://gitstarter.agnt.gg';
+const SITE_URL = 'https://gitstarter.xyz';
 const PROGRAM_ID = new PublicKey('6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy');
 const CONFIG_PDA = new PublicKey('DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29');
 const keypairPath = process.env.DEPLOYER_KEYPAIR;

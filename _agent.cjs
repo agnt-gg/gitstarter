@@ -20,7 +20,7 @@ const escrow = require('./shared/escrow');
 // Follows the program above. This still said devnet after the program id moved
 // to mainnet, which pointed the CLI at a chain where the program does not exist.
 const RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-const API = 'https://gitstarter.agnt.gg';
+const API = 'https://gitstarter.xyz';
 const ctx = {
   // Pinned rather than fetched from /api/config, for the same reason the browser
   // pins them: whoever can answer that endpoint would otherwise choose what this

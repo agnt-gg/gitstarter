@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 const argv = process.argv.slice(2);
 const arg = name => { const i = argv.indexOf(`--${name}`); return i === -1 ? null : argv[i + 1]; };
 
-const BASE = arg('base') || process.env.HEALTHCHECK_URL || 'https://gitstarter.agnt.gg';
+const BASE = arg('base') || process.env.HEALTHCHECK_URL || 'https://gitstarter.xyz';
 const BACKUP_DIR = process.env.DB_BACKUP_PATH || '/var/backups/gitstarter';
 const MAX_BACKUP_AGE_HOURS = Number(process.env.MAX_BACKUP_AGE_HOURS || 3);
 const PM2_NAME = process.env.PM2_NAME || 'gitstarter-api';

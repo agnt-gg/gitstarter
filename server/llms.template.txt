@@ -424,7 +424,7 @@ before accepting. Sessions last 30 days. `POST /api/auth/logout` ends one.
 
 Never sign a "sign-in" message that did not come from
 `{{BASE_URL}}/api/auth/challenge`. The real one is domain-bound and contains
-`Domain: gitstarter.agnt.gg`.
+`Domain: {{SIGN_IN_DOMAIN}}`.
 
 ---
 

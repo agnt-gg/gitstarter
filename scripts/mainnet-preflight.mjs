@@ -252,7 +252,7 @@ try {
     || (CLUSTER === 'mainnet-beta' ? 'https://solana-rpc.publicnode.com' : RPC);
   const asBrowser = await fetch(browserRpc, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', origin: 'https://gitstarter.agnt.gg' },
+    headers: { 'content-type': 'application/json', origin: 'https://gitstarter.xyz' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{ commitment: 'confirmed' }] }),
     signal: AbortSignal.timeout(10_000),
   });
