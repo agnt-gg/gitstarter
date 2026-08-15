@@ -125,8 +125,16 @@ test('a confirmed transaction pins every later read to its slot', () => {
   // reload. Recording the confirming slot and demanding it back makes a stale
   // node say so instead of quietly answering with old state.
   const send = functionBody(CLIENT, 'send');
-  assert.match(send, /confirmation\?\.context\?\.slot/,
-    'send must record the slot its transaction confirmed in');
+  // Mechanism changed from WSS subscription to HTTP polling because
+  // publicnode.com's WSS accepts signatureSubscribe but never replies. The
+  // slot now comes from getSignatureStatuses' response, not from the WSS
+  // subscription callback. The pinning INVARIANT is unchanged.
+  assert.match(send, /getSignatureStatuses\(\[sig\]\)/,
+    'confirmation must poll rather than subscribe to a WSS endpoint that hangs');
+  assert.doesNotMatch(send, /confirmTransaction\(sig/,
+    'the WSS confirmation path was the bug; nothing must call it any more');
+  assert.match(send, /status\.slot/,
+    'send must record the slot the polled status carries back');
   assert.match(send, /state\.minContextSlot\s*=\s*Math\.max/,
     'the recorded slot must only ever move forward');
 
