@@ -16,7 +16,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import escrow from '../shared/escrow.js';
 import { Connection, PublicKey } from '@solana/web3.js';
-import * as multisig from '@sqds/multisig';
+
+// Loaded lazily, because a preflight that cannot start is strictly worse than
+// one that reports a check it could not run. This crashed the whole report on
+// the production box, where @sqds/multisig is not installed — turning every
+// other answer, including the ones about backups and the deployed hash, into no
+// answer at all.
+let multisig = null;
+try { multisig = await import('@sqds/multisig'); } catch { /* reported by the check that needs it */ }
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -79,7 +86,7 @@ try {
     // authority are read. Pointing this at the wrong account proves nothing and
     // fails.
     let multisigDetail = null;
-    if (authority !== null && process.env.MULTISIG_ADDRESS) {
+    if (authority !== null && process.env.MULTISIG_ADDRESS && multisig) {
       try {
         const ms = new PublicKey(process.env.MULTISIG_ADDRESS);
         const [vault] = multisig.getVaultPda({ multisigPda: ms, index: 0 });
@@ -102,6 +109,7 @@ try {
       authority === null
         ? 'none — the program is immutable and nobody can swap it'
         : multisigDetail ? multisigDetail
+        : !multisig ? `${authority} — cannot verify whether this is a multisig: @sqds/multisig is not installed here`
         : `${authority} can replace this program at any time, and with it every vault it holds. `
           + 'Renounce it (solana program set-upgrade-authority --final), or move it behind a multisig or timelock.');
   }
