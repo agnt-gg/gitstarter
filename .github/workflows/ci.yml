@@ -51,9 +51,11 @@ jobs:
           fi
 
   # Native tests for the escrow program, including the adversarial suite.
-  # Toolchain pinned: solana-program 1.18 predates several later-stable
-  # breakages, and a floating `stable` here would eventually fail on a rustc
-  # release this crate has never seen.
+  # Toolchain pinned to 1.89.0: the version inside platform-tools v1.53, which
+  # built the deployed mainnet binary, and the version this Cargo.lock was
+  # resolved under. (1.78 was tried first and cannot build this dependency
+  # set; a floating `stable` would eventually break on a release this crate
+  # has never seen. Same tree, same toolchain, both directions.)
   rust:
     name: program tests
     runs-on: ubuntu-latest
@@ -64,7 +66,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.78.0
+          toolchain: 1.89.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: program
