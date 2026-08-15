@@ -30,7 +30,7 @@ const argv = process.argv.slice(2);
 const arg = name => { const i = argv.indexOf(`--${name}`); return i === -1 ? null : argv[i + 1]; };
 
 const CLUSTER = arg('cluster') || process.env.SOLANA_CLUSTER || 'devnet';
-const RPC = arg('rpc') || process.env.RPC_URL
+const RPC = arg('rpc') || process.env.SOLANA_RPC_URL || process.env.RPC_URL
   || (CLUSTER === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
 const PROGRAM_ID = process.env.PROGRAM_ID || '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
 const TREASURY = process.env.TREASURY_WALLET || '4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY';
@@ -228,7 +228,11 @@ if (config) {
 // and settle against the wrong program.
 for (const [name, value] of [
   ['SOLANA_CLUSTER', process.env.SOLANA_CLUSTER],
-  ['RPC_URL', process.env.RPC_URL],
+  // The server reads SOLANA_RPC_URL; this used to check RPC_URL, which it does
+  // not read at all. So the check passed when a meaningless variable was set and
+  // failed when the real one was — exactly backwards, and it blocked a correctly
+  // configured launch.
+  ['SOLANA_RPC_URL', process.env.SOLANA_RPC_URL || process.env.RPC_URL],
   ['PROGRAM_ID', process.env.PROGRAM_ID],
   ['TREASURY_WALLET', process.env.TREASURY_WALLET],
 ]) {
