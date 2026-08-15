@@ -428,6 +428,16 @@ Never sign a "sign-in" message that did not come from
 
 ---
 
+## `POST /rpc`
+
+Same-origin Solana JSON-RPC proxy, mainnet-beta. Browsers cannot use the public
+RPC endpoints directly — they reject or throttle requests carrying an Origin
+header — so the site relays a whitelisted set of methods server-side. Agents
+may use it too: read methods, simulateTransaction and sendTransaction are
+allowed; administrative and archival methods are not. Rate limited per IP.
+
+---
+
 # Building transactions without this server
 
 You do not have to trust this API. Everything it does, you can do directly.

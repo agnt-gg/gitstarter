@@ -38,7 +38,7 @@ const PINNED = {
   // them; a hostile server pointing the browser at a fake RPC would be caught
   // by rejecting hosts NOT in this set. Add a pool member here first, or the
   // client refuses to boot.
-  rpcHosts:['solana-rpc.publicnode.com','rpc.ankr.com','solana-mainnet.g.alchemy.com','api.mainnet-beta.solana.com']
+  rpcHosts:['gitstarter.xyz','solana-rpc.publicnode.com','rpc.ankr.com','solana-mainnet.g.alchemy.com','api.mainnet-beta.solana.com']
 };
 
 // The failover pool.
@@ -54,6 +54,10 @@ const PINNED = {
 // Labs are the fallbacks; some of them 403/429 browser Origin headers, and
 // that is exactly the point of having four.
 const RPC_POOL=[
+  // Our own origin first. The browser can never be Origin-discriminated by its
+  // own server, and the server-side failover behind /rpc has endpoints that
+  // have worked all along — it is only BROWSERS the public RPCs reject.
+  window.location.origin+'/rpc',
   'https://solana-rpc.publicnode.com',
   'https://rpc.ankr.com/solana',
   'https://solana-mainnet.g.alchemy.com/v2/demo',
@@ -447,7 +451,10 @@ async function refresh(){
 function subscribeToCommissions(){
   if(state.subscription!=null||!state.connection)return;
   try{
-    state.subscription=state.connection.onProgramAccountChange(
+    // The proxy at pool[0] is HTTP-only, so the live-update subscription uses
+    // the first pool member with a real websocket. If that WSS dies the page
+    // still works — it just needs a reload for other people's updates.
+    state.subscription=(state.connections?.[1]||state.connection).onProgramAccountChange(
       new PublicKey(state.config.programId),
       ({accountId,accountInfo})=>applyLiveUpdate(accountId.toBase58(),accountInfo.data),
       'confirmed',

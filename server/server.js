@@ -30,7 +30,7 @@ const CLUSTER = process.env.SOLANA_CLUSTER || 'mainnet-beta';
 // action failed while every server-side test passed. The two audiences need
 // endpoints chosen for how each actually connects.
 const BROWSER_SAFE_RPC = CLUSTER === 'mainnet-beta'
-  ? 'https://solana-rpc.publicnode.com'
+  ? 'https://gitstarter.xyz/rpc'
   : 'https://api.devnet.solana.com';
 const PUBLIC_RPC_URL = process.env.PUBLIC_SOLANA_RPC_URL
   || (/api-key|\?|api\.mainnet-beta/i.test(RPC_URL) ? BROWSER_SAFE_RPC : RPC_URL);
@@ -1618,6 +1618,63 @@ app.get('/llms.txt', (_req, res) => {
     cluster: CLUSTER, programId: PROGRAM_ID, configPda: CONFIG_PDA,
     treasury: TREASURY_WALLET, rpcUrl: PUBLIC_RPC_URL, signInDomain: SIGN_IN_DOMAIN,
   }));
+});
+
+// Same-origin Solana RPC proxy.
+//
+// Every free public RPC discriminates against browsers: api.mainnet-beta 403s
+// any request carrying an Origin header, ankr/alchemy 403/429 them, and
+// publicnode intermittently 504s through Cloudflare from some regions — which
+// took the whole site down for a user in Atlanta while every server-side test
+// passed. Browsers cannot shed their Origin header; servers never send one.
+// So the browser talks to ITS OWN origin, and this route forwards the call
+// server-side, where the upstreams have worked flawlessly all along.
+//
+// Failover across upstreams lives here now, close to the network, instead of
+// in every client.
+const RPC_UPSTREAMS = [...new Set([
+  RPC_URL,
+  'https://api.mainnet-beta.solana.com',
+  'https://solana-rpc.publicnode.com',
+])];
+// A whitelist, not a passthrough: an open JSON-RPC proxy would let anyone use
+// this box as a free Solana gateway. These are exactly the methods the client
+// and the agent manual need.
+const RPC_PROXY_METHODS = new Set([
+  'getLatestBlockhash', 'getBalance', 'getAccountInfo', 'getMultipleAccounts',
+  'getProgramAccounts', 'getSignatureStatuses', 'getSignaturesForAddress',
+  'sendTransaction', 'simulateTransaction', 'getTransaction',
+  'getMinimumBalanceForRentExemption', 'getRecentPrioritizationFees',
+  'getFeeForMessage', 'getVersion', 'getHealth', 'getSlot',
+]);
+app.post('/rpc', async (req, res) => {
+  try {
+    const calls = Array.isArray(req.body) ? req.body : [req.body];
+    if (!calls.length || !calls.every(c => c && typeof c.method === 'string' && RPC_PROXY_METHODS.has(c.method))) {
+      return res.status(400).json({ error: 'Method not allowed through this proxy' });
+    }
+    // Generous but bounded: the board load plus a confirmation-polling loop is
+    // well under this; a scraper hammering the box is not.
+    if (!rateLimit(`rpc:${req.ip}`, 300, 60_000)) {
+      return res.status(429).json({ error: 'Slow down' });
+    }
+    let lastStatus = 502;
+    for (const upstream of RPC_UPSTREAMS) {
+      try {
+        const upstreamRes = await fetch(upstream, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(req.body),
+          signal: AbortSignal.timeout(20_000),
+        });
+        // 5xx/429 means THIS upstream is unhappy — the next one may not be.
+        if (upstreamRes.status >= 500 || upstreamRes.status === 429) { lastStatus = upstreamRes.status; continue; }
+        const text = await upstreamRes.text();
+        return res.status(upstreamRes.status).type('application/json').send(text);
+      } catch { lastStatus = 504; }
+    }
+    res.status(lastStatus).json({ error: 'Every upstream RPC failed; try again shortly' });
+  } catch { res.status(400).json({ error: 'Malformed RPC request' }); }
 });
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
