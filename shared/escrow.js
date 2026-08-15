@@ -62,6 +62,10 @@ const COMMISSION_ACCOUNT_BYTES = 275;
 const SUBMISSION_ACCOUNT_BYTES = 109;
 const PLEDGE_ACCOUNT_BYTES = 83;
 const CONFIG_ACCOUNT_BYTES = 67;
+const HANDLE_ACCOUNT_BYTES = 75;
+const SEED_HANDLE = Buffer.from('handle');
+const MAX_HANDLE_LEN = 32;
+const MIN_HANDLE_LEN = 3;
 const INTENT_ACCOUNT_BYTES = 75;
 // Rent-exemption minimums. Solana charges for 128 bytes of account overhead plus
 // the account's own data, at 6960 lamports per byte. These are locked up for as
@@ -108,6 +112,7 @@ const IX = {
   closeVault: 13,
   closeSubmission: 14,
   closeIntent: 15,
+  claimHandle: 16,
 };
 
 // There is deliberately no "assigned" state between funded and shipped: funded
@@ -162,9 +167,16 @@ const ERRORS = {
   34: 'NotInvited',
   35: 'TooManySubmissions',
   36: 'WorkWindowClosed',
+  37: 'BadHandle',
+  38: 'HandleTaken',
 };
 
 const ERROR_HELP = {
+  BadHandle: 'A name is 3 to 32 characters of lower-case letters, numbers and inner hyphens. '
+    + 'Capitals are refused rather than corrected, because the name is its own address and '
+    + '"Alice" would otherwise be a different name from "alice".',
+  HandleTaken: 'Somebody already holds that name. Names are first-come and permanent, so that '
+    + 'nobody can pick up a name you built a reputation under.',
   Unauthorized: 'That wallet is not the creator, agent, or backer this action requires.',
   BadStatus: 'The commission is not in a state where this action is allowed.',
   MilestoneAlreadyReleased: 'That milestone has already been paid.',
@@ -226,6 +238,33 @@ function submissionPda(programId, commission, milestoneIndex, agent) {
 function intentPda(programId, commission, agent) {
   return w3().PublicKey.findProgramAddressSync(
     [SEED_INTENT, key(commission).toBuffer(), key(agent).toBuffer()], key(programId))[0];
+}
+
+/// The address of a name.
+///
+/// Derived from the name itself, which is what makes uniqueness free: two
+/// wallets cannot hold the same handle for the same reason two accounts cannot
+/// share an address. The handle must already be lower-cased — the program
+/// refuses anything else rather than normalising it, because normalising would
+/// mean "Alice" and "alice" derived different addresses and both could be held.
+function handlePda(programId, handle) {
+  return w3().PublicKey.findProgramAddressSync(
+    [SEED_HANDLE, Buffer.from(String(handle).toLowerCase(), 'utf8')], key(programId))[0];
+}
+
+/// Decodes a HandleClaim account — one name, bound to one wallet, permanently.
+function decodeHandleClaim(data) {
+  const b = Buffer.from(data);
+  if (b.length !== HANDLE_ACCOUNT_BYTES) throw new Error('Not a handle claim account');
+  if (b[0] !== 6) throw new Error('Not a handle claim account');
+  const wallet = bs58.encode(b.subarray(1, 33));
+  const len = b[65];
+  if (len < MIN_HANDLE_LEN || len > MAX_HANDLE_LEN) throw new Error('Not a handle claim account');
+  return {
+    wallet,
+    handle: b.subarray(33, 33 + len).toString('utf8'),
+    claimedAt: Number(b.readBigInt64LE(66)),
+  };
 }
 
 function pledgePda(programId, commission, backer) {
@@ -662,6 +701,35 @@ const build = {
   ///
   /// The agent does not sign. They are not present when the creator settles the
   /// commission, so requiring them would make the whole sweep unsendable.
+  /// Claims a name for the signing wallet, permanently.
+  ///
+  /// The wallet signs because a name means "this key said so". There is no
+  /// matching close or transfer builder because the program has no such
+  /// instruction: renaming frees nothing, so a reputation can never be inherited
+  /// by somebody who did not build it.
+  claimHandle(ctx, { wallet, handle }) {
+    const lower = String(handle).toLowerCase();
+    const claim = handlePda(ctx.programId, lower);
+    const name = Buffer.from(lower, 'utf8');
+    return {
+      handle: lower, claim,
+      instruction: ix({
+        programId: key(ctx.programId),
+        keys: [
+          meta(wallet, true, true),
+          meta(claim, false, true),
+          meta(systemProgram(), false, false),
+        ],
+        // Borsh: variant byte, then a u32 length-prefixed byte vector.
+        data: Buffer.concat([
+          Buffer.from([IX.claimHandle]),
+          (() => { const n = Buffer.alloc(4); n.writeUInt32LE(name.length); return n; })(),
+          name,
+        ]),
+      }),
+    };
+  },
+
   closeIntent(ctx, { agent, commission }) {
     const intent = intentPda(ctx.programId, commission, agent);
     return {
@@ -899,7 +967,7 @@ function explainError(error) {
 
 module.exports = {
   LAMPORTS_PER_SOL, BPS_DENOMINATOR, FEE_BASIS_POINTS, MAX_MILESTONES,
-  COMMISSION_ACCOUNT_BYTES, SUBMISSION_ACCOUNT_BYTES, INTENT_ACCOUNT_BYTES, PLEDGE_ACCOUNT_BYTES, CONFIG_ACCOUNT_BYTES,
+  COMMISSION_ACCOUNT_BYTES, SUBMISSION_ACCOUNT_BYTES, INTENT_ACCOUNT_BYTES, PLEDGE_ACCOUNT_BYTES, CONFIG_ACCOUNT_BYTES, HANDLE_ACCOUNT_BYTES,
   VAULT_RENT_LAMPORTS, PLEDGE_RENT_LAMPORTS, COMMISSION_RENT_LAMPORTS,
   SUBMISSION_RENT_LAMPORTS, INTENT_RENT_LAMPORTS,
   MAX_FUNDING_DURATION_SECONDS,
@@ -910,6 +978,7 @@ module.exports = {
   frontOfQueue, queueFor, refundCarriesFee, reclaimableRent, pendingAttention,
   IX, STATUS, SUBMISSION_STATE, ERRORS, ERROR_HELP,
   commissionPda, vaultPda, pledgePda, submissionPda, intentPda,
-  decodeCommission, decodeSubmission, decodeIntent, decodePledge, decodeConfig, escrowRemaining,
+  decodeCommission, decodeSubmission, decodeIntent, decodePledge, decodeConfig, decodeHandleClaim, escrowRemaining,
+  handlePda,
   build, availableActions, explainError, canBuildTransactions,
 };

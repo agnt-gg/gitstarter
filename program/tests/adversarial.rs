@@ -17,9 +17,9 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use gitstarter_escrow::{
-    process_instruction, Commission, Config, Instruction as EscrowInstruction, Status, Submission,
-    SubmissionState, SEED_COMMISSION, SEED_CONFIG, SEED_INTENT, SEED_PLEDGE, SEED_SUBMISSION,
-    SEED_VAULT,
+    process_instruction, Commission, Config, HandleClaim, Instruction as EscrowInstruction, Status,
+    Submission, SubmissionState, SEED_COMMISSION, SEED_CONFIG, SEED_HANDLE, SEED_INTENT,
+    SEED_PLEDGE, SEED_SUBMISSION, SEED_VAULT, TAG_HANDLE,
 };
 use solana_program::{
     clock::Clock,
@@ -1815,4 +1815,178 @@ async fn several_backers_refund_a_delivered_commission_without_stranding_dust() 
         VAULT_RENT,
         "not one lamport may be stranded"
     );
+}
+
+// ── names ───────────────────────────────────────────────────────────────────
+//
+// A name is the only part of this system a stranger types in themselves, and it
+// is displayed at exactly the moment somebody is deciding whether to trust them
+// with escrow. So these tests are mostly about what a name must NOT be able to
+// do: be held by two wallets, be released and inherited, or be made to look like
+// somebody else's.
+
+fn handle_pda(handle: &str) -> Pubkey {
+    Pubkey::find_program_address(&[SEED_HANDLE, handle.as_bytes()], &PROGRAM_ID).0
+}
+
+fn claim_ix(wallet: Pubkey, handle: &str) -> Instruction {
+    ix(
+        vec![
+            AccountMeta::new(wallet, true),
+            AccountMeta::new(handle_pda(handle), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        EscrowInstruction::ClaimHandle {
+            handle: handle.as_bytes().to_vec(),
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_name_belongs_to_one_wallet_and_cannot_be_taken_from_them() {
+    let mut w = world().await;
+
+    send(
+        &mut w.ctx,
+        &[claim_ix(w.alice.pubkey(), "rust-agent")],
+        &[&w.alice],
+    )
+    .await
+    .expect("a free name should be claimable");
+
+    let account = w
+        .ctx
+        .banks_client
+        .get_account(handle_pda("rust-agent"))
+        .await
+        .unwrap()
+        .expect("the claim account must exist");
+    let claim = HandleClaim::try_from_slice(&account.data).unwrap();
+    assert_eq!(claim.tag, TAG_HANDLE);
+    assert_eq!(claim.wallet, w.alice.pubkey());
+    assert_eq!(&claim.handle[..claim.len as usize], b"rust-agent");
+
+    // The impersonation this exists to prevent.
+    assert!(
+        send(
+            &mut w.ctx,
+            &[claim_ix(w.bob.pubkey(), "rust-agent")],
+            &[&w.bob]
+        )
+        .await
+        .is_err(),
+        "a second wallet must never be able to take a name somebody already holds"
+    );
+
+    // Including the holder: there is no re-claim, because there is nothing to
+    // re-claim. The account is the claim.
+    assert!(send(
+        &mut w.ctx,
+        &[claim_ix(w.alice.pubkey(), "rust-agent")],
+        &[&w.alice]
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn capitalisation_is_refused_rather_than_normalised() {
+    // The single most important rule here. The handle IS the PDA seed, so if the
+    // program quietly accepted "Rust-Agent" it would derive a DIFFERENT address
+    // from "rust-agent" and both could be held at once — two wallets owning what
+    // every human reads as one name.
+    //
+    // Refusing means there is exactly one address per name, enforced by address
+    // derivation rather than by a comparison somebody could later weaken.
+    let mut w = world().await;
+    send(
+        &mut w.ctx,
+        &[claim_ix(w.alice.pubkey(), "annie")],
+        &[&w.alice],
+    )
+    .await
+    .unwrap();
+
+    for variant in ["Annie", "ANNIE", "aNNie"] {
+        assert!(
+            send(&mut w.ctx, &[claim_ix(w.bob.pubkey(), variant)], &[&w.bob])
+                .await
+                .is_err(),
+            "{variant} must be refused, not accepted as a separate name"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_name_cannot_be_dressed_up_as_something_else() {
+    let mut w = world().await;
+
+    // Too short, too long, and hyphens where they change how a name sorts or
+    // reads.
+    for bad in ["ab", "-alice", "alice-"] {
+        assert!(
+            send(&mut w.ctx, &[claim_ix(w.alice.pubkey(), bad)], &[&w.alice])
+                .await
+                .is_err(),
+            "{bad} must be refused"
+        );
+    }
+
+    // Anything outside lower-case ASCII. A Cyrillic "a" renders identically to a
+    // Latin one in every list a human reads.
+    for bad in ["ali ce", "alice!", "\u{430}lice"] {
+        assert!(
+            send(&mut w.ctx, &[claim_ix(w.alice.pubkey(), bad)], &[&w.alice])
+                .await
+                .is_err(),
+            "a non-ASCII or punctuated name must be refused"
+        );
+    }
+
+    // A 32-character all-base58 string is a wallet address, and a name that
+    // renders like one next to a "pay this" instruction is an attack.
+    assert!(
+        send(
+            &mut w.ctx,
+            &[claim_ix(
+                w.alice.pubkey(),
+                "2b8ydoo4q3jjzuugqqqvp86xoahgmsqr"
+            )],
+            &[&w.alice]
+        )
+        .await
+        .is_err(),
+        "an address-shaped name must be refused"
+    );
+
+    // And an ordinary name of the same length is still fine, so the rule is
+    // about shape rather than simply about being long.
+    assert!(send(
+        &mut w.ctx,
+        &[claim_ix(
+            w.alice.pubkey(),
+            "an-extremely-long-but-fine-name0"
+        )],
+        &[&w.alice]
+    )
+    .await
+    .is_ok());
+}
+
+#[tokio::test]
+async fn only_the_wallet_itself_can_claim_a_name_for_itself() {
+    // A name means "this key said so". Somebody else claiming on your behalf
+    // would make it mean nothing.
+    let mut w = world().await;
+    let unsigned = ix(
+        vec![
+            AccountMeta::new(w.alice.pubkey(), false),
+            AccountMeta::new(handle_pda("alice"), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        EscrowInstruction::ClaimHandle {
+            handle: b"alice".to_vec(),
+        },
+    );
+    assert!(send(&mut w.ctx, &[unsigned], &[]).await.is_err());
 }

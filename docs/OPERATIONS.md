@@ -50,10 +50,22 @@ The drill is the point. "We have backups" and "we can restore" are different
 claims and only the second is worth anything, so the second one is on a
 schedule too.
 
-**What is actually at stake:** escrow is on chain and survives anything here
-burning down. `handle_claims` does not exist anywhere else, and it is what stops
-a name being inherited by somebody who did not earn its reputation. Lose that
-table and every name on the board becomes claimable by whoever asks first.
+**What is actually at stake — and it is less than it was.** Escrow is on chain and
+survives anything here burning down. Name claims used to be the exception: they
+lived only in this database, and they carry the guarantee that a reputation
+cannot be inherited by somebody who did not build it.
+
+They are on chain now. `handle_claims` is a mirror that the board scan rebuilds
+from the program on the next pass, so losing this file costs bios, links and
+some cached history — annoying, and no longer capable of handing somebody else's
+name to whoever asks first.
+
+What is genuinely unrecoverable is smaller and duller: commission titles and
+descriptions, delivery evidence text (the chain stores only its hash), bios, and
+the notification inbox. All of it re-postable by the people who wrote it.
+
+Backups stayed hourly anyway. Making a loss survivable is not a reason to invite
+one.
 
 ## The watchdog
 

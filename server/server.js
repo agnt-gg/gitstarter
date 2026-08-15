@@ -331,6 +331,18 @@ const rememberIntent = db.prepare(`
     last_seen = excluded.last_seen
   WHERE intent_history.withdrawn != excluded.withdrawn`);
 
+/// Copies the on-chain name claims into the local cache.
+///
+/// Deliberately an upsert with no delete: the program has no CloseHandle, so a
+/// claim that vanished from a scan is a failed read rather than a released name,
+/// and honouring that would let a flaky RPC call free somebody's identity.
+const mirrorHandleClaims = db.transaction(claims => {
+  const upsert = db.prepare(`INSERT INTO handle_claims (handle_key, wallet, claimed_at)
+    VALUES (@handle, @wallet, @claimedAt)
+    ON CONFLICT(handle_key) DO UPDATE SET wallet = excluded.wallet`);
+  for (const claim of claims) upsert.run({ ...claim, claimedAt: claim.claimedAt * 1000 });
+});
+
 const rememberChainState = db.transaction((submissionsByCommission, intents) => {
   const now = Math.floor(Date.now() / 1000);
   for (const list of submissionsByCommission.values()) {
@@ -465,7 +477,7 @@ async function chainCommissions() {
       // than one per commission. An open board means several agents may be
       // queued on the same milestone, and nothing about the board makes sense
       // without knowing who is in that queue and in what order.
-      const [accounts, submissionAccounts, intentAccounts] = await Promise.all([
+      const [accounts, submissionAccounts, intentAccounts, handleAccounts] = await Promise.all([
         rpc('getProgramAccounts', [PROGRAM_ID, {
           commitment: 'confirmed', encoding: 'base64',
           filters: [{ dataSize: escrow.COMMISSION_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '3' } }],
@@ -477,6 +489,15 @@ async function chainCommissions() {
         rpc('getProgramAccounts', [PROGRAM_ID, {
           commitment: 'confirmed', encoding: 'base64',
           filters: [{ dataSize: escrow.INTENT_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '6' } }],
+        }]),
+        // Name claims. These used to live only in SQLite, which made this
+        // service's database the single thing in the system whose loss could not
+        // be recovered from — and it was carrying the guarantee that matters
+        // most, that a reputation cannot be inherited by somebody who did not
+        // build it. They are on chain now, so this scan rebuilds them.
+        rpc('getProgramAccounts', [PROGRAM_ID, {
+          commitment: 'confirmed', encoding: 'base64',
+          filters: [{ dataSize: escrow.HANDLE_ACCOUNT_BYTES }, { memcmp: { offset: 0, bytes: '7' } }],
         }]),
       ]);
       const value = new Map();
@@ -502,6 +523,16 @@ async function chainCommissions() {
       // Copy what the chain currently says into the durable index, BEFORE the
       // settling sweep closes these accounts. Nothing is invented here: every
       // row is a verbatim observation of an account that existed at this moment.
+      // Mirror the on-chain claims. This table is now a cache rather than the
+      // record: every row here is reconstructible by anybody scanning the
+      // program, so losing this database costs bios and nothing else.
+      const claims = [];
+      for (const entry of handleAccounts) {
+        try { claims.push(escrow.decodeHandleClaim(Buffer.from(entry.account.data[0], 'base64'))); }
+        catch { /* not a claim we understand */ }
+      }
+      try { mirrorHandleClaims(claims); } catch (error) { console.error('handle mirror failed', error); }
+
       try { rememberChainState(submissions, intents); } catch { /* an index that fails must never fail a read */ }
       // Same rule: telling somebody what happened must never be the reason they
       // cannot read the board.
@@ -907,24 +938,39 @@ function handlesFor(wallets) {
 }
 
 /// Claim or update the name on the signed-in wallet.
-app.post('/api/v1/handle', requireAuth, (req, res, next) => {
+app.post('/api/v1/handle', requireAuth, async (req, res, next) => {
   try {
     const { handle, key } = cleanHandle(req.body.handle);
     const bio = req.body.bio == null ? '' : cleanText(req.body.bio, 280);
     const link = req.body.link ? cleanHttpUrl(req.body.link) : '';
 
-    // A name is bound to the first wallet that took it, for good. Without this,
-    // an agent could build a record as one name, rename, and leave the name free
-    // for somebody else to inherit the recognition of.
-    const claim = db.prepare('SELECT wallet FROM handle_claims WHERE handle_key = ?').get(key);
-    if (claim && claim.wallet !== req.wallet) {
-      return res.status(409).json({ error: 'That handle belongs to another wallet' });
+    // The chain decides who holds a name; this only records what it says.
+    //
+    // The claim itself is a PDA derived from the name, so uniqueness is address
+    // derivation rather than a constraint in this table — two wallets can no
+    // more share a name than they can share an account. Read directly rather
+    // than from the few-second cache, because a wallet posts here immediately
+    // after claiming and a stale read would reject the claim that just landed.
+    const claimPda = escrow.handlePda(PROGRAM_ID, key).toBase58();
+    const account = (await rpc('getAccountInfo', [claimPda, { commitment: 'confirmed', encoding: 'base64' }]))?.value;
+    if (!account) {
+      return res.status(409).json({
+        error: 'That name has not been claimed on chain yet. Send the ClaimHandle transaction first — '
+          + 'the claim is what makes the name yours, and this only records the bio beside it.',
+        claimAccount: claimPda,
+      });
+    }
+    let onChain;
+    try { onChain = escrow.decodeHandleClaim(Buffer.from(account.data[0], 'base64')); }
+    catch { return res.status(409).json({ error: 'That address is not a name claim' }); }
+    if (onChain.wallet !== req.wallet) {
+      return res.status(409).json({ error: 'That name belongs to another wallet' });
     }
 
     const now = Date.now();
     db.transaction(() => {
       db.prepare('INSERT INTO handle_claims(handle_key,wallet,claimed_at) VALUES(?,?,?) ON CONFLICT(handle_key) DO NOTHING')
-        .run(key, req.wallet, now);
+        .run(key, req.wallet, onChain.claimedAt * 1000);
       db.prepare(`INSERT INTO handles(wallet,handle,handle_key,bio,link,created_at,updated_at)
         VALUES(@wallet,@handle,@key,@bio,@link,@now,@now)
         ON CONFLICT(wallet) DO UPDATE SET

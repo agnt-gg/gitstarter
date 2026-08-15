@@ -177,7 +177,27 @@ test('the index only ever copies what the chain said', () => {
   assert.match(remember, /rememberChainState\s*=\s*db\.transaction/,
     'a snapshot must be atomic, or a crash mid-scan leaves a half-written history');
 
+  // Every bookkeeping rider on the board scan must be individually guarded. The
+  // scan is what makes the site work; an index, a mirror or a notification that
+  // throws must cost its own feature and nothing else.
+  //
+  // Matched by name rather than by position, because an earlier version pinned
+  // this to the first 3000 characters and broke the moment another rider was
+  // added ahead of it — reporting a missing guard that was in fact present.
   const scan = SERVER.slice(SERVER.indexOf('async function chainCommissions'));
-  assert.match(scan.slice(0, 3000), /try \{ rememberChainState\([\s\S]{0,80}\} catch/,
-    'an index that fails must never fail the read it was riding along on');
+  const body = scan.slice(0, scan.indexOf('chainCache = {'));
+  for (const rider of ['rememberChainState', 'mirrorHandleClaims', 'recordEvents']) {
+    const at = body.indexOf(`${rider}(`);
+    assert.notEqual(at, -1, `${rider} should be called by the board scan`);
+    // Actually enclosed, rather than merely near a `try`. A character-distance
+    // check passes or fails on how long the block happens to be, which is a
+    // property of the formatting rather than of the guard.
+    const opened = body.lastIndexOf('try {', at);
+    const closed = body.indexOf('} catch', at);
+    assert.ok(
+      opened !== -1 && closed !== -1 && opened < at && at < closed,
+      `${rider} rides along on the board scan and must be inside a try/catch, `
+      + 'or a failure in it takes the whole board down with it',
+    );
+  }
 });

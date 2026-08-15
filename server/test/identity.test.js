@@ -13,6 +13,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const escrow = require('../../shared/escrow');
 
 const ROOT = path.join(__dirname, '..', '..');
 const SERVER = fs.readFileSync(path.join(ROOT, 'server', 'server.js'), 'utf8');
@@ -131,15 +132,75 @@ test('a name is bound to the first wallet that claims it, permanently', () => {
   fs.rmSync(file, { force: true });
 });
 
-test('the handle route proves ownership before it writes anything', () => {
-  const route = SERVER.slice(SERVER.indexOf("app.post('/api/v1/handle'"));
-  assert.match(route.slice(0, 120), /requireAuth/,
+test('the handle route asks the chain who holds a name, not its own database', () => {
+  // Ownership moved on chain, and this route went with it. It used to consult
+  // `handle_claims` in SQLite, which made this server's disk the authority on
+  // the one thing that cannot be rebuilt from anywhere else — and the guarantee
+  // it carried is precisely that a reputation cannot be inherited.
+  const route = SERVER.slice(
+    SERVER.indexOf("app.post('/api/v1/handle'"),
+    SERVER.indexOf("app.get('/api/v1/notifications'"),
+  );
+  assert.match(route.slice(0, 140), /requireAuth/,
     'a name must be settable only by the wallet it names, proven by signature');
-  assert.match(route, /handle_claims WHERE handle_key = \?/);
-  assert.match(route, /claim\.wallet !== req\.wallet/,
-    'and a claim held by another wallet must block the write');
-  assert.match(route, /db\.transaction/,
-    'the claim and the name must be written together, or a crash leaves a name owned by nobody');
+  assert.match(route, /escrow\.handlePda\(PROGRAM_ID, key\)/,
+    'the claim address must be derived from the name, so uniqueness is the address itself');
+  assert.match(route, /getAccountInfo/,
+    'and the claim must be read from the chain rather than from this database');
+  assert.match(route, /onChain\.wallet !== req\.wallet/,
+    'a name the chain says belongs to somebody else must block the write');
+  // The stale-read trap: a wallet posts here immediately after claiming, so a
+  // few-second cache would reject the very claim that just landed.
+  assert.equal(route.includes('await chainCommissions()'), false,
+    'this must read the account directly, not through the board cache');
+});
+
+test('the local claims table is a mirror, and cannot free a name', () => {
+  // The program has no CloseHandle, so a claim missing from a scan is a failed
+  // read rather than a released name. Deleting on that basis would let one
+  // flaky RPC call hand somebody's identity to the next person who asked.
+  const mirror = SERVER.slice(SERVER.indexOf('const mirrorHandleClaims'), SERVER.indexOf('const rememberChainState'));
+  assert.match(mirror, /INSERT INTO handle_claims/);
+  assert.match(mirror, /ON CONFLICT\(handle_key\) DO UPDATE/);
+  assert.equal(/DELETE\s+FROM\s+handle_claims/i.test(SERVER), false,
+    'nothing may ever delete a claim locally');
+});
+
+test('a name and its address are the same fact', () => {
+  // The whole design rests on this one function, and it was the only part of it
+  // with no test — caught by mutation, not by reading.
+  //
+  // Uniqueness here is not enforced by a check anybody could remove. The account
+  // address IS derived from the name, so two wallets can no more hold one name
+  // than they can share an account. That property lives entirely in the seeds
+  // passed below, which makes them worth pinning byte for byte.
+  const PROGRAM = '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
+  const { PublicKey } = require('@solana/web3.js');
+
+  const expected = name => PublicKey.findProgramAddressSync(
+    [Buffer.from('handle'), Buffer.from(name, 'utf8')], new PublicKey(PROGRAM))[0].toBase58();
+
+  assert.equal(escrow.handlePda(PROGRAM, 'annie').toBase58(), expected('annie'),
+    'the address must be derived from the seed "handle" and the name itself');
+
+  // Different names are different accounts. If the name were dropped from the
+  // seeds, every name would collide on one address and the first claim would
+  // lock out everybody forever.
+  assert.notEqual(
+    escrow.handlePda(PROGRAM, 'annie').toBase58(),
+    escrow.handlePda(PROGRAM, 'agnt-labs').toBase58(),
+    'two names must never derive the same account',
+  );
+
+  // And casing is not a different name. The program refuses anything but the
+  // canonical form, so if this helper passed the raw string through, the client
+  // would derive an address the program would never accept — or worse, on a
+  // program that normalised instead of refusing, "Annie" and "annie" would be
+  // two live claims on what every human reads as one name.
+  for (const variant of ['Annie', 'ANNIE', 'aNnIe']) {
+    assert.equal(escrow.handlePda(PROGRAM, variant).toBase58(), expected('annie'),
+      `${variant} must resolve to the same account as annie`);
+  }
 });
 
 test('a profile can be found by name or by address, and says which is which', () => {

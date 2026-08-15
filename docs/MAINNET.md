@@ -19,10 +19,23 @@ upgrade authority, whether that authority is also the treasury, whether every
 setting is explicit rather than falling back to a devnet default, whether an
 independent review exists, and whether the database is backed up.
 
-Run against the current devnet deployment it reports **eight blockers**, the
-largest being that the upgrade authority is a single hot key which is also the
-treasury. That is the honest state of things, and the sections below are how it
-gets fixed.
+Run against the current devnet deployment it reports **five blockers**, and every
+one of them is now about key custody or review rather than about the software:
+
+```
+BLOCK  upgrade authority is not a single hot key
+BLOCK  upgrade authority is separate from the treasury
+BLOCK  admin is separate from the treasury
+BLOCK  the treasury is not also an operating wallet
+BLOCK  an independent review exists
+```
+
+The first four are one `InitConfig` away once the addresses are decided; the
+fifth is a person reading the escrow. Backups, restore rehearsal and the
+hash-matches-the-deployment check all pass, and they used to be on this list.
+
+That is the honest state of things, and the sections below are how the rest of
+it gets fixed.
 
 ## Keys
 
@@ -33,6 +46,32 @@ network:
 |---|---|
 | Program ID | `HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4` |
 | Initializer | `AactHbz74TBh1nGkEMeHaAdpwUGQHqnBrKabZefLikYj` |
+
+### The decided addresses
+
+| Role | Address | Held by |
+|---|---|---|
+| Multisig signer A | `2B8YDoo4Q3JJZuuGqqqVP86xoahgMsqREr3ScxhGS8C5` | Nathan, main |
+| Multisig signer B | `CzWRYDTxwJP44TZqP4A5f9bNEaQNRJw5cygUtKD2xyxP` | Nathan, alt |
+| Multisig signer C | `3YkcozncNpombu98hqxYaKTxGqLcWDQxq5JJUvKXWTFf` | recovery |
+| **Treasury** | `6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P` | cold |
+
+Signers C and the treasury were generated fresh and verified at zero balance on
+mainnet — they have never been used on any network. Their keypairs are in
+`~/gitstarter-mainnet-keys/`, mode 600. Their seed phrases have deliberately
+never been printed to a terminal or a transcript; recovering one is something to
+do at your own machine, or better, never, because the key is on a hardware
+wallet by then.
+
+**2-of-3, not 2-of-2.** Two signers means a lost device leaves a permanently
+unupgradeable program with live money in it, which is a worse failure than the
+one the multisig was protecting against.
+
+**The treasury is separate and never signs.** Both instructions that pay it mark
+it writable and not a signer, so it can be the coldest key in the system without
+making anything slower for anybody. `server/test/treasury.test.js` pins that,
+because a builder that started requiring its signature would break cold storage
+silently and nobody would notice until a payout was due.
 
 They live at `~/gitstarter-mainnet-keys/` inside WSL, mode 600, outside the git
 repository. The initializer address is compiled into the binary behind the

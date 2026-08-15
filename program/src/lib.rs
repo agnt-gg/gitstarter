@@ -152,6 +152,7 @@ pub const SEED_VAULT: &[u8] = b"vault";
 pub const SEED_PLEDGE: &[u8] = b"pledge";
 pub const SEED_SUBMISSION: &[u8] = b"submission";
 pub const SEED_INTENT: &[u8] = b"intent";
+pub const SEED_HANDLE: &[u8] = b"handle";
 
 /// Account-type tags. A single byte at offset 0 of every account we own.
 /// Without this, an attacker can pass a `Pledge` where a `Commission` is
@@ -162,6 +163,13 @@ pub const TAG_COMMISSION: u8 = 2;
 pub const TAG_PLEDGE: u8 = 3;
 pub const TAG_SUBMISSION: u8 = 4;
 pub const TAG_INTENT: u8 = 5;
+pub const TAG_HANDLE: u8 = 6;
+
+/// A handle is at most 32 bytes because that is the maximum length of a single
+/// PDA seed, and the handle IS the seed. Everything else about this design
+/// follows from that choice.
+pub const MAX_HANDLE_LEN: usize = 32;
+pub const MIN_HANDLE_LEN: usize = 3;
 
 // ───────────────────────────── errors ─────────────────────────────
 
@@ -209,7 +217,17 @@ pub enum EscrowError {
     TooManySubmissions = 35,
     /// The window for doing the work has closed.
     WorkWindowClosed = 36,
+    /// Not a name this program will accept: wrong length, a character outside
+    /// lower-case ASCII, a leading or trailing hyphen, or a string shaped like a
+    /// wallet address.
+    BadHandle = 37,
+    /// Somebody already holds it. Names are first-come and permanent.
+    HandleTaken = 38,
 }
+
+/// Base58 as Solana uses it: no 0, O, I or l, precisely so that an address
+/// cannot be misread. Used here to refuse names that are shaped like keys.
+const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 impl From<EscrowError> for ProgramError {
     fn from(e: EscrowError) -> Self {
@@ -472,6 +490,41 @@ impl Intent {
     pub const LEN: usize = 1 + 32 + 32 + 8 + 1 + 1;
 }
 
+/// A name, bound to one wallet, permanently.
+///
+/// This lives on chain rather than in our database for one reason: it is the
+/// only piece of identity that cannot be rebuilt by reading the program. A
+/// commission, a delivery, a reputation figure — all of those are derivable from
+/// chain state by anybody. A name held only in SQLite is a name that disappears
+/// with the server, and with it the guarantee that stops somebody inheriting a
+/// reputation they did not earn.
+///
+/// **Uniqueness is the address, not a check.** The PDA is derived from the
+/// handle itself, so two wallets cannot hold the same name in the same way that
+/// two accounts cannot share an address. There is no constraint here that could
+/// be removed by a later edit, and no index that could be dropped.
+///
+/// **There is deliberately no CloseHandle.** Renaming frees nothing. If a claim
+/// could be released, an agent could build a record under one name, move on, and
+/// leave that name for a stranger to pick up and be mistaken for — at exactly
+/// the moment a creator is deciding whom to trust with escrow. The rent is the
+/// price of that guarantee and it is not refundable, which is the point.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct HandleClaim {
+    pub tag: u8,
+    /// The wallet this name belongs to, for good.
+    pub wallet: Pubkey,
+    /// Lower-cased, left-aligned, zero-padded. Fixed width because it is a PDA
+    /// seed and seeds are raw bytes.
+    pub handle: [u8; MAX_HANDLE_LEN],
+    pub len: u8,
+    pub claimed_at: i64,
+    pub bump: u8,
+}
+impl HandleClaim {
+    pub const LEN: usize = 1 + 32 + MAX_HANDLE_LEN + 1 + 8 + 1;
+}
+
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct Pledge {
     pub tag: u8,
@@ -651,6 +704,18 @@ pub enum Instruction {
     /// Anyone may send this; it always pays the agent named on the intent.
     /// Accounts: [agent(w)] [commission(w)] [intent(w)]
     CloseIntent,
+    /// 16. Claim a name, permanently, for the signing wallet.
+    ///
+    /// `handle` must already be lower-cased; the program refuses anything else
+    /// rather than normalising it, because the handle is the PDA seed and a
+    /// program that quietly accepted "Alice" would create an account at a
+    /// different address from "alice" — two live claims on one name, which is
+    /// precisely what this exists to prevent.
+    ///
+    /// There is no matching close or transfer. A name is bound for the life of
+    /// the program.
+    /// Accounts: [wallet(s,w)] [claim(w)] [system_program]
+    ClaimHandle { handle: Vec<u8> },
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -887,6 +952,7 @@ pub fn process_instruction(
         Instruction::CloseVault => close_vault(program_id, accounts),
         Instruction::CloseSubmission => close_submission(program_id, accounts),
         Instruction::CloseIntent => close_intent(program_id, accounts),
+        Instruction::ClaimHandle { handle } => claim_handle(program_id, accounts, handle),
     }
 }
 
@@ -1987,6 +2053,88 @@ fn close_intent(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     let reclaimed = intent_ai.lamports();
     close_account(intent_ai, agent)?;
     msg!("intent closed, {} lamports of rent reclaimed", reclaimed);
+    Ok(())
+}
+
+// 16 ── ClaimHandle ─────────────────────────────────
+//
+// A name that survives this service disappearing.
+//
+// Every other piece of identity on the board is derivable from the chain by
+// anybody: who created a commission, who delivered, what was paid. A name held
+// only in our database was the single exception, and it was the one carrying the
+// guarantee that matters most — that a reputation cannot be inherited by
+// somebody who did not build it.
+fn claim_handle(program_id: &Pubkey, accounts: &[AccountInfo], handle: Vec<u8>) -> ProgramResult {
+    let ai = &mut accounts.iter();
+    let wallet = next_account_info(ai)?;
+    let claim_ai = next_account_info(ai)?;
+    let system_program = next_account_info(ai)?;
+
+    // Only ever for yourself. A name means "this key said so", so it has to be
+    // that key saying it.
+    assert_signer(wallet)?;
+    if *system_program.key != solana_program::system_program::ID {
+        return Err(EscrowError::BadOwner.into());
+    }
+
+    if handle.len() < MIN_HANDLE_LEN || handle.len() > MAX_HANDLE_LEN {
+        return Err(EscrowError::BadHandle.into());
+    }
+    // Lower-case ASCII, digits and inner hyphens, and nothing else.
+    //
+    // Rejecting rather than normalising is deliberate and load-bearing. The
+    // handle is the PDA seed, so accepting "Alice" would derive a different
+    // address from "alice" and both could be claimed — two wallets holding what
+    // reads as one name. Refusing anything but the canonical form means there is
+    // exactly one address per name, enforced by address derivation rather than
+    // by a check that a later edit could weaken.
+    //
+    // The ASCII restriction closes the other impersonation route: a Cyrillic "a"
+    // renders identically to a Latin one in every list a human reads.
+    for (index, byte) in handle.iter().enumerate() {
+        let ok = matches!(byte, b'a'..=b'z' | b'0'..=b'9')
+            || (*byte == b'-' && index != 0 && index != handle.len() - 1);
+        if !ok {
+            return Err(EscrowError::BadHandle.into());
+        }
+    }
+    // A name shaped like an address is a name designed to be mistaken for one.
+    // Base58 excludes 0, O, I and l, so a 32-byte all-base58 string is far more
+    // likely to be a key than a name somebody chose.
+    if handle.len() >= 32 && handle.iter().all(|b| BASE58_ALPHABET.contains(b)) {
+        return Err(EscrowError::BadHandle.into());
+    }
+
+    let bump = assert_pda(&[SEED_HANDLE, &handle], program_id, claim_ai)?;
+
+    // Already taken. Not an error worth distinguishing by holder: whoever asks
+    // second is refused, and the account itself says who holds it.
+    if !claim_ai.data_is_empty() {
+        return Err(EscrowError::HandleTaken.into());
+    }
+
+    create_pda_account(
+        wallet,
+        claim_ai,
+        system_program,
+        program_id,
+        HandleClaim::LEN,
+        &[SEED_HANDLE, &handle, &[bump]],
+    )?;
+
+    let mut padded = [0u8; MAX_HANDLE_LEN];
+    padded[..handle.len()].copy_from_slice(&handle);
+    let claim = HandleClaim {
+        tag: TAG_HANDLE,
+        wallet: *wallet.key,
+        handle: padded,
+        len: handle.len() as u8,
+        claimed_at: Clock::get()?.unix_timestamp,
+        bump,
+    };
+    save(claim_ai, &claim)?;
+    msg!("handle claimed permanently; it can never be transferred or released");
     Ok(())
 }
 

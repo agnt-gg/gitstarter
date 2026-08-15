@@ -824,9 +824,31 @@ function openNameDialog({firstTime=false}={}){
 async function saveHandle(){
   const handle=($('handleInput')?.value||'').trim();
   if(!handle)throw new Error('Enter a name first.');
-  const saved=await api('/api/v1/handle',{method:'POST',body:JSON.stringify({
-    handle,bio:($('bioInput')?.value||'').trim(),link:($('linkInput')?.value||'').trim(),
-  })});
+  const bio=($('bioInput')?.value||'').trim(),link=($('linkInput')?.value||'').trim();
+
+  // The claim goes on chain first, because the chain is what makes the name
+  // yours. This service only records the bio that sits beside it — if it
+  // disappeared tomorrow, the name would still be yours and anybody could prove
+  // it by reading the program.
+  //
+  // Skipped when the name is unchanged, so editing a bio does not ask for a
+  // signature or a second rent payment.
+  if(handle.toLowerCase()!==(state.myHandle||'').toLowerCase()){
+    const built=escrow.build.claimHandle(ESCROW_CTX,{wallet:state.wallet,handle});
+    const existing=await state.connection.getAccountInfo(built.claim,'confirmed');
+    if(existing){
+      const held=escrow.decodeHandleClaim(existing.data);
+      if(held.wallet!==currentWallet()){
+        throw new Error(`@${built.handle} belongs to another wallet. Names are permanent, so that `
+          +'nobody can pick up a name you built a reputation under.');
+      }
+    }else{
+      showProgress('Claiming the name on chain\u2026 this is permanent.');
+      await send(new Transaction().add(built.instruction),showProgress);
+    }
+  }
+
+  const saved=await api('/api/v1/handle',{method:'POST',body:JSON.stringify({handle,bio,link})});
   state.myHandle=saved.handle;
   closeDialog();
   showToast(`You are now @${saved.handle}. This name is yours permanently.`);
