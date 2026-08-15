@@ -12,6 +12,9 @@ git push production main
 1. `root@agnt.gg:/root/gitstarter.git` — server-side deploy hook.
 2. `https://github.com/agnt-gg/gitstarter.git` — public source mirror.
 
-The server hook stages the exact pushed tree, runs `npm test`, syntax-checks both the server and committed browser bundle, verifies the public entrypoint exists, rsyncs tracked files without deleting live `.env`, SQLite, or `node_modules`, gracefully reloads `gitstarter-api`, verifies PM2 and `/api/health`, and restores the previous revision on failure. Browser assets must be built and committed before pushing; production deliberately does not install build-only dependencies.
+The server hook stages the exact pushed tree and then **fails closed on the two mistakes that have actually shipped**:
 
-The hook never runs `git clean` or `npm ci`. Dependency changes require a deliberate server-side `npm install` before deployment.
+1. **A stale bundle is a rejected push.** The stage rebuilds `public/app.js` with `npm run build:client` and compares it byte-for-byte against the committed file. A correct source fix with a stale committed bundle — which shipped twice, silently — now bounces with instructions instead of deploying old code.
+2. **The stage runs the dependency tree the revision declares.** If `package-lock.json` differs from live's (or the build tools are missing), the stage gets its own `npm ci`; live `node_modules` is reused only when the lockfile is byte-identical. On success the staged tree is rsynced into live in the same deploy as the code that needs it, so a new dependency can never reach production uninstalled — the failure mode behind the Node 18 `ERR_REQUIRE_ESM` outage.
+
+After the gate: rsync of tracked files without touching live `.env`, SQLite, or `data/`, a graceful PM2 reload, an `/api/health` verification, and automatic restore of the previous revision on any failure. The hook's source of truth is `deploy/post-receive` in this repository; installing a changed hook is a deliberate server-side copy to `/root/gitstarter.git/hooks/post-receive`.

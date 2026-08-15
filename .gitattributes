@@ -1,0 +1,10 @@
+# The committed browser bundle is BYTES, not text. esbuild emits LF; the deploy
+# gate and CI both compare a fresh build against the committed file with cmp.
+# Letting autocrlf rewrite it on a Windows checkout makes an identical bundle
+# look stale locally and hides a genuinely stale one from git diff.
+public/app.js -text
+
+# Server-side executables must reach the droplet with LF regardless of who
+# committed them from where. A CRLF shebang line is "/bin/bash\r": not found.
+deploy/post-receive text eol=lf
+*.sh text eol=lf

@@ -6,9 +6,50 @@ STAGE=/root/gitstarter-deploy-stage
 LIVE=/var/www/gitstarter.agnt.gg/app
 PM2_NAME=gitstarter-api
 log(){ echo ">>> $*"; }
-stage_rev(){ rm -rf "$STAGE" && mkdir -p "$STAGE" && git --work-tree="$STAGE" --git-dir="$GIT_DIR" checkout -f "$1" -- . && ln -s "$LIVE/node_modules" "$STAGE/node_modules"; }
-gate(){ node -c "$1/server/server.js" && node -c "$1/public/app.js" && test -s "$1/public/index.html" && (cd "$1" && npm test); }
-sync_live(){ rsync -a --exclude='.env' --exclude='data/' --exclude='node_modules' "$STAGE/" "$LIVE/"; }
+
+# The stage runs against the dependency tree the pushed revision DECLARES.
+# Reusing live node_modules is an optimisation that is only sound when the
+# lockfile is byte-identical to live's and the build tool is actually present;
+# anything else installs the declared tree fresh in the stage. A new dependency
+# can therefore never reach production uninstalled (the Node 18 ERR_REQUIRE_ESM
+# outage), and live's node_modules is never touched before the gate has passed.
+stage_rev(){
+  rm -rf "$STAGE" && mkdir -p "$STAGE" \
+    && git --work-tree="$STAGE" --git-dir="$GIT_DIR" checkout -f "$1" -- . || return 1
+  if cmp -s "$STAGE/package-lock.json" "$LIVE/package-lock.json" && [ -e "$LIVE/node_modules/.bin/esbuild" ]; then
+    ln -s "$LIVE/node_modules" "$STAGE/node_modules"
+  else
+    log "dependency tree differs from live (or build tools missing); running npm ci in the stage"
+    (cd "$STAGE" && npm ci --no-audit --no-fund) || return 1
+  fi
+}
+
+# Fail closed on a stale bundle. Twice a correct fix in client/app.js shipped
+# while users kept executing the old committed public/app.js — and the deploy
+# reported success both times, because this gate only syntax-checked the stale
+# file. Now the stage rebuilds the bundle and the push is REJECTED unless the
+# committed file is byte-identical to what this revision's source builds.
+gate(){
+  node -c "$1/server/server.js" && node -c "$1/public/app.js" && test -s "$1/public/index.html" || return 1
+  cp "$1/public/app.js" "$1/public/.app.committed.js" || return 1
+  (cd "$1" && npm run build:client) || { log "REJECTED: build:client failed"; return 1; }
+  if ! cmp -s "$1/public/app.js" "$1/public/.app.committed.js"; then
+    log "REJECTED: committed public/app.js is not what this revision's client/app.js builds. Run 'npm run build:client' and commit the bundle."
+    return 1
+  fi
+  rm -f "$1/public/.app.committed.js"
+  (cd "$1" && npm test)
+}
+
+sync_live(){
+  rsync -a --exclude='.env' --exclude='data/' --exclude='node_modules' "$STAGE/" "$LIVE/"
+  # Only when the stage installed its own tree, and only after the gate passed:
+  # live's dependencies move in the same deploy as the code that needs them,
+  # and --delete keeps removed packages from surviving forever.
+  if [ -d "$STAGE/node_modules" ] && [ ! -L "$STAGE/node_modules" ]; then
+    rsync -a --delete "$STAGE/node_modules/" "$LIVE/node_modules/"
+  fi
+}
 deploy_rev(){ stage_rev "$1" && gate "$STAGE" && sync_live && node -c "$LIVE/server/server.js"; }
 online(){ pm2 jlist | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=JSON.parse(s).find(x=>x.name==='$PM2_NAME');process.exit(p&&p.pm2_env.status==='online'?0:1)})"; }
 while read oldrev newrev ref; do
