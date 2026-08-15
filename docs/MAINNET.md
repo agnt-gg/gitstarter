@@ -3,6 +3,40 @@
 Devnet money is free, so devnet mistakes are free. Everything below exists
 because a mistake here is not.
 
+## Live since 2026-08-15
+
+| | |
+|---|---|
+| Program | `HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4` |
+| Program data | `HouLWhmifmnaNofPbbtfnViyi4aJvbSiYUwNS18ngEH7` |
+| Config | `E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2` |
+| Upgrade authority | `Efa2qpUAsUMyGDyDR7LATA6qKqxrjQQ9uuUcZthdLY3H` (2-of-3 vault) |
+| Admin (pause only) | `AactHbz74TBh1nGkEMeHaAdpwUGQHqnBrKabZefLikYj` |
+| Treasury | `6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P` |
+| Program hash | `8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9` |
+| Deployed in slot | `439347274` |
+
+Deploy cost 1.159 SOL, nearly all of it recoverable rent. The account was
+allocated at exactly the binary length, so the **next upgrade needs**
+`solana program extend HYrwoRK… 20480` first — and that now takes two signers.
+
+The first commission was run end to end with real SOL before anyone was
+invited: `CK62dCU2FbjpwKneoyHUMR1Rs5uiTskHHG5ribhZdMMq`.
+
+### What that first run found
+
+The treasury was a fresh cold wallet with no account yet. A fee is paid by
+crediting lamports directly, so paying the first one into it would have created
+the account **below the rent-exempt minimum** — and Solana rejects the entire
+transaction for that, while every instruction in the logs reports success.
+
+The first genuine milestone release on the platform would have failed, with
+nothing in the error explaining why. Devnet could never have surfaced it, because
+there the treasury was the deployer wallet and already funded.
+
+The treasury is now pre-funded, and the preflight has a blocker for it. The same
+floor applies forever: never sweep the treasury to zero.
+
 ## Preflight
 
 Everything the service needs to point at mainnet is already an environment
