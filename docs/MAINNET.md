@@ -13,7 +13,8 @@ because a mistake here is not.
 | Upgrade authority | `Efa2qpUAsUMyGDyDR7LATA6qKqxrjQQ9uuUcZthdLY3H` (2-of-3 vault) |
 | Admin (pause only) | `AactHbz74TBh1nGkEMeHaAdpwUGQHqnBrKabZefLikYj` |
 | Treasury | `6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P` |
-| Program hash | `8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9` |
+| Artifact sha256 (the .so file) | `8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9` |
+| solana-verify hash (trailing zeros stripped) | `4b420a7857def4b3b836defcf1b7657c3db7ec7e0946c16e5fd25cc71fbd6148` |
 | Deployed in slot | `439347274` |
 
 Deploy cost 1.159 SOL, nearly all of it recoverable rent. The account was

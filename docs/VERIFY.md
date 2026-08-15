@@ -10,7 +10,7 @@ it. Everything below uses public data and standard tooling.
 | Program id | `HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4` |
 | Cluster | mainnet-beta |
 | Upgrade authority | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
-| Program hash (`solana-verify`) | `8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9` |
+| Program hash (`solana-verify`) | `4b420a7857def4b3b836defcf1b7657c3db7ec7e0946c16e5fd25cc71fbd6148` |
 | Raw file sha256 | `5b59fa7604ef0c52e656ab861ec5c86c1d1a0eb409a673dd6cf35c43e0d16023` |
 | Source release | `mainnet-2026-08-15` |
 | Last deployed in slot | `439347274` |
@@ -34,7 +34,7 @@ solana-verify get-program-hash -u mainnet-beta HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6v
 It must print:
 
 ```
-8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9
+4b420a7857def4b3b836defcf1b7657c3db7ec7e0946c16e5fd25cc71fbd6148
 ```
 
 That is the value published above and in this repository's history. If it does
