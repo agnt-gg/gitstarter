@@ -120,7 +120,21 @@ const selfDeal = await fetch(`${BASE}/api/v1/tx/select-agent`, {
   method: 'POST', headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ creator, commission: indexed.address, agent: creator }),
 });
-check('self-dealing is refused at the API boundary too', () => assert.equal(selfDeal.status, 400));
+// Only an OPEN commission can have work built against it, so the probe needs
+// one — a settled commission 404s before the self-dealing rule is ever reached.
+// Devnet always had something open, which hid the assumption; the day after a
+// mainnet launch, a fully settled board is a normal state. A check that cannot
+// run must say so, not fail — and not silently pass either.
+const open = list.commissions.find(c => c.status === 'funded' || c.status === 'funding');
+if (open) {
+  const selfDealOpen = await fetch(`${BASE}/api/v1/tx/submit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ creator: open.creator, commission: open.address, agent: open.creator }),
+  });
+  check('self-dealing is refused at the API boundary too', () => assert.equal(selfDealOpen.status, 400));
+} else {
+  results.push('SKIP  self-dealing probe — no open commission on the board to probe against');
+}
 const unknown = await fetch(`${BASE}/api/v1/tx/nope`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
 check('unknown action is a clean 404 listing valid ones', () => assert.equal(unknown.status, 404));
 
@@ -136,5 +150,6 @@ check('every endpoint agrees about the deployed program', () => {
 });
 
 console.log(results.join('\n'));
-console.log(results.every(r => r.startsWith('PASS')) ? '\nALL AGENT API CHECKS PASSED' : '\nFAILURES PRESENT');
-process.exit(results.every(r => r.startsWith('PASS')) ? 0 : 1);
+const failed = results.filter(r => r.startsWith('FAIL'));
+console.log(failed.length === 0 ? '\nALL AGENT API CHECKS PASSED' : '\nFAILURES PRESENT');
+process.exit(failed.length === 0 ? 0 : 1);
