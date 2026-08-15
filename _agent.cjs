@@ -20,8 +20,11 @@ const escrow = require('./shared/escrow');
 const RPC = 'https://api.devnet.solana.com';
 const API = 'https://gitstarter.agnt.gg';
 const ctx = {
-  programId: '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy',
-  configPda: 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29',
+  // Pinned rather than fetched from /api/config, for the same reason the browser
+  // pins them: whoever can answer that endpoint would otherwise choose what this
+  // agent signs. Override by environment to point at devnet.
+  programId: process.env.PROGRAM_ID || 'HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4',
+  configPda: process.env.CONFIG_PDA || 'E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2',
   treasury: '4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY',
 };
 const agent = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(`${__dirname}/_TEST_AGENT_WALLET.json`, 'utf8'))));

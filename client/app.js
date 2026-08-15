@@ -30,11 +30,11 @@ const WALLETS = [
 // transfer of the user's whole balance into it. The server may describe
 // commissions; it may not choose what you sign.
 const PINNED = {
-  programId:'6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy',
-  configPda:'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29',
-  treasuryWallet:'4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY',
-  cluster:'devnet',
-  rpcHosts:['api.devnet.solana.com']
+  programId:'HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4',
+  configPda:'E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2',
+  treasuryWallet:'6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P',
+  cluster:'mainnet-beta',
+  rpcHosts:['api.mainnet-beta.solana.com']
 };
 function verifyConfig(config){
   for(const field of ['programId','configPda','treasuryWallet','cluster']){

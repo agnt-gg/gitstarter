@@ -7,13 +7,13 @@ it. Everything below uses public data and standard tooling.
 
 | | |
 |---|---|
-| Program id | `6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy` |
+| Program id | `HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4` |
 | Cluster | devnet |
 | Upgrade authority | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
-| Program hash (`solana-verify`) | `fb0c48de084912662c7bbf34f83a4b49012a3f860e18a44206ca667115471d5a` |
+| Program hash (`solana-verify`) | `8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9` |
 | Raw file sha256 | `5b59fa7604ef0c52e656ab861ec5c86c1d1a0eb409a673dd6cf35c43e0d16023` |
 | Source release | `devnet-2026-08-13` |
-| Last deployed in slot | `483977902` |
+| Last deployed in slot | `439347274` |
 
 The two hashes differ because they measure different things. The **program
 hash** is the ecosystem-standard measurement — `solana-verify` strips the
@@ -28,13 +28,13 @@ If you only do one thing, do this:
 
 ```bash
 cargo install solana-verify
-solana-verify get-program-hash -u devnet 6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy
+solana-verify get-program-hash -u mainnet-beta HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4
 ```
 
 It must print:
 
 ```
-fb0c48de084912662c7bbf34f83a4b49012a3f860e18a44206ca667115471d5a
+8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9
 ```
 
 That is the value published above and in this repository's history. If it does
@@ -46,7 +46,7 @@ The deployed binary carries a machine-readable contact and provenance section.
 You do not need this repository to find it:
 
 ```bash
-solana program dump 6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy /tmp/onchain.so --url devnet
+solana program dump HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4 /tmp/onchain.so --url mainnet-beta
 tr '\0' '\n' < /tmp/onchain.so | sed -n '/BEGIN SECURITY.TXT V1/,/END SECURITY.TXT V1/p'
 ```
 
@@ -95,9 +95,9 @@ badge on explorers:
 cargo install solana-verify
 solana-verify build --library-name gitstarter_escrow
 solana-verify get-executable-hash target/deploy/gitstarter_escrow.so
-solana-verify get-program-hash -u devnet 6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy
+solana-verify get-program-hash -u mainnet-beta HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4
 solana-verify verify-from-repo -u devnet \
-  --program-id 6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy \
+  --program-id HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4 \
   https://github.com/agnt-gg/gitstarter --library-name gitstarter_escrow --mount-path program
 ```
 

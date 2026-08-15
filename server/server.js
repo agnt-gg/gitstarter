@@ -11,15 +11,22 @@ const escrow = require('../shared/escrow');
 const { llmsTxt } = require('./llms');
 
 const PORT = Number(process.env.PORT || 3417);
-const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+// Defaults describe the network this build is FOR, not a safer-looking one.
+//
+// They used to be devnet, on the reasoning that an unconfigured server should
+// not touch real money. That stopped being true when the browser began pinning
+// its addresses: a devnet-defaulting server now serves a config the client
+// refuses outright, so the "safe" default produces a broken app rather than a
+// cautious one. Devnet work is a devnet build, with these set explicitly.
+const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 // The server's own RPC endpoint may embed a provider API key. Browsers get a
 // keyless endpoint instead, so /api/config can never hand out billing credentials.
 const PUBLIC_RPC_URL = process.env.PUBLIC_SOLANA_RPC_URL
-  || (/api-key|\?/i.test(RPC_URL) ? 'https://api.devnet.solana.com' : RPC_URL);
-const CLUSTER = process.env.SOLANA_CLUSTER || 'devnet';
-const PROGRAM_ID = process.env.PROGRAM_ID || '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
-const TREASURY_WALLET = process.env.TREASURY_WALLET || '4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY';
-const CONFIG_PDA = process.env.CONFIG_PDA || 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29';
+  || (/api-key|\?/i.test(RPC_URL) ? 'https://api.mainnet-beta.solana.com' : RPC_URL);
+const CLUSTER = process.env.SOLANA_CLUSTER || 'mainnet-beta';
+const PROGRAM_ID = process.env.PROGRAM_ID || 'HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4';
+const TREASURY_WALLET = process.env.TREASURY_WALLET || '6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P';
+const CONFIG_PDA = process.env.CONFIG_PDA || 'E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2';
 const DB_PATH = path.resolve(process.env.DATABASE_PATH || path.join(__dirname, '..', 'data', 'gitstarter.sqlite'));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 // __Host- forbids a Domain attribute and requires Secure + Path=/, so a

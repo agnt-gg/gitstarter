@@ -15,6 +15,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import escrow from '../shared/escrow.js';
+import { Connection, PublicKey } from '@solana/web3.js';
+import * as multisig from '@sqds/multisig';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -64,10 +66,42 @@ try {
   } else {
     const programData = await rpc('getAccountInfo', [programDataAddress, { encoding: 'jsonParsed', commitment: 'confirmed' }]);
     authority = programData?.value?.data?.parsed?.info?.authority ?? null;
+    // Three acceptable answers, not one.
+    //
+    // The first version of this only passed on `authority === null`, which meant
+    // it went on reporting a hot key after the authority had been handed to a
+    // 2-of-3 multisig — the exact thing it was asking for. A check that cannot
+    // recognise success is a check people learn to ignore.
+    //
+    // A multisig is verified rather than asserted: MULTISIG_ADDRESS only says
+    // where to look, and the vault is re-derived from it and compared to the
+    // authority actually on chain, then the multisig's own threshold and config
+    // authority are read. Pointing this at the wrong account proves nothing and
+    // fails.
+    let multisigDetail = null;
+    if (authority !== null && process.env.MULTISIG_ADDRESS) {
+      try {
+        const ms = new PublicKey(process.env.MULTISIG_ADDRESS);
+        const [vault] = multisig.getVaultPda({ multisigPda: ms, index: 0 });
+        if (vault.toBase58() === authority) {
+          const account = await multisig.accounts.Multisig.fromAccountAddress(
+            new Connection(RPC, 'confirmed'), ms);
+          const noConfigAuthority = account.configAuthority.toBase58() === PublicKey.default.toBase58();
+          if (account.threshold >= 2 && noConfigAuthority) {
+            multisigDetail = `${account.threshold} of ${account.members.length} multisig `
+              + `(${process.env.MULTISIG_ADDRESS}), no config authority`;
+          } else if (!noConfigAuthority) {
+            multisigDetail = null; // a config authority can drop the threshold to 1 alone
+          }
+        }
+      } catch { /* falls through to the hot-key verdict below */ }
+    }
+
     check('blocker', 'upgrade authority is not a single hot key',
-      authority === null,
+      authority === null || multisigDetail !== null,
       authority === null
         ? 'none — the program is immutable and nobody can swap it'
+        : multisigDetail ? multisigDetail
         : `${authority} can replace this program at any time, and with it every vault it holds. `
           + 'Renounce it (solana program set-upgrade-authority --final), or move it behind a multisig or timelock.');
   }
@@ -150,6 +184,33 @@ if (config) {
 
   check('warn', 'the board is not paused', !config.paused,
     config.paused ? 'new commissions and pledges are currently blocked' : 'accepting work');
+
+  // The treasury must already be rent-exempt, or the first release fails.
+  //
+  // Found by running a real commission on a freshly deployed mainnet. A fee is
+  // paid by crediting lamports directly, so paying one into an account that
+  // does not exist yet would create it below the rent-exempt minimum — and
+  // Solana rejects the WHOLE transaction for that, with every instruction
+  // reporting success in the logs. The agent simply cannot be paid, and nothing
+  // in the error says why.
+  //
+  // Devnet could never surface this: there the treasury was the deployer
+  // wallet, already funded. It is specific to the cold treasury a real launch
+  // uses, and it would have hit the first genuine release on the platform.
+  //
+  // The same floor applies forever: a sweep that empties the treasury closes
+  // the account and breaks the next release, which is why treasury-status.mjs
+  // says to leave the minimum behind.
+  try {
+    const balance = (await rpc('getBalance', [config.treasury, { commitment: 'confirmed' }]))?.value ?? 0;
+    const RENT_EXEMPT_MINIMUM = 890_880;
+    check('blocker', 'the treasury can actually receive a fee',
+      balance >= RENT_EXEMPT_MINIMUM,
+      balance >= RENT_EXEMPT_MINIMUM
+        ? `${(balance / 1e9).toFixed(6)} SOL, rent-exempt`
+        : `${(balance / 1e9).toFixed(6)} SOL — below the ${RENT_EXEMPT_MINIMUM / 1e9} SOL rent-exempt minimum, `
+          + 'so the first milestone release will fail with every instruction reporting success');
+  } catch { check('blocker', 'the treasury can actually receive a fee', false, 'could not read the balance'); }
 }
 
 // ── 3. Nothing may be running on a default ──────────────────────────────────

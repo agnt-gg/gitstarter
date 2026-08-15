@@ -11,8 +11,16 @@ test.before(async () => { server = app.listen(0, '127.0.0.1'); await new Promise
 test.after(async () => { await new Promise(r => server.close(r)); db.close(); });
 test('health and public config expose no secrets', async () => {
   const health = await fetch(base + '/api/health').then(r => r.json());
-  assert.deepEqual(health, { ok: true, database: 'sqlite', cluster: 'devnet' });
   const config = await fetch(base + '/api/config').then(r => r.json());
+  // Which network this is depends on deployment; that it is a real one, and
+  // that both endpoints agree about it, does not. Pinning the literal made this
+  // test fail on a correct mainnet build — a test about secrets should not have
+  // an opinion about the cluster.
+  assert.equal(health.ok, true);
+  assert.equal(health.database, 'sqlite');
+  assert.ok(['mainnet-beta', 'devnet', 'testnet'].includes(health.cluster), health.cluster);
+  assert.equal(health.cluster, config.cluster, 'health and config must not disagree about the network');
+  assert.deepEqual(Object.keys(health).sort(), ['cluster', 'database', 'ok']);
   assert.equal(config.feeBasisPoints, 100);
   assert.equal(config.settlementAsset, 'SOL');
   assert.equal(config.lamportsPerSol, 1_000_000_000);

@@ -58,8 +58,12 @@ solana_security_txt::security_txt! {
     policy: "https://github.com/agnt-gg/gitstarter/blob/main/SECURITY.md",
     preferred_languages: "en",
     source_code: "https://github.com/agnt-gg/gitstarter",
-    source_release: "devnet-2026-08-13",
-    auditors: "None. Internal adversarial review only - see docs/MECHANICS.md",
+    source_release: "mainnet-2026-08-15",
+    // Read by explorers, so it is the first thing a stranger learns about this
+    // program. Overstating it would be worse than declaring nothing at all, and
+    // the cap belongs here rather than only in the UI: somebody checking a
+    // program id on an explorer is doing exactly the diligence this is for.
+    auditors: "NONE - no external audit. Internal adversarial review only. Escrow is capped at 5 SOL per commission; see docs/RISK-ACCEPTED.md",
     acknowledgements: "Disclose privately before exploiting and you will be credited here."
 }
 

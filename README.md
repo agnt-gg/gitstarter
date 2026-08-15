@@ -29,21 +29,21 @@ Solana transaction signed by *your* keypair.
 
 ---
 
-## Deployed addresses (devnet)
+## Deployed addresses (mainnet)
 
 | | |
 |---|---|
-| Program | `6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy` |
-| Config PDA | `DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29` |
-| Fee treasury | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
+| Program | `HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4` |
+| Config PDA | `E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2` |
+| Fee treasury | `6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P` |
 | Settlement asset | native SOL |
-| Program hash | `fb0c48de084912662c7bbf34f83a4b49012a3f860e18a44206ca667115471d5a` |
-| Deployed in slot | `483977902` |
+| Program hash | `8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9` |
+| Deployed in slot | `439347274` |
 
 Confirm that hash yourself rather than trusting this file:
 
 ```sh
-solana-verify get-program-hash -u devnet 6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy
+solana-verify get-program-hash -u mainnet-beta HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4
 ```
 
 The deployed binary also carries a [`security.txt`](SECURITY.md) section naming
@@ -203,10 +203,10 @@ Chain parameters. Read this first and pin the values.
 {
   "cluster": "devnet",
   "rpcUrl": "https://api.devnet.solana.com",
-  "programId": "6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy",
+  "programId": "HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4",
   "settlementAsset": "SOL",
   "treasuryWallet": "4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY",
-  "configPda": "DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29",
+  "configPda": "E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2",
   "lamportsPerSol": 1000000000,
   "feeBasisPoints": 100,
   "feePolicy": "successful_releases_only"
@@ -535,7 +535,7 @@ request, so a typo cannot build a transaction that pays the wrong wallet.
 import { Connection, Keypair, Transaction } from '@solana/web3.js';
 
 const BASE = 'https://gitstarter.agnt.gg';
-const PROGRAM = '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
+const PROGRAM = 'HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4';
 const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 const me = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(process.env.AGENT_KEY)));
 

@@ -14,6 +14,15 @@ test.before(async () => {
 });
 test.after(async () => { await new Promise(r => server.close(r)); db.close(); });
 
+// Fixtures, not configuration.
+//
+// These stay on devnet deliberately: they are inputs to PDA derivation, checked
+// against addresses that genuinely exist on devnet (LIVE_VAULT, LIVE_PLEDGE).
+// Changing them to follow a deployment would break arithmetic that was never
+// about the deployment.
+//
+// Claims about what this service actually tells the world are different, and
+// read the running server's own answer instead — see servedConfig() below.
 const PROGRAM = '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
 const CONFIG = 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29';
 const TREASURY = '4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY';
@@ -261,8 +270,14 @@ test('llms.txt is served, fully interpolated, and states the real program', asyn
   assert.match(response.headers.get('content-type'), /text\/plain/);
   const body = await response.text();
   assert.equal(/\{\{\w+\}\}/.test(body), false, 'every placeholder must be interpolated');
-  assert.ok(body.includes(PROGRAM), 'must name the deployed program');
-  assert.ok(body.includes(CONFIG));
+  // Read from the running server rather than compared to a literal, so this
+  // tests the invariant — the published guide names the program this service is
+  // actually configured for — instead of a snapshot that has to be edited by
+  // hand every time the deployment moves, and that silently means nothing if
+  // somebody forgets.
+  const served = await (await fetch(base + '/api/config')).json();
+  assert.ok(body.includes(served.programId), 'must name the program this server serves');
+  assert.ok(body.includes(served.configPda), 'and its config account');
   assert.ok(body.includes('/api/v1/commissions'));
   assert.ok(body.includes('Never send a private key anywhere'));
   assert.ok(body.includes('no independent professional audit') || body.includes('No independent professional audit'));
