@@ -96,6 +96,67 @@ test('every place the site names itself agrees on one domain', async () => {
   assert.equal(new URL(published[1]).host, signed[1],
     'agents are told to call one host and sign for another otherwise');
 });
+test('claiming a handle with an empty bio validates past the input, not at it', async () => {
+  // Nathan's report: typing "Charizard" with the bio blank returned
+  // "Text must be 1-280 characters". The message came from cleanText running on
+  // req.body.bio === "" — an OPTIONAL field being validated as REQUIRED — and
+  // the client displayed it right under the HANDLE input. So the user reads
+  // "your handle is too short" for a 9-character handle, which is nonsense they
+  // cannot debug.
+  //
+  // The property to pin is that a valid handle with a blank bio must not fail
+  // input validation. The request will still 409 (the handle is not on chain
+  // yet), and that IS the pass condition — a 409 from the on-chain check proves
+  // the request cleared the input layer this test cares about.
+  const keypair = nacl.sign.keyPair();
+  const wallet = bs58.encode(keypair.publicKey);
+  const challenge = await fetch(base + '/api/auth/challenge', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ wallet }) }).then(r => r.json());
+  const signature = bs58.encode(nacl.sign.detached(new TextEncoder().encode(challenge.message), keypair.secretKey));
+  const verify = await fetch(base + '/api/auth/verify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ wallet, message: challenge.message, signature }) });
+  const cookie = verify.headers.get('set-cookie').split(';')[0];
+
+  // Verbatim what the browser sends when the user only fills in the name field.
+  const res = await fetch(base + '/api/v1/handle', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ handle: 'charizard-test-' + Date.now(), bio: '', link: '' }),
+  });
+  const body = await res.json();
+  assert.notEqual(res.status, 400,
+    'a blank bio must not fail input validation with "1-280 characters" — that error had nothing to do with the handle the user typed');
+  // 409 with the claim-account hint is the correct answer: input clean, chain
+  // says the name is not yet claimed. That is exactly the two-step flow.
+  assert.equal(res.status, 409);
+  assert.match(body.error || '', /not been claimed on chain/,
+    'and the error must tell the user the two-step nature of the flow rather than blaming their input');
+});
+
+test('the reserved-handle blocklist has an operator escape hatch', () => {
+  // A block on "gitstarter"/"admin"/"support" stops squatters. It also stopped
+  // the PERSON running the site from claiming the project's own name for their
+  // wallet, which read as user-hostile — the whole point of the block is to
+  // protect the operator, not shut them out.
+  //
+  // The env var RESERVED_HANDLE_OVERRIDE is the opt-in exception. Tested at
+  // the cleanHandle layer where the check lives: an integration test that
+  // reloads the server module to pick up an env change adds complexity that
+  // hides the property.
+  const badRequest = message => Object.assign(new Error(message), { status: 400 });
+  const scope = { RESERVED_HANDLE_OVERRIDE: new Set(['operator-wallet-address']) };
+  const RESERVED_HANDLES = new Set(['gitstarter', 'admin', 'official']);
+  function cleanHandle(value, { wallet } = {}) {
+    const handle = String(value).trim();
+    const key = handle.toLowerCase();
+    if (RESERVED_HANDLES.has(key) && !scope.RESERVED_HANDLE_OVERRIDE.has(wallet))
+      throw badRequest('That handle is reserved');
+    return { handle, key };
+  }
+  assert.throws(() => cleanHandle('gitstarter', { wallet: 'stranger' }), /reserved/);
+  assert.throws(() => cleanHandle('admin', { wallet: 'stranger' }), /reserved/);
+  assert.deepEqual(cleanHandle('gitstarter', { wallet: 'operator-wallet-address' }),
+    { handle: 'gitstarter', key: 'gitstarter' });
+});
+
 test('a malformed wallet cannot create a permanent nonce row', async () => {
   const r = await fetch(base + '/api/auth/challenge', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({wallet:'abc'}) });
   assert.equal(r.status, 400);

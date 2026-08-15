@@ -932,7 +932,17 @@ const RESERVED_HANDLES = new Set([
   'agnt', 'solana', 'api', 'www', 'null', 'undefined', 'anonymous', 'me', 'you',
 ]);
 
-function cleanHandle(value) {
+/// Wallets exempt from the reserved-name blocklist.
+///
+/// A defensive default that stops anyone claiming "admin" or "official" reads
+/// as user-hostile the moment the PERSON running the site cannot claim their
+/// own project name. This env var is the escape hatch — comma-separated list
+/// of wallet addresses that may take a reserved handle for themselves.
+const RESERVED_HANDLE_OVERRIDE = new Set(
+  (process.env.RESERVED_HANDLE_OVERRIDE || '').split(',').map(w => w.trim()).filter(Boolean),
+);
+
+function cleanHandle(value, { wallet } = {}) {
   const handle = cleanText(value, 32);
   // Deliberately narrow: no spaces, no punctuation, no mixed scripts. A name
   // that can contain a Cyrillic "a" is a name that can impersonate.
@@ -940,7 +950,7 @@ function cleanHandle(value) {
     throw badRequest('A handle is 3 to 32 characters, letters, numbers and hyphens, starting and ending with a letter or number');
   }
   const key = handle.toLowerCase();
-  if (RESERVED_HANDLES.has(key)) throw badRequest('That handle is reserved');
+  if (RESERVED_HANDLES.has(key) && !RESERVED_HANDLE_OVERRIDE.has(wallet)) throw badRequest('That handle is reserved');
   // A name that looks like an address is a name designed to be mistaken for one.
   if (/^[1-9A-HJ-NP-Za-km-z]{32,}$/.test(handle)) throw badRequest('A handle may not look like a wallet address');
   return { handle, key };
@@ -964,8 +974,12 @@ function handlesFor(wallets) {
 /// Claim or update the name on the signed-in wallet.
 app.post('/api/v1/handle', requireAuth, async (req, res, next) => {
   try {
-    const { handle, key } = cleanHandle(req.body.handle);
-    const bio = req.body.bio == null ? '' : cleanText(req.body.bio, 280);
+    const { handle, key } = cleanHandle(req.body.handle, { wallet: req.wallet });
+    // Optional fields collapse to '' rather than being validated as if they were
+    // required. cleanText refuses an empty string with a generic "1-280 chars"
+    // error, which surfaced next to the HANDLE input as if the handle were
+    // wrong — a confusing failure for anyone who left the bio blank.
+    const bio = req.body.bio ? cleanText(req.body.bio, 280) : '';
     const link = req.body.link ? cleanHttpUrl(req.body.link) : '';
 
     // The chain decides who holds a name; this only records what it says.

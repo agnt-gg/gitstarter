@@ -34,6 +34,11 @@ PUBLIC_BASE_URL=https://gitstarter.xyz
 # The watchdog probes the public site, so it must probe the canonical name —
 # pointed at the old one it would only ever be measuring the redirect.
 HEALTHCHECK_URL=https://gitstarter.xyz
+# Wallets that may claim otherwise-reserved handles (gitstarter, admin, ...).
+# Comma-separated. Deliberately opt-in: the blocklist protects users from
+# squatters, but the person RUNNING the site should be able to claim the
+# project's own name for their operator wallet.
+RESERVED_HANDLE_OVERRIDE=2B8YDoo4Q3JJZuuGqqqVP86xoahgMsqREr3ScxhGS8C5
 # Paths on disk, deliberately unchanged: the site is renamed, the directory
 # layout is not, and moving it would break the deploy hook and every backup path.
 DATABASE_PATH=/var/www/gitstarter.agnt.gg/data/gitstarter-mainnet.sqlite
