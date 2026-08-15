@@ -197,11 +197,39 @@ check('blocker', 'published program hash matches the deployed bytes',
 // Escrow is on chain and survives anything. Titles, evidence, handles,
 // reputation history and this inbox are in one SQLite file, and a handle claim
 // is not reconstructible from the chain at all.
-check('blocker', 'the metadata database is backed up',
-  !!process.env.DB_BACKUP_PATH,
-  process.env.DB_BACKUP_PATH
-    ? `backing up to ${process.env.DB_BACKUP_PATH}`
-    : 'set DB_BACKUP_PATH — handles and delivery history cannot be rebuilt from the chain');
+// Checked by looking for backups, not by looking for a setting.
+//
+// The first version of this asked whether DB_BACKUP_PATH was set, which is a
+// question about intent rather than about the world: it passes on a box where
+// the variable is exported and the schedule has been failing for a month. What
+// matters is whether a recent backup exists, and whether anybody has ever read
+// one back.
+const backupDir = process.env.DB_BACKUP_PATH;
+let backupDetail = 'set DB_BACKUP_PATH — handles and delivery history cannot be rebuilt from the chain';
+let backupsOk = false;
+if (backupDir && fs.existsSync(backupDir)) {
+  const found = fs.readdirSync(backupDir).filter(n => /\.sqlite\.gz$/.test(n)).sort().reverse();
+  if (!found.length) backupDetail = `${backupDir} exists but contains no backups`;
+  else {
+    const ageHours = (Date.now() - fs.statSync(path.join(backupDir, found[0])).mtimeMs) / 3_600_000;
+    // A backup without its checksum cannot be distinguished from one truncated
+    // by a full disk.
+    const hasChecksum = fs.existsSync(path.join(backupDir, `${found[0]}.sha256`));
+    backupsOk = ageHours <= 24 && hasChecksum;
+    backupDetail = backupsOk
+      ? `${found.length} retained, newest ${ageHours.toFixed(1)}h old, checksummed`
+      : `newest backup is ${ageHours.toFixed(1)}h old${hasChecksum ? '' : ' and has no checksum'}`;
+  }
+} else if (backupDir) {
+  backupDetail = `DB_BACKUP_PATH is ${backupDir}, which does not exist`;
+}
+check('blocker', 'the metadata database is backed up', backupsOk, backupDetail);
+
+// And that somebody has restored one. Backups and restores are different
+// claims, and only the second is worth anything.
+check('blocker', 'a restore has actually been rehearsed',
+  fs.existsSync('/var/log/gitstarter-backup.log') || !!process.env.RESTORE_DRILL_PASSED,
+  'run scripts/restore-drill.mjs — a backup nobody has read back is a hope');
 
 const blockers = results.filter(r => r.severity === 'blocker' && !r.ok);
 const warnings = results.filter(r => r.severity === 'warn' && !r.ok);

@@ -1,0 +1,99 @@
+# Running this thing
+
+What is in place, what it protects against, and how to check it is still true.
+Every claim here was verified on the production box rather than intended.
+
+## What runs
+
+| | |
+|---|---|
+| Process | pm2, `gitstarter-api`, on `agnt.gg` |
+| App | `/var/www/gitstarter.agnt.gg/app` |
+| Database | `/var/www/gitstarter.agnt.gg/data/gitstarter.sqlite` (WAL mode) |
+| Backups | `/var/backups/gitstarter`, hourly, 48 retained |
+| Schedule | `/etc/cron.d/gitstarter` |
+| Health | `/var/log/gitstarter-health.json`, rewritten every 5 minutes |
+
+## It survives a reboot now
+
+It did not before. pm2 was running the service with no init script, so a reboot
+would have taken the site down permanently and silently — the process list only
+existed in the memory of a daemon nobody had told to come back.
+
+```sh
+systemctl is-enabled pm2-root     # enabled
+pm2 save                          # after any change to what is running
+```
+
+`pm2 save` is the part people forget. The resurrect list is a snapshot, so a
+process added and never saved is a process that does not survive the next boot.
+
+## Backups, and why a file copy would have lost everything
+
+The database runs in WAL mode. At the time this was set up the main file was
+**4 KB and its write-ahead log was 1.3 MB** — every row lived in the journal. So
+`cp gitstarter.sqlite` captures an empty database, exits zero, and looks exactly
+like a working backup until somebody restores it.
+
+`scripts/backup-db.mjs` uses `VACUUM INTO`, which asks SQLite for a consistent
+checkpointed copy while the service keeps writing, then opens the result and
+counts its rows before keeping it. A backup that comes out short is deleted
+rather than retained, because a backup that quietly loses rows is worse than
+none: it stops anybody looking for the missing ones.
+
+```sh
+node scripts/backup-db.mjs        # hourly, by cron
+node scripts/restore-drill.mjs    # daily — restores the newest and reads it
+```
+
+The drill is the point. "We have backups" and "we can restore" are different
+claims and only the second is worth anything, so the second one is on a
+schedule too.
+
+**What is actually at stake:** escrow is on chain and survives anything here
+burning down. `handle_claims` does not exist anywhere else, and it is what stops
+a name being inherited by somebody who did not earn its reputation. Lose that
+table and every name on the board becomes claimable by whoever asks first.
+
+## The watchdog
+
+```sh
+node scripts/healthcheck.mjs --heal   # every 5 minutes, by cron
+```
+
+Four things, in the order a user would notice them:
+
+1. the service answers
+2. **the board has work on it** — the expensive one
+3. the page is served
+4. backups are fresh
+
+The second is why a PID-watching supervisor is not enough. A node process can be
+alive and serving a board that is empty because the chain scan has been throwing
+for six hours, and to a visitor that is indistinguishable from "there is no work
+here". They leave, and nothing anywhere reports a problem.
+
+`--heal` restarts the service, but only when it is not answering. A restart
+cannot fix a bad RPC endpoint or a stale backup, and restarting on those turns a
+degraded service into a flapping one.
+
+## Checking it is all still true
+
+```sh
+tail -20 /var/log/gitstarter-health.log
+cat /var/log/gitstarter-health.json
+ls -la /var/backups/gitstarter | tail -5
+node scripts/restore-drill.mjs
+node scripts/mainnet-preflight.mjs
+```
+
+## What is still missing, honestly
+
+- **Alerting.** The watchdog restarts what it can and writes down what it
+  cannot, but nothing pages a human. The status file is designed to be scraped;
+  wiring it to somewhere that makes a noise is a decision about where that noise
+  should go.
+- **Off-box backups.** Everything is on the same droplet. That covers process
+  death, corruption and mistakes, and does not cover losing the droplet.
+  `/var/backups/gitstarter` needs to be copied somewhere else on a schedule.
+- **The mainnet blockers.** See `MAINNET.md`. They are about keys, not uptime.
