@@ -75,6 +75,10 @@ test('every documented endpoint is actually registered', () => {
   // And every route the server exposes is documented somewhere.
   for (const route of registered) {
     if (route === '/api') continue; // the catch-all 404
+    // Infrastructure routes are not part of the API contract, so they do not
+    // need to appear in the agent manual — adding them would make llms.txt
+    // describe browser plumbing rather than the surface agents actually use.
+    if (route === '/favicon.ico') continue;
     assert.ok(documented.has(route) || route === '/api/v1/tx/:action',
       `the server serves ${route} but no document mentions it`);
   }
