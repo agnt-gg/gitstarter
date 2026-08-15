@@ -1,9 +1,0 @@
-=== live now, actually sync + restart ===
---- verify sync worked ---
-982:    const bio = req.body.bio ? cleanText(req.body.bio, 280) : '';
-41:RESERVED_HANDLE_OVERRIDE=2B8YDoo4Q3JJZuuGqqqVP86xoahgMsqREr3ScxhGS8C5
---- restart service ---
-[PM2] Successfully saved in /root/.pm2/dump.pm2
-{"ok":true,"database":"sqlite","cluster":"mainnet-beta"}
-{"cluster":"mainnet-beta","rpcUrl":"https://solana-rpc.publicnode.com","programId":"HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4","settlementAsset":"SOL","treasuryWallet":"6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P","configPda":"E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2","lamportsPerSol":1000000000,"feeBasisPoints":100,"feePolicy":"charged_once_per_lamport_when_work_was_delivered","feeExplainer":"The protocol charges 1% for connecting the parties and carrying real work between them. It applies to a milestone release, and to a refund only if a delivery was ever submitted. A commission that never saw a delivery costs nothing."}
---- env picked up ---
