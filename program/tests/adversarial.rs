@@ -87,8 +87,19 @@ async fn balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
 }
 
 async fn warp_past(ctx: &mut ProgramTestContext, deadline: i64) {
+    // Setting unix_timestamp alone is not enough. The test bank re-derives the
+    // clock from its SLOT estimate (~400ms per slot) at bank boundaries, so a
+    // timestamp pinned with set_sysvar silently regresses if a boundary lands
+    // between the warp and the transaction under test — which is exactly what
+    // happened on a loaded machine and never on a fast one. Advance the slot
+    // far enough that even a recomputed estimate is past the deadline, then
+    // pin the timestamp for the bank we are actually in.
     let mut clock: Clock = ctx.banks_client.get_sysvar().await.unwrap();
-    clock.unix_timestamp = deadline + 1;
+    let seconds_short = (deadline + 1 - clock.unix_timestamp).max(1) as u64;
+    let slots_needed = seconds_short * 5 / 2 + 100; // 2.5 slots per second, plus margin
+    ctx.warp_to_slot(clock.slot + slots_needed).unwrap();
+    clock = ctx.banks_client.get_sysvar().await.unwrap();
+    clock.unix_timestamp = clock.unix_timestamp.max(deadline + 1);
     ctx.set_sysvar(&clock);
 }
 
