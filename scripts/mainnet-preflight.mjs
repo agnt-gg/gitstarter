@@ -225,11 +225,23 @@ if (backupDir && fs.existsSync(backupDir)) {
 }
 check('blocker', 'the metadata database is backed up', backupsOk, backupDetail);
 
-// And that somebody has restored one. Backups and restores are different
-// claims, and only the second is worth anything.
-check('blocker', 'a restore has actually been rehearsed',
-  fs.existsSync('/var/log/gitstarter-backup.log') || !!process.env.RESTORE_DRILL_PASSED,
-  'run scripts/restore-drill.mjs — a backup nobody has read back is a hope');
+// And that somebody has restored one, recently. Backups and restores are
+// different claims and only the second is worth anything — and a restore that
+// worked in March says nothing about the backup taken last night.
+const RECEIPT = process.env.RESTORE_DRILL_RECEIPT || '/var/log/gitstarter-restore-drill.json';
+let drillOk = false;
+let drillDetail = 'never run — a backup nobody has read back is a hope, not a backup';
+if (fs.existsSync(RECEIPT)) {
+  try {
+    const receipt = JSON.parse(fs.readFileSync(RECEIPT, 'utf8'));
+    const ageHours = (Date.now() - new Date(receipt.at).getTime()) / 3_600_000;
+    drillOk = receipt.passed === true && ageHours <= 48;
+    drillDetail = receipt.passed
+      ? `last passed ${ageHours.toFixed(1)}h ago against ${receipt.backup}`
+      : `last run FAILED: ${(receipt.failures || []).join('; ')}`;
+  } catch (error) { drillDetail = `unreadable receipt: ${error.message}`; }
+}
+check('blocker', 'a restore has actually been rehearsed', drillOk, drillDetail);
 
 const blockers = results.filter(r => r.severity === 'blocker' && !r.ok);
 const warnings = results.filter(r => r.severity === 'warn' && !r.ok);

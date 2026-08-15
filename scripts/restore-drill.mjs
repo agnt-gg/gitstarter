@@ -98,10 +98,31 @@ if (drift && Object.keys(drift).length) {
 }
 if (ageHours > 48) console.log(`\n  \u26a0 this backup is ${Math.floor(ageHours / 24)} days old \u2014 is the schedule still running?`);
 
+// A receipt, written only on success and only by an actual restore.
+//
+// The preflight used to satisfy itself that a log file existed, which is a
+// question about whether anything has ever been written rather than about
+// whether a restore worked. This records what was restored and when, so a stale
+// pass is visible as stale rather than counting forever.
+const RECEIPT = process.env.RESTORE_DRILL_RECEIPT || '/var/log/gitstarter-restore-drill.json';
 if (failures.length) {
   console.log('\nDRILL FAILED');
   for (const failure of failures) console.log(`  \u2022 ${failure}`);
+  try {
+    fs.writeFileSync(RECEIPT, JSON.stringify({
+      at: new Date().toISOString(), passed: false, backup: path.basename(newest), failures,
+    }, null, 2));
+  } catch { /* the exit code is the real signal */ }
   process.exit(1);
 }
+try {
+  fs.writeFileSync(RECEIPT, JSON.stringify({
+    at: new Date().toISOString(),
+    passed: true,
+    backup: path.basename(newest),
+    backupAgeHours: Number(ageHours.toFixed(2)),
+    restoredRows: counts,
+  }, null, 2));
+} catch { /* never fail a passing drill on bookkeeping */ }
 console.log('\nDRILL PASSED \u2014 this backup was restored and read, not merely written.');
 process.exit(0);
