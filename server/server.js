@@ -1607,6 +1607,13 @@ app.get('/llms.txt', (_req, res) => {
 });
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
+// The HTML declares the icon at /favicon.svg, so every actual browser follows
+// that link. But tools, previewers and scrapers still probe /favicon.ico
+// blindly; without this they would hit the SPA fallback below and be handed
+// 46 KB of HTML labelled as text/html, which some of them try to parse as an
+// image and quietly cache as broken.
+app.get('/favicon.ico', (_req, res) => res.type('image/svg+xml')
+  .sendFile(path.join(PUBLIC_DIR, 'favicon.svg')));
 app.use(express.static(PUBLIC_DIR, { etag: true, maxAge: '1h', index: 'index.html' }));
 app.get(/^(?!\/api(?:\/|$)).*/, (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
 app.use((error, _req, res, _next) => {
