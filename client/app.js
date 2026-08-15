@@ -587,7 +587,7 @@ function render(){
   $('wBal').textContent=wallet?'refreshing…':'connect wallet'; $('wProj').textContent=wallet?state.projects.filter(p=>p.creator===wallet).length:'—';
   if(wallet)loadBalance();
 }
-async function loadBalance(){try{const lamports=await state.connection.getBalance(state.wallet);$('wBal').textContent=fmtBase(lamports)+' SOL';}catch{$('wBal').textContent='— SOL';}}
+async function loadBalance(){try{const lamports=await callWithFailover('getBalance',state.wallet);$('wBal').textContent=fmtBase(lamports)+' SOL';}catch{$('wBal').textContent='— SOL';}}
 /// What this wallet is part of, on both sides, past and present.
 ///
 /// Kept separate from the board on purpose. The board answers "what work
