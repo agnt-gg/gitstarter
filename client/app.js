@@ -274,17 +274,35 @@ async function send(transaction,onStage=()=>{}){
     sig=await state.connection.sendRawTransaction(signed.serialize(),{skipPreflight:false,maxRetries:3});
   }
   onStage('Confirming on Solana\u2026');
-  const confirmation=await state.connection.confirmTransaction(sig,'confirmed');
 
-  // Remember the slot that confirmed us.
+  // Poll getSignatureStatuses instead of subscribing over WebSocket.
   //
-  // The public RPC endpoint is a pool of nodes. `confirmTransaction` can be
-  // satisfied by one node while the very next read is served by another that has
-  // not caught up, which is why a pledge could confirm and still show as
-  // unfunded until a manual reload. Pinning subsequent reads to this slot makes
-  // a stale node say so instead of quietly answering with old state.
-  const slot=confirmation?.context?.slot;
-  if(slot)state.minContextSlot=Math.max(state.minContextSlot||0,slot);
+  // publicnode.com's HTTP RPC is fast and CORS-friendly, but its WSS accepts
+  // signatureSubscribe connections and NEVER replies — connections just hang
+  // for 60 seconds until web3.js gives up. In DevTools that reads as "pending
+  // forever", which is the exact symptom that made a claimed handle look
+  // broken even though the transaction had already landed on chain.
+  //
+  // Polling every 1.5s costs one small HTTP call per second, keeps the RPC
+  // pool consistent with everything else the client does, and lets us give the
+  // user honest progress instead of a spinner that means nothing.
+  const deadline=Date.now()+60_000;
+  let status=null;
+  while(Date.now()<deadline){
+    await new Promise(r=>setTimeout(r,1500));
+    const res=await state.connection.getSignatureStatuses([sig]);
+    status=res.value?.[0];
+    if(status?.err)throw new Error(`The network rejected this transaction: ${JSON.stringify(status.err)}`);
+    if(status?.confirmationStatus==='confirmed'||status?.confirmationStatus==='finalized')break;
+  }
+  if(!status?.confirmationStatus){
+    throw new Error('The transaction did not confirm within a minute. It may still land \u2014 check your wallet history before retrying, so you do not pay twice.');
+  }
+
+  // Remember the slot that confirmed us. Pinning subsequent reads to this slot
+  // makes a stale node in the RPC pool say so instead of quietly answering with
+  // old state — a pledge could otherwise confirm and still show as unfunded.
+  if(status.slot)state.minContextSlot=Math.max(state.minContextSlot||0,status.slot);
   return sig;
 }
 
