@@ -16,8 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { Connection, PublicKey } from '@solana/web3.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const RPC = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
-const PROGRAM = process.env.PROGRAM_ID || '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
+const RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const PROGRAM = process.env.PROGRAM_ID || 'HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4';
 
 /// ProgramData layout: 4-byte tag, 8-byte slot, 1-byte option, 32-byte authority.
 const PROGRAM_DATA_HEADER = 45;

@@ -14,6 +14,9 @@ cd /var/www/gitstarter.agnt.gg/app
 cat > .env.runtime <<'ENVEOF'
 PORT=3417
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+# What BROWSERS are handed. Different from the server's endpoint on purpose:
+# api.mainnet-beta 403s any request with an Origin header, i.e. every browser.
+PUBLIC_SOLANA_RPC_URL=https://solana-rpc.publicnode.com
 SOLANA_CLUSTER=mainnet-beta
 PROGRAM_ID=HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4
 TREASURY_WALLET=6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P

@@ -18,12 +18,15 @@ import {
 } from '@solana/web3.js';
 import escrow from '../shared/escrow.js';
 
+// Defaults to the LIVE deployment. Point it at devnet explicitly when cleaning
+// up devnet debris — a safety-net script that silently targets the wrong chain
+// reports "nothing to sweep" and everyone believes it.
 const ctx = {
-  programId: '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy',
-  configPda: 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29',
-  treasury: '4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY',
+  programId: process.env.PROGRAM_ID || 'HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4',
+  configPda: process.env.CONFIG_PDA || 'E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2',
+  treasury: process.env.TREASURY_WALLET || '6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P',
 };
-const RPC = process.env.RPC_URL || 'https://api.devnet.solana.com';
+const RPC = process.env.SOLANA_RPC_URL || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 const execute = process.argv.includes('--execute');
 const connection = new Connection(RPC, 'confirmed');
 const payer = process.env.DEPLOYER_KEYPAIR

@@ -2,9 +2,16 @@
 import assert from 'node:assert/strict';
 import { Transaction, PublicKey } from '@solana/web3.js';
 
-const BASE = 'https://gitstarter.agnt.gg';
-const PROGRAM = '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
-const CONFIG = 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29';
+const BASE = process.env.GITSTARTER_BASE || 'https://gitstarter.agnt.gg';
+// Read from the live API first, exactly as a real agent would — an agent has no
+// compiled-in constants. Hardcoding the program id here meant this script kept
+// certifying the devnet deployment after the real one moved to mainnet, and
+// every check below silently measured the wrong system. What is asserted now is
+// CONSISTENCY: every endpoint must agree with /api/config about what is
+// deployed, and the browser separately pins what may be signed.
+const config = await (await fetch(`${BASE}/api/config`)).json();
+const PROGRAM = config.programId;
+const CONFIG = config.configPda;
 const results = [];
 const check = (name, fn) => { try { fn(); results.push(`PASS  ${name}`); } catch (e) { results.push(`FAIL  ${name} -> ${e.message}`); } };
 
@@ -38,7 +45,11 @@ check('commission list merges chain state with metadata', () => {
   assert.ok(bounty.title, 'indexed commission must carry a title');
   assert.ok(Array.isArray(bounty.milestones) && bounty.milestones.length >= 1);
   assert.equal(typeof bounty.escrowRemainingLamports, 'number');
-  assert.ok(bounty.explorer.includes('cluster=devnet'));
+  // Solscan omits the cluster query on mainnet and requires it elsewhere. The
+  // old assertion hardcoded devnet, which made this script report the live
+  // mainnet API as broken for emitting a correct link.
+  if (config.cluster === 'mainnet-beta') assert.ok(!bounty.explorer.includes('cluster='));
+  else assert.ok(bounty.explorer.includes(`cluster=${config.cluster}`));
 });
 
 const indexed = list.commissions.find(c => c.indexed);
@@ -119,8 +130,10 @@ check('legacy metadata endpoint still returns a bare array', () => {
   assert.ok(Array.isArray(legacy), 'the browser client reads this shape');
   assert.ok(legacy.length >= 1);
 });
-const config = await (await fetch(`${BASE}/api/config`)).json();
-check('config still pins the same program', () => assert.equal(config.programId, PROGRAM));
+check('every endpoint agrees about the deployed program', () => {
+  assert.equal(list.programId, config.programId);
+  assert.ok(llms.includes(config.configPda), 'the agent manual must name the same config account');
+});
 
 console.log(results.join('\n'));
 console.log(results.every(r => r.startsWith('PASS')) ? '\nALL AGENT API CHECKS PASSED' : '\nFAILURES PRESENT');

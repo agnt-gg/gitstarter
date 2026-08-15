@@ -34,7 +34,18 @@ const PINNED = {
   configPda:'E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2',
   treasuryWallet:'6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P',
   cluster:'mainnet-beta',
-  rpcHosts:['api.mainnet-beta.solana.com']
+  // Deliberately does NOT include api.mainnet-beta.solana.com. That endpoint
+  // returns 403 to any request carrying an Origin header — which is to say, to
+  // every browser — while answering server-side calls normally. Shipping it
+  // here made the site pass every server-run test and fail for every actual
+  // user: wallet actions died at the first RPC call, which surfaced as endless
+  // reconnect prompts and a name that could not be claimed. Devnet allows
+  // browsers, which is why months of devnet use never showed it.
+  //
+  // Keeping the hostile host out of the pin list means a config regression
+  // fails loudly at verifyConfig instead of shipping a board where nothing can
+  // be signed.
+  rpcHosts:['solana-rpc.publicnode.com']
 };
 function verifyConfig(config){
   for(const field of ['programId','configPda','treasuryWallet','cluster']){
@@ -73,7 +84,12 @@ function walletProvider(){return state.provider;}
 function closeIcon(){return '<button class="closeX" id="bX" type="button" aria-label="Close dialog">×</button>';}
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function connectMetaMask(silent=false){
-  const client=await createSolanaClient({dapp:{name:'GitStarter',url:window.location.origin},api:{supportedNetworks:{devnet:state.config.rpcUrl}},analytics:{enabled:false}});
+  // The network key must match the cluster this build is actually on. This was
+  // hardcoded `devnet:` from the devnet era, which registered the MAINNET RPC
+  // url under the devnet scope — mislabelling every SDK-side lookup even though
+  // signing itself was saved by the explicit CAIP chain id below.
+  const networkKey=state.config?.cluster==='mainnet-beta'?'mainnet':'devnet';
+  const client=await createSolanaClient({dapp:{name:'GitStarter',url:window.location.origin},api:{supportedNetworks:{[networkKey]:state.config.rpcUrl}},analytics:{enabled:false}});
   const wallet=client.getWallet();
   let accounts;
   if(silent){
@@ -124,7 +140,7 @@ function openWalletModal(){
     return `<button class="wallet-option" type="button" data-wallet="${wallet.id}"><span class="wallet-logo"><img src="${wallet.logo}" alt="" width="30" height="30"></span><span class="wallet-copy"><span class="wallet-name">${wallet.name}</span><span class="wallet-state ${installed?'detected':''}">${installed?(wallet.id==='metamask'?'Connect with MetaMask':'Detected in this browser'):'Get wallet'}</span></span><span class="wallet-next" aria-hidden="true">${installed?'›':'↗'}</span></button>`;
   }).join('');
   $('dlg').className='dlg dlg-wallet';
-  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>Connect wallet</h1><div class="sub">Choose a Solana wallet to continue on ${esc(state.config?.cluster||'devnet')}.</div></div>${closeIcon()}</div></div><div class="dlg-content"><div class="wallet-list">${rows}</div><div class="security-note"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0c.69 0 1.25.56 1.25 1.25V2h1A2.75 2.75 0 0 1 13 4.75v2.086c.916.355 1.5 1.18 1.5 2.164v4.5A2.5 2.5 0 0 1 12 16H4a2.5 2.5 0 0 1-2.5-2.5V9c0-.984.584-1.81 1.5-2.164V4.75A2.75 2.75 0 0 1 5.75 2h1v-.75C6.75.56 7.31 0 8 0Zm-2.25 3.5c-.69 0-1.25.56-1.25 1.25V6.5h7V4.75c0-.69-.56-1.25-1.25-1.25h-4.5ZM4 8a1 1 0 0 0-1 1v4.5A1 1 0 0 0 4 14.5h8a1 1 0 0 0 1-1V9a1 1 0 0 0-1-1H4Z"/></svg><span>GitStarter never sees your recovery phrase or private keys. Your wallet asks for approval before every signature.</span></div></div>`;
+  $('dlg').innerHTML=`<div class="dlg-head"><div class="dlg-head-row"><div class="dlg-head-copy"><h1>Connect wallet</h1><div class="sub">Choose a Solana wallet to continue on ${esc(state.config?.cluster||'mainnet-beta')}.</div></div>${closeIcon()}</div></div><div class="dlg-content"><div class="wallet-list">${rows}</div><div class="security-note"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0c.69 0 1.25.56 1.25 1.25V2h1A2.75 2.75 0 0 1 13 4.75v2.086c.916.355 1.5 1.18 1.5 2.164v4.5A2.5 2.5 0 0 1 12 16H4a2.5 2.5 0 0 1-2.5-2.5V9c0-.984.584-1.81 1.5-2.164V4.75A2.75 2.75 0 0 1 5.75 2h1v-.75C6.75.56 7.31 0 8 0Zm-2.25 3.5c-.69 0-1.25.56-1.25 1.25V6.5h7V4.75c0-.69-.56-1.25-1.25-1.25h-4.5ZM4 8a1 1 0 0 0-1 1v4.5A1 1 0 0 0 4 14.5h8a1 1 0 0 0 1-1V9a1 1 0 0 0-1-1H4Z"/></svg><span>GitStarter never sees your recovery phrase or private keys. Your wallet asks for approval before every signature.</span></div></div>`;
   $('overlay').classList.add('on');
 }
 async function connectWallet(walletId){
@@ -1355,6 +1371,13 @@ document.addEventListener('input',event=>{
 document.addEventListener('change',event=>{if(event.target.id==='sortSelect'){state.sort=event.target.value;render();}});
 (async()=>{try{
   state.config=verifyConfig(await api('/api/config'));
+  // The network name on the page comes from the verified config, never from
+  // static text. The footer said "Solana devnet" for a day after the mainnet
+  // launch because it was a hardcoded string nobody re-read — rendering it from
+  // the same config the transactions use means it cannot lie separately again.
+  for(const [id,text] of [['ftMeta',`Solana ${state.config.cluster} \u00b7 native SOL escrow \u00b7 SQLite metadata \u00b7 1% on releases`],['topicNet',`Solana ${state.config.cluster==='mainnet-beta'?'mainnet':state.config.cluster}`]]){
+    const el=document.getElementById(id);if(el)el.textContent=text;
+  }
   state.connection=new web3.Connection(state.config.rpcUrl,'confirmed');
   // Restore the session BEFORE scanning the chain. The scan takes seconds on a
   // phone, and running it first left a returning user looking anonymous for

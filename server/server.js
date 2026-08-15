@@ -19,11 +19,21 @@ const PORT = Number(process.env.PORT || 3417);
 // refuses outright, so the "safe" default produces a broken app rather than a
 // cautious one. Devnet work is a devnet build, with these set explicitly.
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const CLUSTER = process.env.SOLANA_CLUSTER || 'mainnet-beta';
 // The server's own RPC endpoint may embed a provider API key. Browsers get a
 // keyless endpoint instead, so /api/config can never hand out billing credentials.
+//
+// The browser endpoint is also a DIFFERENT endpoint from the server's, not
+// merely a keyless copy of it. api.mainnet-beta.solana.com answers servers
+// normally and 403s anything carrying an Origin header — every browser — so
+// handing browsers the server's endpoint shipped a site where every wallet
+// action failed while every server-side test passed. The two audiences need
+// endpoints chosen for how each actually connects.
+const BROWSER_SAFE_RPC = CLUSTER === 'mainnet-beta'
+  ? 'https://solana-rpc.publicnode.com'
+  : 'https://api.devnet.solana.com';
 const PUBLIC_RPC_URL = process.env.PUBLIC_SOLANA_RPC_URL
-  || (/api-key|\?/i.test(RPC_URL) ? 'https://api.mainnet-beta.solana.com' : RPC_URL);
-const CLUSTER = process.env.SOLANA_CLUSTER || 'mainnet-beta';
+  || (/api-key|\?|api\.mainnet-beta/i.test(RPC_URL) ? BROWSER_SAFE_RPC : RPC_URL);
 const PROGRAM_ID = process.env.PROGRAM_ID || 'HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4';
 const TREASURY_WALLET = process.env.TREASURY_WALLET || '6RehrefK9bq2U8dJse96GjGGHm8t6mznxGR1Qj2e1A5P';
 const CONFIG_PDA = process.env.CONFIG_PDA || 'E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2';

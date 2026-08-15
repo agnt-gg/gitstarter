@@ -14,11 +14,11 @@ import escrow from '../shared/escrow.js';
 const argv = process.argv.slice(2);
 const arg = name => { const i = argv.indexOf(`--${name}`); return i === -1 ? null : argv[i + 1]; };
 
-const CLUSTER = arg('cluster') || process.env.SOLANA_CLUSTER || 'devnet';
+const CLUSTER = arg('cluster') || process.env.SOLANA_CLUSTER || 'mainnet-beta';
 const RPC = arg('rpc') || process.env.RPC_URL
   || (CLUSTER === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
-const PROGRAM_ID = process.env.PROGRAM_ID || '6PFsiUA7sX5j96pzK7zxLbpFpsJXNLkfwQPYyd4UNFTy';
-const CONFIG_PDA = process.env.CONFIG_PDA || 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29';
+const PROGRAM_ID = process.env.PROGRAM_ID || 'HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4';
+const CONFIG_PDA = process.env.CONFIG_PDA || 'E7tHZCvZWB6fQLwZA6KCipgJszjPn4ZTzSUdZC1XX4x2';
 const sol = lamports => `${(lamports / 1e9).toFixed(6)} SOL`;
 
 async function rpc(method, params) {

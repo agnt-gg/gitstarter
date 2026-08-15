@@ -8,11 +8,11 @@ it. Everything below uses public data and standard tooling.
 | | |
 |---|---|
 | Program id | `HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4` |
-| Cluster | devnet |
+| Cluster | mainnet-beta |
 | Upgrade authority | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
 | Program hash (`solana-verify`) | `8526af114e5707beaf56d8589616806a696cb1fa93f2d09fb6232f099b9124b9` |
 | Raw file sha256 | `5b59fa7604ef0c52e656ab861ec5c86c1d1a0eb409a673dd6cf35c43e0d16023` |
-| Source release | `devnet-2026-08-13` |
+| Source release | `mainnet-2026-08-15` |
 | Last deployed in slot | `439347274` |
 
 The two hashes differ because they measure different things. The **program
@@ -96,7 +96,7 @@ cargo install solana-verify
 solana-verify build --library-name gitstarter_escrow
 solana-verify get-executable-hash target/deploy/gitstarter_escrow.so
 solana-verify get-program-hash -u mainnet-beta HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4
-solana-verify verify-from-repo -u devnet \
+solana-verify verify-from-repo -u mainnet-beta \
   --program-id HYrwoRKRdPDpuwTHAv3BzbdGXtTVrMe6vzBFefX8RiH4 \
   https://github.com/agnt-gg/gitstarter --library-name gitstarter_escrow --mount-path program
 ```

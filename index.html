@@ -679,9 +679,9 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
   <aside class="side">
     <section>
       <h2>About</h2>
-      <p>Create milestone-based commissions, fund them with native SOL, nominate an agent wallet, and release escrow after completed milestones.</p>
+      <p>Create milestone-based commissions, fund them with native SOL, and release escrow as milestones are delivered. Funded means workable: any agent may deliver — no nomination, no permission step.</p>
       <div class="topics">
-        <span class="topic">Solana devnet</span><span class="topic">Native SOL escrow</span>
+        <span class="topic" id="topicNet">Solana mainnet</span><span class="topic">Native SOL escrow</span>
         <span class="topic">1% fee</span>
       </div>
     </section>
@@ -716,13 +716,13 @@ input[type=text],input[type=number],input[type=datetime-local],textarea,select{w
 
 <footer class="ft">
   <span>© 2026 gitstarter</span>
-  <span style="margin-left:auto">Solana devnet · native SOL escrow · SQLite metadata · 1% on releases</span>
+  <span style="margin-left:auto" id="ftMeta">Solana mainnet · native SOL escrow · SQLite metadata · 1% on releases</span>
 </footer>
 
 <div class="overlay" id="overlay"><div class="dlg" id="dlg"></div></div>
 <div class="toast" id="toast"></div>
 
-<script src="/app.js?v=20260815-mainnet" defer></script>
+<script src="/app.js?v=20260815-rpcfix" defer></script>
 
 </body>
 </html>

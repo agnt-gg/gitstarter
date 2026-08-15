@@ -240,6 +240,33 @@ for (const [name, value] of [
     value ? 'set' : 'falling back to a devnet default');
 }
 
+// ── 4b. The endpoint handed to browsers must actually accept browsers ───────
+//
+// The check that was missing at launch. Every server-side test passed while
+// every real user got 403s, because api.mainnet-beta.solana.com rejects any
+// request carrying an Origin header — and only browsers send one. A diagnostic
+// that connects the way a server connects cannot see the failure, so this one
+// connects the way a USER does.
+try {
+  const browserRpc = process.env.PUBLIC_SOLANA_RPC_URL
+    || (CLUSTER === 'mainnet-beta' ? 'https://solana-rpc.publicnode.com' : RPC);
+  const asBrowser = await fetch(browserRpc, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: 'https://gitstarter.agnt.gg' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{ commitment: 'confirmed' }] }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const answer = await asBrowser.json().catch(() => ({}));
+  check('blocker', 'the browser RPC endpoint accepts browser requests',
+    asBrowser.status === 200 && answer.result !== undefined,
+    asBrowser.status === 200
+      ? `${new URL(browserRpc).host} answers with an Origin header present`
+      : `${new URL(browserRpc).host} returned HTTP ${asBrowser.status} to a request with an Origin header — `
+        + 'every wallet action in every browser will fail exactly like this');
+} catch (error) {
+  check('blocker', 'the browser RPC endpoint accepts browser requests', false, error.message);
+}
+
 // ── 4. A public RPC will not carry this ─────────────────────────────────────
 //
 // api.mainnet-beta.solana.com rate-limits hard, and the board is one
