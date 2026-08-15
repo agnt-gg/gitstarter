@@ -78,12 +78,18 @@ function sweep({ pledges = [], submissions = [], intents = [], fail = false } = 
       },
     },
   };
-  const build = new Function('escrow', 'PublicKey', 'state', 'ESCROW_CTX', `
+  // The shipped sweep now routes reads through callWithFailover so a 504 from
+  // one RPC rotates to the next instead of hanging the page. In this harness
+  // there is only the one stubbed connection, so the shim delegates straight
+  // to it — which also preserves the fail:true path used to prove housekeeping
+  // never takes the payment down with it.
+  const callWithFailover = (method, ...args) => state.connection[method](...args);
+  const build = new Function('escrow', 'PublicKey', 'state', 'ESCROW_CTX', 'callWithFailover', `
     ${extract(CLIENT, 'cleanupInstructions')}
     return cleanupInstructions;
   `)(escrow, PublicKey, state, {
     programId: PROGRAM, configPda: 'DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29', treasury: BACKER,
-  });
+  }, callWithFailover);
   return build(COMMISSION, { creator: CREATOR });
 }
 

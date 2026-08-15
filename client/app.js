@@ -362,7 +362,11 @@ async function send(transaction,onStage=()=>{}){
 /// ourselves is reconciled separately by `reconcile`, which uses a read that
 /// does honour the pin.
 async function readCommissionAccounts(){
-  return state.connection.getProgramAccounts(new PublicKey(state.config.programId),{
+  // The board load. This is the request that 504'd through Cloudflare from
+  // Nathan's region: publicnode intermittently answers getProgramAccounts with
+  // 504 retry-after-120. Routed through the pool so a bad node rotates instead
+  // of hanging the whole page.
+  return callWithFailover('getProgramAccounts',new PublicKey(state.config.programId),{
     commitment:'confirmed',
     filters:[{dataSize:escrow.COMMISSION_ACCOUNT_BYTES},{memcmp:{offset:0,bytes:'3'}}],
   });
@@ -383,7 +387,7 @@ async function reconcile(address){
     :{commitment:'confirmed'};
   for(let attempt=0;attempt<12;attempt++){
     try{
-      const info=await state.connection.getAccountInfo(key,options);
+      const info=await callWithFailover('getAccountInfo',key,options);
       if(info?.data){applyLiveUpdate(address,info.data);return;}
     }catch{/* Behind our slot, or a transient RPC failure. Both mean: ask again. */}
     await sleep(300);
@@ -1259,7 +1263,7 @@ async function pledge(address){
 async function cleanupInstructions(address,commission){
   const program=new PublicKey(state.config.programId);
   // Both records store their commission at offset 1, right after the tag byte.
-  const owned=(bytes,tag)=>state.connection.getProgramAccounts(program,{
+  const owned=(bytes,tag)=>callWithFailover('getProgramAccounts',program,{
     commitment:'confirmed',
     filters:[{dataSize:bytes},{memcmp:{offset:0,bytes:tag}},{memcmp:{offset:1,bytes:address}}],
   });
