@@ -1,0 +1,71 @@
+# Every test in this repository used to run for the first time inside the
+# production deploy hook — main was where tests debuted. This runs the same
+# gates on every pull request, with no secrets, so it passes on fork PRs from
+# contributors with zero repository access.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # Production runs Node 18.19.1. The 18 leg is not optional: a Node-22-only
+  # assumption (ESM-only transitive dependency) once made @solana/web3.js
+  # unloadable in production while every local test passed on 22.
+  node:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18.19.1', '22.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # The committed public/app.js must be exactly what this revision's
+  # client/app.js builds. A correct source fix has shipped with a stale bundle
+  # twice; users kept executing the old code while the deploy reported success.
+  bundle:
+    name: committed bundle is fresh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+      - run: npm ci
+      - run: npm run build:client
+      - name: committed bundle must match a fresh build
+        run: |
+          if ! git diff --exit-code -- public/app.js; then
+            echo '::error::public/app.js is stale. Run `npm run build:client` and commit the result.'
+            exit 1
+          fi
+
+  # Native tests for the escrow program, including the adversarial suite.
+  # Toolchain pinned: solana-program 1.18 predates several later-stable
+  # breakages, and a floating `stable` here would eventually fail on a rustc
+  # release this crate has never seen.
+  rust:
+    name: program tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: program
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.78.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: program
+      - run: cargo test
