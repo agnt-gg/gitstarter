@@ -62,6 +62,10 @@ const COMMISSION_ACCOUNT_BYTES = 275;
 const SUBMISSION_ACCOUNT_BYTES = 109;
 const PLEDGE_ACCOUNT_BYTES = 83;
 const CONFIG_ACCOUNT_BYTES = 67;
+/// Mirrors MAX_COMMISSION_LAMPORTS in the program. Kept here so the browser can
+/// say no before asking somebody to sign a transaction that the chain would
+/// reject anyway — the program is still the thing that enforces it.
+const MAX_COMMISSION_LAMPORTS = 5 * 1_000_000_000;
 const HANDLE_ACCOUNT_BYTES = 75;
 const SEED_HANDLE = Buffer.from('handle');
 const MAX_HANDLE_LEN = 32;
@@ -169,9 +173,14 @@ const ERRORS = {
   36: 'WorkWindowClosed',
   37: 'BadHandle',
   38: 'HandleTaken',
+  39: 'CommissionTooLarge',
 };
 
 const ERROR_HELP = {
+  CommissionTooLarge: 'One commission may hold at most 5 SOL while this escrow is new. The program '
+    + 'has not been independently reviewed, so the cap is there to make the worst case a number '
+    + 'chosen in advance rather than one somebody else chooses later. Split the work into '
+    + 'separate commissions.',
   BadHandle: 'A name is 3 to 32 characters of lower-case letters, numbers and inner hyphens. '
     + 'Capitals are refused rather than corrected, because the name is its own address and '
     + '"Alice" would otherwise be a different name from "alice".',
@@ -968,6 +977,7 @@ function explainError(error) {
 module.exports = {
   LAMPORTS_PER_SOL, BPS_DENOMINATOR, FEE_BASIS_POINTS, MAX_MILESTONES,
   COMMISSION_ACCOUNT_BYTES, SUBMISSION_ACCOUNT_BYTES, INTENT_ACCOUNT_BYTES, PLEDGE_ACCOUNT_BYTES, CONFIG_ACCOUNT_BYTES, HANDLE_ACCOUNT_BYTES,
+  MAX_COMMISSION_LAMPORTS,
   VAULT_RENT_LAMPORTS, PLEDGE_RENT_LAMPORTS, COMMISSION_RENT_LAMPORTS,
   SUBMISSION_RENT_LAMPORTS, INTENT_RENT_LAMPORTS,
   MAX_FUNDING_DURATION_SECONDS,

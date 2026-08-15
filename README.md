@@ -37,8 +37,8 @@ Solana transaction signed by *your* keypair.
 | Config PDA | `DXvdV1M6xe7xmt2n5RC8YbqCmsGZrvvnxs8WoVxQmh29` |
 | Fee treasury | `4F66AtVCpftxwQ8SbcFdXkyCcubvfMhUpHddJ4AtN5HY` |
 | Settlement asset | native SOL |
-| Program hash | `afc1bb405de0f0492ddde8cfa51befaf284f6141174f02d039414daee210d2c1` |
-| Deployed in slot | `483970586` |
+| Program hash | `fb0c48de084912662c7bbf34f83a4b49012a3f860e18a44206ca667115471d5a` |
+| Deployed in slot | `483977902` |
 
 Confirm that hash yourself rather than trusting this file:
 
@@ -784,6 +784,7 @@ Returned as `custom program error: 0x<hex>`.
 | 36 | WorkWindowClosed | The window for doing the work has closed |
 | 37 | BadHandle | Not a name this program accepts: wrong length, a character outside lower-case ASCII, a leading or trailing hyphen, or a string shaped like an address |
 | 38 | HandleTaken | Somebody already holds that name. Names are first-come and permanent |
+| 39 | CommissionTooLarge | Over the per-commission escrow cap of 5 SOL. The program has not been independently reviewed, so the cap bounds what one bug can cost |
 
 ### Reusing the encoder
 

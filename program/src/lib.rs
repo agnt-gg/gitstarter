@@ -91,6 +91,24 @@ pub const INITIALIZER: Pubkey =
 
 pub const MAX_MILESTONES: usize = 8;
 
+/// The most SOL one commission may ever hold.
+///
+/// This program has not been read by anybody who did not write it. That is the
+/// ordinary state of new code and it is worth being honest about rather than
+/// quiet about, because the people it costs are the ones putting money in.
+///
+/// A cap does not make a bug less likely. It makes the worst case a number
+/// somebody chose in advance instead of a number an attacker chooses later, and
+/// it is the difference between a bug report and somebody's savings. Every
+/// escrow bug found in this codebase so far was found by running it, which is
+/// evidence for taking the possibility seriously rather than against it.
+///
+/// Raising it is a program upgrade, so it takes two of the three multisig
+/// signers — a deliberate second opinion rather than a config flag somebody can
+/// flip alone at 3am. Raise it before renouncing the upgrade authority, or the
+/// cap becomes permanent along with everything else.
+pub const MAX_COMMISSION_LAMPORTS: u64 = 5 * 1_000_000_000;
+
 // ── clocks ──────────────────────────────────────────────────────────────────
 //
 // One deadline used to cover both raising the money and doing the work, which
@@ -223,6 +241,8 @@ pub enum EscrowError {
     BadHandle = 37,
     /// Somebody already holds it. Names are first-come and permanent.
     HandleTaken = 38,
+    /// Over the per-commission escrow cap. See MAX_COMMISSION_LAMPORTS.
+    CommissionTooLarge = 39,
 }
 
 /// Base58 as Solana uses it: no 0, O, I or l, precisely so that an address
@@ -1044,6 +1064,12 @@ fn create_commission(
     if goal < BPS_DENOMINATOR {
         return Err(EscrowError::GoalTooSmall.into());
     }
+    // Refused here as well as in Pledge, so somebody advertising a job finds out
+    // while they are posting it rather than after an agent has done the work and
+    // the backers cannot fund it.
+    if goal > MAX_COMMISSION_LAMPORTS {
+        return Err(EscrowError::CommissionTooLarge.into());
+    }
     let now = Clock::get()?.unix_timestamp;
     if deadline <= now {
         return Err(EscrowError::DeadlineInPast.into());
@@ -1273,6 +1299,13 @@ fn pledge(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Program
         .total_pledged
         .checked_add(amount)
         .ok_or(EscrowError::MathOverflow)?;
+    // The check that actually bounds the loss. Capping the goal alone would not:
+    // a commission can be pledged past its goal, so the ceiling has to be on the
+    // money that is really in the vault rather than on the number somebody asked
+    // for.
+    if c.total_pledged > MAX_COMMISSION_LAMPORTS {
+        return Err(EscrowError::CommissionTooLarge.into());
+    }
     if new_pledger {
         c.pledger_count = c
             .pledger_count

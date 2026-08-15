@@ -183,9 +183,37 @@ check('warn', 'RPC endpoint is not the public one',
 // This program moves other people's money and has never been read by anyone who
 // did not write it. That is the ordinary state of new code and an unacceptable
 // state for custody. The file is deliberately something a human has to create.
+// Satisfied by either a review or a recorded decision to launch without one.
+//
+// Deleting this check because the answer was inconvenient would be the
+// dishonest option, and so would passing it on a file that merely exists. What
+// it asks for is that somebody made the call ON PURPOSE and wrote down what
+// they were accepting — which is a real thing a person can decide, unlike an
+// audit, which is a claim about work that either happened or did not.
 const auditPath = path.join(ROOT, 'docs', 'AUDIT.md');
-check('blocker', 'an independent review exists', fs.existsSync(auditPath),
-  fs.existsSync(auditPath) ? 'docs/AUDIT.md present' : 'no docs/AUDIT.md — nobody but the author has read the escrow');
+const acceptedPath = path.join(ROOT, 'docs', 'RISK-ACCEPTED.md');
+const reviewed = fs.existsSync(auditPath);
+const accepted = fs.existsSync(acceptedPath);
+check('blocker', 'the review question has been answered', reviewed || accepted,
+  reviewed ? 'docs/AUDIT.md present'
+    : accepted ? 'no external review; docs/RISK-ACCEPTED.md records the decision and its bound'
+      : 'nobody but the author has read the escrow, and no decision to accept that has been recorded');
+
+// The bound that makes launching unreviewed defensible at all. Checked against
+// the program source rather than assumed, because the cap is the entire
+// argument: it turns "we hope there is no bug" into "a bug costs at most this".
+if (accepted && !reviewed) {
+  let cap = null;
+  try {
+    const program = fs.readFileSync(path.join(ROOT, 'program', 'src', 'lib.rs'), 'utf8');
+    const match = program.match(/MAX_COMMISSION_LAMPORTS: u64 = ([\d_ *]+);/);
+    if (match) cap = Function(`return ${match[1].replace(/_/g, '')}`)();
+  } catch { /* reported below */ }
+  check('blocker', 'an unreviewed escrow caps what one commission can hold',
+    cap !== null && cap > 0 && cap <= 10 * 1e9,
+    cap === null ? 'could not read MAX_COMMISSION_LAMPORTS from the program'
+      : `${cap / 1e9} SOL per commission${cap > 10 * 1e9 ? ' — too high to call a bound' : ''}`);
+}
 
 // ── 6. The published hash matches what is actually deployed ─────────────────
 check('blocker', 'published program hash matches the deployed bytes',

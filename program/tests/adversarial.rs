@@ -18,8 +18,8 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use gitstarter_escrow::{
     process_instruction, Commission, Config, HandleClaim, Instruction as EscrowInstruction, Status,
-    Submission, SubmissionState, SEED_COMMISSION, SEED_CONFIG, SEED_HANDLE, SEED_INTENT,
-    SEED_PLEDGE, SEED_SUBMISSION, SEED_VAULT, TAG_HANDLE,
+    Submission, SubmissionState, MAX_COMMISSION_LAMPORTS, SEED_COMMISSION, SEED_CONFIG,
+    SEED_HANDLE, SEED_INTENT, SEED_PLEDGE, SEED_SUBMISSION, SEED_VAULT, TAG_HANDLE,
 };
 use solana_program::{
     clock::Clock,
@@ -1989,4 +1989,147 @@ async fn only_the_wallet_itself_can_claim_a_name_for_itself() {
         },
     );
     assert!(send(&mut w.ctx, &[unsigned], &[]).await.is_err());
+}
+
+// ── the launch cap ──────────────────────────────────────────────────────────
+//
+// This program has not been read by anybody who did not write it. The cap does
+// not make a bug less likely; it makes the worst case a number chosen in advance
+// rather than one an attacker chooses later.
+
+const SOL: u64 = 1_000_000_000;
+
+#[tokio::test]
+async fn a_commission_asking_for_more_than_the_cap_is_refused_when_it_is_posted() {
+    // Refused at posting as well as at funding, so somebody advertising a job
+    // finds out while writing it rather than after an agent has done the work
+    // and the backers discover they cannot fund it.
+    let mut w = world().await;
+    let (commission, vault) = addresses(w.creator.pubkey(), 90);
+    let deadline = soon(&mut w.ctx, A_WEEK).await;
+
+    assert!(
+        send(
+            &mut w.ctx,
+            &[create_ix(
+                w.creator.pubkey(),
+                w.config,
+                commission,
+                vault,
+                90,
+                MAX_COMMISSION_LAMPORTS + 1,
+                vec![10_000],
+                deadline,
+                7_200,
+                3_600,
+            )],
+            &[&w.creator]
+        )
+        .await
+        .is_err(),
+        "a goal over the cap must be refused"
+    );
+
+    // And exactly the cap is fine, so the boundary is inclusive rather than
+    // one lamport short of what the documentation says.
+    let (at_cap, at_cap_vault) = addresses(w.creator.pubkey(), 91);
+    send(
+        &mut w.ctx,
+        &[create_ix(
+            w.creator.pubkey(),
+            w.config,
+            at_cap,
+            at_cap_vault,
+            91,
+            MAX_COMMISSION_LAMPORTS,
+            vec![10_000],
+            deadline,
+            7_200,
+            3_600,
+        )],
+        &[&w.creator],
+    )
+    .await
+    .expect("a goal of exactly the cap must be allowed");
+}
+
+#[tokio::test]
+async fn the_cap_bounds_the_vault_rather_than_the_asking_price() {
+    // The case a goal-only check would miss, and the reason the check lives in
+    // Pledge as well.
+    //
+    // A commission accepts pledges until its goal is MET, and the pledge that
+    // crosses the line can be any size. So a 4 SOL job can take a single 6 SOL
+    // pledge and end up holding more than the cap while its goal never
+    // exceeded it. What has to be bounded is the money actually in the vault.
+    let mut w = world().await;
+    let goal = 4 * SOL;
+    let (commission, vault) = addresses(w.creator.pubkey(), 92);
+    let deadline = soon(&mut w.ctx, A_WEEK).await;
+    send(
+        &mut w.ctx,
+        &[create_ix(
+            w.creator.pubkey(),
+            w.config,
+            commission,
+            vault,
+            92,
+            goal,
+            vec![10_000],
+            deadline,
+            7_200,
+            3_600,
+        )],
+        &[&w.creator],
+    )
+    .await
+    .unwrap();
+
+    // The vault already holds its own rent-exemption from creation, so the
+    // property worth asserting is that a refused pledge changes nothing rather
+    // than that the balance is any particular number.
+    let before = balance(&mut w.ctx, vault).await;
+
+    assert!(
+        send(
+            &mut w.ctx,
+            &[pledge_ix(
+                w.backer_a.pubkey(),
+                w.config,
+                commission,
+                vault,
+                6 * SOL
+            )],
+            &[&w.backer_a]
+        )
+        .await
+        .is_err(),
+        "a single pledge that puts the vault over the cap must be refused, \
+         even though the goal was under it"
+    );
+
+    assert_eq!(
+        balance(&mut w.ctx, vault).await,
+        before,
+        "a refused pledge must move nothing"
+    );
+
+    // And funding it properly still works, so the cap constrains the ceiling
+    // rather than the mechanism.
+    send(
+        &mut w.ctx,
+        &[pledge_ix(
+            w.backer_a.pubkey(),
+            w.config,
+            commission,
+            vault,
+            goal,
+        )],
+        &[&w.backer_a],
+    )
+    .await
+    .expect("a pledge within the cap must still fund the commission");
+    let c = commission_state(&mut w.ctx, commission).await;
+    assert_eq!(c.status, Status::Funded);
+    assert_eq!(c.total_pledged, goal);
 }

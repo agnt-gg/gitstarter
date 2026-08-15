@@ -67,6 +67,51 @@ wallet by then.
 unupgradeable program with live money in it, which is a worse failure than the
 one the multisig was protecting against.
 
+### Creating it
+
+```sh
+node scripts/create-multisig.mjs                                   # devnet
+MULTISIG_PAYER_KEYPAIR=... node scripts/create-multisig.mjs \
+  --cluster mainnet-beta --confirm
+```
+
+The script creates a Squads v4 multisig and then **reads it back and checks what
+it actually made** — threshold, membership, and above all that `configAuthority`
+is unset. That last one is the whole thing: with a config authority, one key can
+add members and drop the threshold to 1, so a 2-of-3 with a config authority is
+a 1-of-1 wearing a costume.
+
+Whoever runs it pays and then has no further power, which is why it does not
+need to be one of the signers.
+
+**Rehearsed on devnet**, with all three real signer addresses:
+
+| | |
+|---|---|
+| multisig | `685kCG1ebqLEzedXnTZaHbPR1ZGq6taf2N6tkzcDRrWP` |
+| vault (the future upgrade authority) | `8hX8yPXKJt986ypm6JSPo2rV82sZajwDviDUprpvHWgZ` |
+| verified | 2 of 3, configAuthority none, timeLock 0 |
+
+The devnet program's authority was deliberately **not** moved to it. Doing so
+would mean every devnet deploy needed two human signatures, which would end the
+ability to iterate here — and rehearsing the creation is the part with anything
+to learn. Moving the authority is one documented command either way.
+
+**Mainnet cost: 0.002509 SOL.** Account rent 0.002499, Squads creation fee
+currently zero, plus network fees. The fee is read from Squads' own on-chain
+config at runtime rather than assumed.
+
+### The launch cap
+
+`MAX_COMMISSION_LAMPORTS` is **5 SOL**, enforced on the vault rather than on the
+advertised goal — a commission can be pledged past its goal, so capping the
+asking price alone would not bound anything.
+
+It exists because the escrow has not been independently reviewed; see
+[RISK-ACCEPTED.md](RISK-ACCEPTED.md). Raising it is a program upgrade and so
+needs two signers. **Raise it before renouncing the upgrade authority**, or it
+becomes permanent along with everything else.
+
 **The treasury is separate and never signs.** Both instructions that pay it mark
 it writable and not a signer, so it can be the coldest key in the system without
 making anything slower for anybody. `server/test/treasury.test.js` pins that,
