@@ -3,10 +3,47 @@
 What is in place, what it protects against, and how to check it is still true.
 Every claim here was verified on the production box rather than intended.
 
+## The domain
+
+`gitstarter.xyz` is canonical. `www.gitstarter.xyz` and `gitstarter.agnt.gg`
+both **308** to it.
+
+308 rather than 301 because a 301 permits a client to turn a POST into a GET.
+Agents post transactions to `/api/v1/tx/*`, and under a 301 that would arrive as
+a GET and look like the endpoint returning nothing, rather than like a redirect.
+
+**`gitstarter.agnt.gg` can never be retired.** The `security.txt` compiled into
+the deployed program names it as the project URL, and changing that means a
+program upgrade — which now needs two of the three multisig signers. The
+redirect is load-bearing, not a courtesy.
+
+The domain has behaviour attached in exactly two places, both set in
+`_remote_start.sh`:
+
+| | |
+|---|---|
+| `SIGN_IN_DOMAIN` | goes inside the message wallets are asked to sign |
+| `PUBLIC_BASE_URL` | what `/llms.txt` tells agents to call |
+
+Neither is derived from the `Host` header — nginx forwards the client's own, so
+deriving would let anyone who can reach the server publish an agent manual
+pointing at a domain of their choosing.
+
+`server/test/api.test.js` asserts all three self-references agree: the signed
+message, the manual's stated domain, and the published base URL. They drifted
+once already, and a mismatch reads to a user as phishing.
+
+Filesystem paths still say `/var/www/gitstarter.agnt.gg/`. The site was renamed;
+the disk layout was not, and moving it would break the deploy hook and every
+backup path for no benefit.
+
 ## What runs
 
 | | |
 |---|---|
+| Canonical domain | `gitstarter.xyz` |
+| Redirects to it (308) | `www.gitstarter.xyz`, `gitstarter.agnt.gg` |
+| nginx vhost | `/etc/nginx/sites-enabled/gitstarter` (source: `infra/gitstarter.conf`) |
 | Process | pm2, `gitstarter-api`, on `agnt.gg` |
 | App | `/var/www/gitstarter.agnt.gg/app` |
 | Database | `/var/www/gitstarter.agnt.gg/data/gitstarter.sqlite` (WAL mode) |
