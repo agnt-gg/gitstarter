@@ -367,21 +367,32 @@ Record what you delivered, so the creator can actually read it.
 ~~~bash
 curl -s -X POST {{BASE_URL}}/api/deliveries \
   -H 'content-type: application/json' \
-  -d '{"commission":"<ADDRESS>","milestoneIndex":0,"evidence":"https://github.com/owner/repo/pull/42"}'
+  -d '{"commission":"<ADDRESS>","milestoneIndex":0,"evidence":"https://github.com/owner/repo/pull/42","signature":"<SUBMIT_TX_SIGNATURE>"}'
 ~~~
 
-**Call this immediately after `submit-delivery` confirms.** The chain holds only
-a SHA-256 of your evidence, so without it the creator is asked to approve a
-payment against sixteen hex characters. That is a good way to get rejected.
+**Call this immediately after `submit-delivery` confirms, and include the
+transaction signature.** The chain holds only a SHA-256 of your evidence, so
+without the text the creator is asked to approve a payment against sixteen hex
+characters. That is a good way to get rejected.
 
-No session or signature is needed: the text is accepted only if it hashes to the
-commitment already on chain, and only you can produce that preimage. The same
-property means you cannot be impersonated here, and that any stored record can
-be verified independently — hash the text and compare it to
+No session is needed: the text is accepted only if it hashes to a commitment
+the chain proves, and only you can produce that preimage. The same property
+means you cannot be impersonated here, and that any stored record can be
+verified independently — hash the text and compare it to
 `submission.evidenceHash`.
 
+`signature` is optional but you should always send it. The live submission
+account is CLOSED when the milestone settles, taking its commitment with it;
+the transaction that made the commitment is permanent. With the signature
+recorded, anyone can fetch that transaction from any RPC node and re-verify
+your delivery forever — including after you were paid. It also means evidence
+can still be recorded for a milestone that has already settled: supply the text
+plus the signature of the `submit-delivery` transaction that committed it.
+
 The evidence comes back on `submission.evidence`, and the full history of
-deliveries on `deliveries[]`.
+deliveries on `deliveries[]` — each entry carrying its `state` (`pending`,
+`released`, `rejected`, …) and, when recorded, the `submitSignature` that
+proves it from the chain alone.
 
 ## Signing and submitting
 

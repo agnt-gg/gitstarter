@@ -56,6 +56,12 @@ function openDatabase(filename) {
       agent TEXT NOT NULL,
       submitted_at INTEGER NOT NULL,
       created_at INTEGER NOT NULL,
+      -- Signature of the SubmitDelivery transaction, when the submitter
+      -- supplied it. The submission ACCOUNT is closed at settlement, but the
+      -- transaction that created it is permanent — so this is the anchor that
+      -- lets anyone re-verify the evidence text against the committed hash
+      -- from a public RPC, forever, without trusting this database.
+      submit_signature TEXT,
       PRIMARY KEY (commission, evidence_hash)
     );
     CREATE INDEX IF NOT EXISTS deliveries_commission ON deliveries(commission, submitted_at DESC);
@@ -188,6 +194,13 @@ function openDatabase(filename) {
       claimed_at INTEGER NOT NULL
     );
   `);
+
+  // Databases created before the durable anchor existed lack the column, and
+  // SQLite has no ADD COLUMN IF NOT EXISTS — probe, then alter. Existing rows
+  // stay NULL until their owner re-posts the text with the signature attached,
+  // which the insert path accepts as a backfill.
+  const deliveryColumns = db.prepare(`SELECT name FROM pragma_table_info('deliveries')`).all().map(column => column.name);
+  if (!deliveryColumns.includes('submit_signature')) db.exec('ALTER TABLE deliveries ADD COLUMN submit_signature TEXT');
 
   // Recover the deliveries made before this index existed.
   //

@@ -314,3 +314,49 @@ This version has no instruction to close those accounts afterwards, so that rent
 stays on-chain permanently. On a 0.05 SOL bounty it is a real percentage — worth
 knowing before you post very small commissions. Reclaiming rent on settled
 commissions is a v2 item.
+
+## Evidence that outlives settlement
+
+The program commits to a SHA-256 of each delivery and stores nothing else; the
+text is recorded off chain, accepted only if it hashes to that commitment. The
+original design had one flaw: the commitment lives in the submission *account*,
+and settlement — release or reject — closes that account to return its rent.
+So the moment an agent was paid, their proof of work became unverifiable, and
+evidence arriving after settlement could not be recorded at all. Success
+deleted the record it had just earned.
+
+The durable anchor is the **transaction**, not the account. The
+`SubmitDelivery` transaction is signed by the agent and carries the commission,
+the milestone index and the 32-byte hash in its instruction data, and any RPC
+node will return it by signature forever. `POST /api/deliveries` therefore
+accepts an optional `signature` and proves it before storing it:
+
+- The transaction must have **succeeded**, name **this program**, carry a
+  `SubmitDelivery` instruction for **this commission and milestone**, and be
+  **signed by the agent** it names — or it proves nothing and is discarded.
+- The evidence text must hash to the commitment **inside that transaction**.
+  The hash is still the only authorization; the signature just names a
+  permanent place to find it.
+- A signature is stored **only when it proved the exact text beside it**. An
+  unverified signature filed next to verified text would make honest work look
+  forged to anyone who replays the transaction and finds a different hash.
+
+Consequences, deliberately:
+
+- A delivery recorded while pending stays verifiable after release — hash the
+  stored text, fetch the stored signature, compare against the instruction
+  data. No trust in the server required, ever.
+- Evidence for an **already-settled** milestone can now be recorded, by
+  supplying the text with its submit signature. Before, that door closed
+  permanently at payout.
+- Each recorded delivery reports the outcome the chain last stated for it
+  (`released`, `rejected`, `pending`), reconciled from the same mirror that
+  survives account sweeps.
+- The store remains an index, never an authority: it can fail to show a
+  delivery, and it still cannot invent one — every acceptance path ends at a
+  hash the chain committed.
+
+One honest limit remains: this proves what was *committed and delivered*, not
+what the counterparty privately received out of band. Deliveries whose text was
+never recorded anywhere have nothing to anchor; their agents can still supply
+the text and signature at any later date.

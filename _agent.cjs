@@ -286,7 +286,9 @@ const [command, address, ...rest] = process.argv.slice(2);
       const response = await fetch(`${API}/api/deliveries`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ commission: address, milestoneIndex: index, evidence }),
+        // The signature is the durable anchor: the submission account dies at
+        // settlement, the transaction that carried the hash does not.
+        body: JSON.stringify({ commission: address, milestoneIndex: index, evidence, signature: sig }),
       });
       console.log(response.ok ? 'evidence recorded and verified against the chain'
         : `evidence NOT recorded: ${(await response.json()).error}`);

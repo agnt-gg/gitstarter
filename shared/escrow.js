@@ -964,6 +964,51 @@ function availableActions(c, wallet, options = {}) {
   }
   return [...new Set(actions)];
 }
+/// Proves a delivery from the transaction that committed it, rather than from
+/// the (mortal) submission account.
+///
+/// Settlement closes the submission account and erases the on-chain commitment
+/// — right for the rent, fatal for the record: the moment an agent was paid,
+/// proof of what they delivered stopped being checkable, and evidence could no
+/// longer be recorded at all. The transaction that carried SubmitDelivery is
+/// the same fact in permanent form — signed by the agent, naming the
+/// commission, the milestone and the hash — and any RPC node will replay it on
+/// request forever. This inspects one and returns exactly what it proves.
+///
+/// Takes the raw `getTransaction` response (encoding "json"). Throws with the
+/// reason rather than returning partial trust: a caller must never treat a
+/// half-matching transaction as evidence of anything.
+function verifySubmitTransaction(tx, { programId, commission, milestoneIndex }) {
+  if (!tx) throw new Error('transaction not found on chain');
+  if (tx.meta?.err) throw new Error('that transaction failed on chain, so it committed nothing');
+  const message = tx.transaction?.message;
+  const keys = (message?.accountKeys || []).map(String);
+  if (!keys.length) throw new Error('transaction carries no account keys');
+  // Legacy message layout: the first numRequiredSignatures keys are signers.
+  const signerCount = message.header?.numRequiredSignatures ?? 0;
+  for (const instruction of message.instructions || []) {
+    if (keys[instruction.programIdIndex] !== programId) continue;
+    let data;
+    try { data = Buffer.from(bs58.decode(instruction.data)); } catch { continue; }
+    // SubmitDelivery wire format: [discriminant, milestone_index, hash[32]].
+    if (data.length !== 34 || data[0] !== IX.submitDelivery) continue;
+    if (data[1] !== milestoneIndex) throw new Error('that transaction submitted a different milestone');
+    const agentIndex = instruction.accounts?.[0];
+    const commissionIndex = instruction.accounts?.[1];
+    if (keys[commissionIndex] !== commission) throw new Error('that transaction is for a different commission');
+    // The agent must have SIGNED, or anyone could manufacture a transaction
+    // attributing a delivery to a wallet that never made one.
+    if (!(Number.isInteger(agentIndex) && agentIndex < signerCount)) throw new Error('the agent on that transaction did not sign it');
+    return {
+      agent: keys[agentIndex],
+      evidenceHash: data.subarray(2).toString('hex'),
+      submittedAt: tx.blockTime ?? null,
+      slot: tx.slot ?? null,
+    };
+  }
+  throw new Error('no SubmitDelivery instruction to this program in that transaction');
+}
+
 /// Extracts a program error name from a failed transaction, if there is one.
 function explainError(error) {
   const message = error?.message || String(error);
@@ -991,4 +1036,5 @@ module.exports = {
   decodeCommission, decodeSubmission, decodeIntent, decodePledge, decodeConfig, decodeHandleClaim, escrowRemaining,
   handlePda,
   build, availableActions, explainError, canBuildTransactions,
+  verifySubmitTransaction,
 };

@@ -283,11 +283,34 @@ app.post('/api/deliveries', async (req, res, next) => {
       const committed = Buffer.from(candidate.evidenceHash, 'hex');
       if (digest.length === committed.length && crypto.timingSafeEqual(digest, committed)) { matched = candidate; break; }
     }
+    // The loop above proves against a LIVE submission account — which release
+    // and reject close, taking the commitment with them. That made evidence
+    // recordable only while a review happened to be pending: the moment an
+    // agent was paid, their proof of work became unverifiable, and evidence
+    // arriving after settlement could never be recorded at all. The
+    // transaction that carried SubmitDelivery is the same commitment in
+    // permanent form — signed by the agent, naming the commission, milestone
+    // and hash — so it is accepted as a second, durable proof. The hash is
+    // still the authorization; the signature only names where it lives.
+    const signature = typeof req.body.signature === 'string' && /^[1-9A-HJ-NP-Za-km-z]{64,120}$/.test(req.body.signature.trim())
+      ? req.body.signature.trim() : null;
+    let proven = null;
+    if (signature) {
+      try {
+        const tx = await rpc('getTransaction', [signature, { commitment: 'confirmed', encoding: 'json', maxSupportedTransactionVersion: 0 }]);
+        const claim = escrow.verifySubmitTransaction(tx, { programId: PROGRAM_ID, commission, milestoneIndex });
+        const anchored = Buffer.from(claim.evidenceHash, 'hex');
+        if (digest.length === anchored.length && crypto.timingSafeEqual(digest, anchored)) proven = claim;
+      } catch { /* an unusable signature proves nothing either way; the live path already ran */ }
+    }
+    if (!matched && proven) matched = proven;
     if (!matched) {
       return res.status(409).json({
-        error: candidates.length
-          ? 'This text does not match any delivery committed on chain for that milestone'
-          : 'No delivery has been submitted for that milestone',
+        error: signature
+          ? 'Neither a live commitment nor that transaction proves this text for that milestone'
+          : candidates.length
+            ? 'This text does not match any delivery committed on chain for that milestone'
+            : 'No delivery has been submitted for that milestone. If it already settled, include the signature of your submit-delivery transaction — the commitment it carries is permanent.',
       });
     }
 
@@ -295,20 +318,35 @@ app.post('/api/deliveries', async (req, res, next) => {
       commission, milestoneIndex, evidence,
       evidenceHash: matched.evidenceHash,
       agent: matched.agent,
-      submittedAt: matched.submittedAt,
+      submittedAt: matched.submittedAt ?? Math.floor(Date.now() / 1000),
       createdAt: Date.now(),
+      // Stored only when it proved THIS text. An unverified signature filed
+      // beside verified text would make honest work look forged to anyone who
+      // replays the transaction later and finds a different hash.
+      submitSignature: proven && proven.evidenceHash === matched.evidenceHash ? signature : null,
     };
-    // Idempotent: re-posting the same proven text is a no-op, not a conflict.
-    db.prepare(`INSERT INTO deliveries(commission,milestone_index,evidence_hash,evidence,agent,submitted_at,created_at)
-      VALUES(@commission,@milestoneIndex,@evidenceHash,@evidence,@agent,@submittedAt,@createdAt)
-      ON CONFLICT(commission,evidence_hash) DO NOTHING`).run(record);
-    res.status(201).json({ ...record, verified: true });
+    // Idempotent: re-posting the same proven text is a no-op, not a conflict —
+    // and a re-post that arrives with the anchor backfills it, so evidence
+    // recorded before this column existed can still gain a permanent proof.
+    db.prepare(`INSERT INTO deliveries(commission,milestone_index,evidence_hash,evidence,agent,submitted_at,created_at,submit_signature)
+      VALUES(@commission,@milestoneIndex,@evidenceHash,@evidence,@agent,@submittedAt,@createdAt,@submitSignature)
+      ON CONFLICT(commission,evidence_hash) DO UPDATE SET
+        submit_signature = COALESCE(deliveries.submit_signature, excluded.submit_signature)`).run(record);
+    res.status(201).json({ ...record, verified: true, anchor: record.submitSignature ? 'transaction' : 'live-account' });
   } catch (error) { next(error); }
 });
 
 /// Every delivery ever recorded for a commission, newest first.
+///
+/// The LEFT JOIN reads each delivery's outcome from the chain-state mirror, so
+/// a recorded delivery still reports released or rejected after settlement has
+/// swept the submission account that once proved it.
 function deliveriesFor(commission) {
-  return db.prepare('SELECT * FROM deliveries WHERE commission = ? ORDER BY submitted_at DESC, created_at DESC LIMIT 32')
+  return db.prepare(`SELECT d.*, h.last_state AS outcome FROM deliveries d
+    LEFT JOIN delivery_history h
+      ON h.commission = d.commission AND h.milestone_index = d.milestone_index
+     AND h.agent = d.agent AND h.evidence_hash = d.evidence_hash
+    WHERE d.commission = ? ORDER BY d.submitted_at DESC, d.created_at DESC LIMIT 32`)
     .all(commission)
     .map(row => ({
       milestoneIndex: row.milestone_index,
@@ -316,6 +354,11 @@ function deliveriesFor(commission) {
       evidenceHash: row.evidence_hash,
       agent: row.agent,
       submittedAt: new Date(row.submitted_at * 1000).toISOString(),
+      // The transaction that carried the commitment, when known. Anyone can
+      // fetch it from a public RPC and re-verify this text against the hash it
+      // holds — without trusting this server, and long after settlement.
+      submitSignature: row.submit_signature || null,
+      state: row.outcome || 'pending',
     }));
 }
 

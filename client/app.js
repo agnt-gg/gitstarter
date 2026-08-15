@@ -1349,12 +1349,13 @@ async function simpleAction(action,address,index,agentArg){
   // must never be blocked by housekeeping, so a failure retries with the payment
   // alone and the deposits are picked up by the next transaction instead.
   const withCleanup=new Transaction().add(built.instruction,...cleanup);
-  if(!cleanup.length)await send(withCleanup,showProgress);
+  let txSignature=null;
+  if(!cleanup.length)txSignature=await send(withCleanup,showProgress);
   else{
-    try{await send(withCleanup,showProgress);}
+    try{txSignature=await send(withCleanup,showProgress);}
     catch(error){
       console.error('cleanup failed; sending the payment on its own',error);
-      await send(new Transaction().add(built.instruction),showProgress);
+      txSignature=await send(new Transaction().add(built.instruction),showProgress);
     }
   }
   // Record what was delivered, now that the commitment it must match is on
@@ -1362,7 +1363,10 @@ async function simpleAction(action,address,index,agentArg){
   // bare hash, which is not something a person can review.
   if(submitted){
     showProgress('Recording your delivery\u2026');
-    try{await api('/api/deliveries',{method:'POST',body:JSON.stringify({commission:address,milestoneIndex:Number(index)||0,evidence:submitted})});}
+    // The signature rides along as the durable anchor: the live submission
+    // account dies at settlement, but the transaction that committed the hash
+    // is permanent, so the record stays independently verifiable after payout.
+    try{await api('/api/deliveries',{method:'POST',body:JSON.stringify({commission:address,milestoneIndex:Number(index)||0,evidence:submitted,signature:txSignature})});}
     catch(error){
       // The delivery itself is on chain and stands regardless; only the
       // human-readable copy failed. Say so rather than implying the work was
