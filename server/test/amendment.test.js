@@ -114,3 +114,30 @@ test('the archive table keeps superseded wording rather than replacing it', () =
   const kept = db.prepare('SELECT title FROM commission_amendments WHERE commission = ? ORDER BY amended_at').all('CommissionUnderTest');
   assert.deepEqual(kept.map(r => r.title), ['first', 'second']);
 });
+
+test('the list exposes when terms were amended, under the name the client reads', async () => {
+  // This response is assembled field by field, so a new column does not reach
+  // the browser just because it exists. The first version of this feature
+  // shipped with the column written and never served, and a client reading the
+  // snake_case name the API does not emit — silently, because an absent field
+  // renders as no marker at all rather than as an error.
+  db.prepare(`INSERT OR REPLACE INTO commissions
+    (address,creator,tx_signature,title,description,repository_url,license,labels_json,created_at,amended_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`)
+    .run('ListedCommission', 'CreatorWallet', 'sig-listed', 'Listed', 'body', null, 'MIT', '[]', Date.now(), 1786914032283);
+  const listed = (await fetch(base + '/api/commissions').then(r => r.json()))
+    .find(row => row.address === 'ListedCommission');
+  assert.equal(listed.amendedAt, 1786914032283);
+  const untouched = db.prepare('SELECT address FROM commissions WHERE amended_at IS NULL LIMIT 1').get();
+  if (untouched) {
+    const row = (await fetch(base + '/api/commissions').then(r => r.json()))
+      .find(r => r.address === untouched.address);
+    assert.equal(row.amendedAt, null, 'a commission nobody amended must not claim it was');
+  }
+});
+
+test('the client reads the amendment date under the name the API emits', () => {
+  const client = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', '..', 'client', 'app.js'), 'utf8');
+  assert.ok(client.includes('m.amendedAt'), 'client must read the camelCase field the API returns');
+  assert.ok(!client.includes('m.amended_at'), 'the snake_case name is never emitted by the API');
+});

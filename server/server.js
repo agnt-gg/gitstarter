@@ -199,7 +199,7 @@ app.get('/api/commissions', (_req, res) => {
       submittedAt: row.submitted_at,
     });
   }
-  res.json(rows.map(row => ({ address: row.address, creator: row.creator, txSignature: row.tx_signature, title: row.title, description: row.description, repositoryUrl: row.repository_url, license: row.license, labels: JSON.parse(row.labels_json), createdAt: row.created_at, creatorHandle: row.creator_handle || null, deliveries: byCommission.get(row.address) || [] })));
+  res.json(rows.map(row => ({ address: row.address, creator: row.creator, txSignature: row.tx_signature, title: row.title, description: row.description, repositoryUrl: row.repository_url, license: row.license, labels: JSON.parse(row.labels_json), createdAt: row.created_at, amendedAt: row.amended_at || null, creatorHandle: row.creator_handle || null, deliveries: byCommission.get(row.address) || [] })));
 });
 app.post('/api/commissions', requireAuth, async (req, res, next) => {
   try {
