@@ -231,6 +231,78 @@ app.post('/api/commissions', requireAuth, async (req, res, next) => {
     res.status(201).json(record);
   } catch (error) { next(error); }
 });
+/// Whether the human-readable terms of a commission may still be rewritten.
+///
+/// The chain fixes the money, the milestones and the deadlines, and none of
+/// that is editable here. What is editable is the text an agent reads before
+/// deciding to take the work — so the rule has to be narrow enough that nobody
+/// can be judged against terms that appeared after they delivered.
+///
+/// Returns the reason rather than a bare false, because an agent that is
+/// refused needs to know which rule it hit.
+function mayAmend(state) {
+  if (state.unresolvedSubmissions > 0) {
+    return { ok: false, reason: 'A delivery is waiting on judgment. Amending the terms now would move them underneath work that is already done.' };
+  }
+  if (state.status !== 'funding' && state.status !== 'funded') {
+    return { ok: false, reason: 'This commission has settled. Its terms are part of the record now.' };
+  }
+  return { ok: true, reason: null };
+}
+/// The next wording, given the current row and what the caller sent.
+///
+/// Absent fields are left alone rather than blanked: a caller correcting a
+/// typo in the title should not have to resend the description to keep it.
+function amendmentRecord(existing, body) {
+  return {
+    title: body.title === undefined ? existing.title : cleanText(body.title, 160),
+    description: body.description === undefined ? existing.description : cleanText(body.description, 10000),
+    repositoryUrl: body.repositoryUrl === undefined
+      ? existing.repository_url
+      : (body.repositoryUrl ? cleanHttpUrl(body.repositoryUrl) : null),
+    labelsJson: Array.isArray(body.labels)
+      ? JSON.stringify(body.labels.slice(0, 12).map(value => cleanText(value, 32)))
+      : existing.labels_json,
+  };
+}
+/// Corrects the wording of a commission the caller created.
+///
+/// Never a silent overwrite: the superseded text is archived first and the row
+/// records when it changed, so the board can say out loud that the terms moved.
+app.patch('/api/commissions/:address', requireAuth, async (req, res, next) => {
+  try {
+    const address = cleanText(req.params.address, 64);
+    const existing = db.prepare('SELECT * FROM commissions WHERE address = ?').get(address);
+    if (!existing) return res.status(404).json({ error: 'No such commission' });
+    const chainAccount = await rpc('getAccountInfo', [address, { commitment: 'confirmed', encoding: 'base64' }]);
+    const value = chainAccount?.value;
+    if (!value || value.owner !== PROGRAM_ID) return res.status(409).json({ error: 'Commission account is missing or has the wrong owner' });
+    const data = Buffer.from(value.data[0], 'base64');
+    if (data.length !== escrow.COMMISSION_ACCOUNT_BYTES || data[0] !== 2) {
+      return res.status(409).json({ error: 'Address is not a GitStarter commission' });
+    }
+    // The chain decides who the creator is, never our own row: an index that
+    // has drifted must not be able to hand somebody else's bounty to a caller.
+    if (bs58.encode(data.subarray(1, 33)) !== req.wallet) {
+      return res.status(403).json({ error: 'Authenticated wallet is not the on-chain creator' });
+    }
+    const permitted = mayAmend(escrow.decodeCommission(data));
+    if (!permitted.ok) return res.status(409).json({ error: permitted.reason });
+    const next_ = amendmentRecord(existing, req.body);
+    const amendedAt = Date.now();
+    db.transaction(() => {
+      db.prepare('INSERT OR REPLACE INTO commission_amendments(commission,title,description,labels_json,amended_at) VALUES(?,?,?,?,?)')
+        .run(address, existing.title, existing.description, existing.labels_json, amendedAt);
+      db.prepare('UPDATE commissions SET title=?, description=?, repository_url=?, labels_json=?, amended_at=? WHERE address=?')
+        .run(next_.title, next_.description, next_.repositoryUrl, next_.labelsJson, amendedAt, address);
+    })();
+    res.json({
+      address, title: next_.title, description: next_.description,
+      repositoryUrl: next_.repositoryUrl, labels: JSON.parse(next_.labelsJson), amendedAt,
+      amendmentCount: db.prepare('SELECT COUNT(*) AS n FROM commission_amendments WHERE commission = ?').get(address).n,
+    });
+  } catch (error) { next(error); }
+});
 /// Records what an agent actually delivered.
 ///
 /// The program commits to a 32-byte SHA-256 of the evidence and stores nothing
@@ -1739,4 +1811,4 @@ app.use((error, _req, res, _next) => {
 });
 
 if (require.main === module) app.listen(PORT, '127.0.0.1', () => console.log(`gitstarter listening on 127.0.0.1:${PORT}`));
-module.exports = { app, db, cleanHttpUrl };
+module.exports = { app, db, cleanHttpUrl, mayAmend, amendmentRecord };

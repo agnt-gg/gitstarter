@@ -35,6 +35,27 @@ function openDatabase(filename) {
     );
     CREATE INDEX IF NOT EXISTS commissions_created_at ON commissions(created_at DESC);
 
+    -- The history of a commission's human-readable terms.
+    --
+    -- The chain fixes the money, the milestones and the deadlines. This text is
+    -- the part a person actually reads before deciding to spend an evening on
+    -- the work, and a board where a creator can quietly rewrite it afterwards is
+    -- not a board anybody should trust. So an edit never overwrites: the
+    -- superseded wording is copied here first, and the commission carries the
+    -- time it last changed, so a reader can see that the terms moved and judge
+    -- for themselves.
+    CREATE TABLE IF NOT EXISTS commission_amendments (
+      commission TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      labels_json TEXT NOT NULL DEFAULT '[]',
+      -- When this wording stopped being the current wording.
+      amended_at INTEGER NOT NULL,
+      PRIMARY KEY (commission, amended_at)
+    );
+    CREATE INDEX IF NOT EXISTS commission_amendments_commission
+      ON commission_amendments(commission, amended_at DESC);
+
     -- What an agent actually delivered.
     --
     -- The program stores a 32-byte SHA-256 commitment and never the content, so
@@ -201,6 +222,11 @@ function openDatabase(filename) {
   // which the insert path accepts as a backfill.
   const deliveryColumns = db.prepare(`SELECT name FROM pragma_table_info('deliveries')`).all().map(column => column.name);
   if (!deliveryColumns.includes('submit_signature')) db.exec('ALTER TABLE deliveries ADD COLUMN submit_signature TEXT');
+
+  // Same reason, same shape: databases created before terms could be amended
+  // have no column to record that they were.
+  const commissionColumns = db.prepare(`SELECT name FROM pragma_table_info('commissions')`).all().map(column => column.name);
+  if (!commissionColumns.includes('amended_at')) db.exec('ALTER TABLE commissions ADD COLUMN amended_at INTEGER');
 
   // Recover the deliveries made before this index existed.
   //
